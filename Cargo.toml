@@ -1,0 +1,11 @@
+[package]
+name = "pdf-x"
+version = "0.1.0"
+edition = "2024"
+authors = ["PDF-X Contributors"]
+description = "A Rust port of PDF.js with progressive loading support"
+license = "Apache-2.0"
+
+[dependencies]
+
+[dev-dependencies]
