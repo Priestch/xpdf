@@ -9,7 +9,9 @@ use super::error::PDFResult;
 /// Implementations must provide core reading operations, while this trait provides
 /// default implementations for common derived operations like multi-byte reads,
 /// peeking, and string conversion.
-pub trait BaseStream {
+///
+/// The `Send` bound allows streams to be transferred between threads safely.
+pub trait BaseStream: Send {
     // ============================================================================
     // Required methods (must be implemented by all stream types)
     // ============================================================================

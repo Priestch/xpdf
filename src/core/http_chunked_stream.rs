@@ -1,13 +1,7 @@
 use super::base_stream::BaseStream;
+use super::chunk_manager::{ChunkLoader, ChunkManager, DEFAULT_MAX_CACHED_CHUNKS};
 use super::error::{PDFError, PDFResult};
-use std::collections::{HashMap, VecDeque};
 use std::io::Read;
-
-/// Default chunk size: 64KB (same as PDF.js)
-pub const DEFAULT_CHUNK_SIZE: usize = 65536;
-
-/// Default maximum number of chunks to keep in memory cache
-pub const DEFAULT_MAX_CACHED_CHUNKS: usize = 10;
 
 /// A chunked stream that progressively loads data from an HTTP source using range requests.
 ///
@@ -20,24 +14,57 @@ pub const DEFAULT_MAX_CACHED_CHUNKS: usize = 10;
 pub struct HttpChunkedStream {
     /// URL of the PDF file
     url: String,
-    /// Total length of the file in bytes
-    length: usize,
-    /// Size of each chunk in bytes
-    chunk_size: usize,
-    /// Total number of chunks
-    num_chunks: usize,
+    /// HTTP agent for making requests
+    agent: ureq::Agent,
+    /// The chunk manager that tracks loaded chunks
+    manager: ChunkManager,
     /// Current read position
     pos: usize,
     /// Starting offset in the file
     start: usize,
-    /// Cache of loaded chunks (chunk_number -> data)
-    chunk_cache: HashMap<usize, Vec<u8>>,
-    /// LRU queue for cache eviction (stores chunk numbers)
-    lru_queue: VecDeque<usize>,
-    /// Maximum number of chunks to keep in cache
-    max_cached_chunks: usize,
-    /// HTTP agent for making requests
-    agent: ureq::Agent,
+}
+
+impl ChunkLoader for HttpChunkedStream {
+    fn request_chunk(&mut self, chunk_num: usize) -> PDFResult<Vec<u8>> {
+        let chunk_start = chunk_num * self.chunk_size();
+        let chunk_end = std::cmp::min(chunk_start + self.chunk_size(), self.total_length()) - 1;
+
+        let range_header = format!("bytes={}-{}", chunk_start, chunk_end);
+
+        let response = self
+            .agent
+            .get(&self.url)
+            .set("Range", &range_header)
+            .call()
+            .map_err(|e| {
+                PDFError::StreamError(format!("Failed to fetch chunk {}: {}", chunk_num, e))
+            })?;
+
+        // Check for 206 Partial Content response
+        if response.status() != 206 {
+            return Err(PDFError::StreamError(format!(
+                "Expected 206 status, got {}",
+                response.status()
+            )));
+        }
+
+        // Read response body
+        let mut buffer = Vec::new();
+        response
+            .into_reader()
+            .read_to_end(&mut buffer)
+            .map_err(|e| PDFError::StreamError(format!("Failed to read response: {}", e)))?;
+
+        Ok(buffer)
+    }
+
+    fn chunk_size(&self) -> usize {
+        self.manager.chunk_size()
+    }
+
+    fn total_length(&self) -> usize {
+        self.manager.length()
+    }
 }
 
 impl HttpChunkedStream {
@@ -86,128 +113,52 @@ impl HttpChunkedStream {
             .parse()
             .map_err(|_| PDFError::StreamError("Invalid Content-Length".to_string()))?;
 
-        let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
-        let max_cached_chunks = max_cached_chunks.unwrap_or(DEFAULT_MAX_CACHED_CHUNKS);
-        let num_chunks = length.div_ceil(chunk_size);
+        let manager = ChunkManager::new(length, chunk_size, max_cached_chunks);
 
         Ok(HttpChunkedStream {
             url,
-            length,
-            chunk_size,
-            num_chunks,
+            agent,
+            manager,
             pos: 0,
             start: 0,
-            chunk_cache: HashMap::new(),
-            lru_queue: VecDeque::new(),
-            max_cached_chunks,
-            agent,
         })
     }
 
-    /// Gets the chunk number for a given byte position.
-    fn get_chunk_number(&self, pos: usize) -> usize {
-        pos / self.chunk_size
-    }
-
-    /// Loads a chunk from the HTTP server if not already cached.
+    /// Ensures a chunk is loaded into the manager.
     ///
-    /// This method implements LRU cache eviction when the cache is full.
+    /// If not already loaded, requests the chunk and sends it to the manager.
     fn ensure_chunk_loaded(&mut self, chunk_num: usize) -> PDFResult<()> {
-        if chunk_num >= self.num_chunks {
-            return Err(PDFError::InvalidByteRange {
-                begin: chunk_num * self.chunk_size,
-                end: (chunk_num + 1) * self.chunk_size,
-            });
+        if !self.manager.has_chunk(chunk_num) {
+            let data = self.request_chunk(chunk_num)?;
+            self.manager.on_receive_data(chunk_num, data)?;
+        } else if self.manager.is_chunk_cached(chunk_num) {
+            self.manager.mark_chunk_accessed(chunk_num);
+        } else {
+            // Chunk was loaded before but evicted from cache, reload it
+            let data = self.request_chunk(chunk_num)?;
+            self.manager.on_receive_data(chunk_num, data)?;
         }
-
-        // Check if chunk is already cached
-        if self.chunk_cache.contains_key(&chunk_num) {
-            // Update LRU: move to back
-            self.lru_queue.retain(|&x| x != chunk_num);
-            self.lru_queue.push_back(chunk_num);
-            return Ok(());
-        }
-
-        // Download chunk via HTTP range request
-        let chunk_start = chunk_num * self.chunk_size;
-        let chunk_end = std::cmp::min(chunk_start + self.chunk_size, self.length) - 1;
-
-        let range_header = format!("bytes={}-{}", chunk_start, chunk_end);
-
-        let response = self
-            .agent
-            .get(&self.url)
-            .set("Range", &range_header)
-            .call()
-            .map_err(|e| {
-                PDFError::StreamError(format!("Failed to fetch chunk {}: {}", chunk_num, e))
-            })?;
-
-        // Check for 206 Partial Content response
-        if response.status() != 206 {
-            return Err(PDFError::StreamError(format!(
-                "Expected 206 status, got {}",
-                response.status()
-            )));
-        }
-
-        // Read response body
-        let mut buffer = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut buffer)
-            .map_err(|e| PDFError::StreamError(format!("Failed to read response: {}", e)))?;
-
-        // Evict LRU chunk if cache is full
-        if self.chunk_cache.len() >= self.max_cached_chunks {
-            if let Some(lru_chunk) = self.lru_queue.pop_front() {
-                self.chunk_cache.remove(&lru_chunk);
-            }
-        }
-
-        // Add to cache
-        self.chunk_cache.insert(chunk_num, buffer);
-        self.lru_queue.push_back(chunk_num);
-
         Ok(())
-    }
-
-    /// Gets a byte from the cache (chunk must be loaded).
-    fn get_byte_from_cache(&self, pos: usize) -> PDFResult<u8> {
-        let chunk_num = self.get_chunk_number(pos);
-        let chunk_offset = pos % self.chunk_size;
-
-        let chunk = self
-            .chunk_cache
-            .get(&chunk_num)
-            .ok_or(PDFError::DataNotLoaded { chunk: chunk_num })?;
-
-        chunk
-            .get(chunk_offset)
-            .copied()
-            .ok_or(PDFError::UnexpectedEndOfStream)
     }
 
     /// Returns the number of chunks currently loaded in the cache.
     pub fn num_chunks_loaded(&self) -> usize {
-        self.chunk_cache.len()
+        self.manager.num_chunks_loaded()
     }
 
     /// Returns the total number of chunks in the file.
     pub fn num_chunks(&self) -> usize {
-        self.num_chunks
+        self.manager.num_chunks()
     }
 
     /// Returns true if all chunks are loaded.
     pub fn is_fully_loaded(&self) -> bool {
-        self.chunk_cache.len() == self.num_chunks
+        self.manager.is_data_loaded()
     }
 
-    /// Returns a list of chunk numbers that are not currently cached.
+    /// Returns a list of chunk numbers that are not currently loaded.
     pub fn get_missing_chunks(&self) -> Vec<usize> {
-        (0..self.num_chunks)
-            .filter(|chunk| !self.chunk_cache.contains_key(chunk))
-            .collect()
+        self.manager.get_missing_chunks()
     }
 
     /// Preloads a specific chunk into the cache.
@@ -217,10 +168,10 @@ impl HttpChunkedStream {
 
     /// Preloads a range of chunks into the cache.
     pub fn preload_range(&mut self, begin: usize, end: usize) -> PDFResult<()> {
-        let begin_chunk = self.get_chunk_number(begin);
-        let end_chunk = self.get_chunk_number(end.saturating_sub(1));
+        let begin_chunk = self.manager.get_chunk_number(begin);
+        let end_chunk = self.manager.get_chunk_number(end.saturating_sub(1));
 
-        for chunk in begin_chunk..=end_chunk.min(self.num_chunks - 1) {
+        for chunk in begin_chunk..=end_chunk.min(self.manager.num_chunks() - 1) {
             self.ensure_chunk_loaded(chunk)?;
         }
 
@@ -235,11 +186,11 @@ impl HttpChunkedStream {
 
 impl BaseStream for HttpChunkedStream {
     fn length(&self) -> usize {
-        self.length
+        self.manager.length()
     }
 
     fn is_empty(&self) -> bool {
-        self.length == 0
+        self.manager.length() == 0
     }
 
     fn pos(&self) -> usize {
@@ -247,10 +198,10 @@ impl BaseStream for HttpChunkedStream {
     }
 
     fn set_pos(&mut self, pos: usize) -> PDFResult<()> {
-        if pos > self.length {
+        if pos > self.manager.length() {
             return Err(PDFError::InvalidPosition {
                 pos,
-                length: self.length,
+                length: self.manager.length(),
             });
         }
         self.pos = pos;
@@ -258,24 +209,24 @@ impl BaseStream for HttpChunkedStream {
     }
 
     fn is_data_loaded(&self) -> bool {
-        self.is_fully_loaded()
+        self.manager.is_data_loaded()
     }
 
     fn get_byte(&mut self) -> PDFResult<u8> {
-        if self.pos >= self.length {
+        if self.pos >= self.manager.length() {
             return Err(PDFError::UnexpectedEndOfStream);
         }
 
-        let chunk_num = self.get_chunk_number(self.pos);
+        let chunk_num = self.manager.get_chunk_number(self.pos);
         self.ensure_chunk_loaded(chunk_num)?;
 
-        let byte = self.get_byte_from_cache(self.pos)?;
+        let byte = self.manager.get_byte_from_cache(self.pos)?;
         self.pos += 1;
         Ok(byte)
     }
 
     fn get_bytes(&mut self, length: usize) -> PDFResult<Vec<u8>> {
-        let end_pos = std::cmp::min(self.pos + length, self.length);
+        let end_pos = std::cmp::min(self.pos + length, self.manager.length());
         let actual_length = end_pos - self.pos;
 
         if actual_length == 0 {
@@ -283,17 +234,40 @@ impl BaseStream for HttpChunkedStream {
         }
 
         // Load all required chunks
-        let begin_chunk = self.get_chunk_number(self.pos);
-        let end_chunk = self.get_chunk_number(end_pos - 1);
+        let begin_chunk = self.manager.get_chunk_number(self.pos);
+        let end_chunk = self.manager.get_chunk_number(end_pos - 1);
 
         for chunk in begin_chunk..=end_chunk {
             self.ensure_chunk_loaded(chunk)?;
         }
 
-        // Collect bytes from cache
+        // Collect bytes from cache efficiently by copying chunk slices
         let mut result = Vec::with_capacity(actual_length);
-        for pos in self.pos..end_pos {
-            result.push(self.get_byte_from_cache(pos)?);
+
+        for chunk_num in begin_chunk..=end_chunk {
+            let chunk = self
+                .manager
+                .get_chunk(chunk_num)
+                .ok_or(PDFError::DataNotLoaded { chunk: chunk_num })?;
+
+            // Calculate the start offset within this chunk
+            let chunk_start_pos = chunk_num * self.manager.chunk_size();
+
+            // Determine which part of this chunk we need
+            let read_start = if chunk_num == begin_chunk {
+                self.pos - chunk_start_pos
+            } else {
+                0
+            };
+
+            let read_end = if chunk_num == end_chunk {
+                end_pos - chunk_start_pos
+            } else {
+                chunk.len()
+            };
+
+            // Copy the slice from this chunk
+            result.extend_from_slice(&chunk[read_start..read_end]);
         }
 
         self.pos = end_pos;
@@ -305,24 +279,47 @@ impl BaseStream for HttpChunkedStream {
             return Err(PDFError::InvalidByteRange { begin, end });
         }
 
-        if end > self.length {
+        if end > self.manager.length() {
             return Err(PDFError::InvalidByteRange { begin, end });
         }
 
-        let begin_chunk = self.get_chunk_number(begin);
-        let end_chunk = self.get_chunk_number(end - 1);
+        let begin_chunk = self.manager.get_chunk_number(begin);
+        let end_chunk = self.manager.get_chunk_number(end - 1);
 
         // Check if all required chunks are loaded
         for chunk in begin_chunk..=end_chunk {
-            if !self.chunk_cache.contains_key(&chunk) {
+            if !self.manager.has_chunk(chunk) {
                 return Err(PDFError::DataNotLoaded { chunk });
             }
         }
 
-        // Collect bytes from cache
+        // Collect bytes from cache efficiently by copying chunk slices
         let mut result = Vec::with_capacity(end - begin);
-        for pos in begin..end {
-            result.push(self.get_byte_from_cache(pos)?);
+
+        for chunk_num in begin_chunk..=end_chunk {
+            let chunk = self
+                .manager
+                .get_chunk(chunk_num)
+                .ok_or(PDFError::DataNotLoaded { chunk: chunk_num })?;
+
+            // Calculate the start offset within this chunk
+            let chunk_start_pos = chunk_num * self.manager.chunk_size();
+
+            // Determine which part of this chunk we need
+            let read_start = if chunk_num == begin_chunk {
+                begin - chunk_start_pos
+            } else {
+                0
+            };
+
+            let read_end = if chunk_num == end_chunk {
+                end - chunk_start_pos
+            } else {
+                chunk.len()
+            };
+
+            // Copy the slice from this chunk
+            result.extend_from_slice(&chunk[read_start..read_end]);
         }
 
         Ok(result)
@@ -341,18 +338,23 @@ impl BaseStream for HttpChunkedStream {
     }
 
     fn make_sub_stream(&self, start: usize, length: usize) -> PDFResult<Box<dyn BaseStream>> {
-        if start + length > self.length {
+        if start + length > self.manager.length() {
             return Err(PDFError::InvalidByteRange {
                 begin: start,
                 end: start + length,
             });
         }
 
-        // For now, return an error as proper sub-stream implementation
-        // would require sharing the HTTP agent or creating a new one
-        Err(PDFError::Generic(
-            "Sub-streams not yet supported for HttpChunkedStream".to_string(),
-        ))
+        // Create a new HttpChunkedStream for the sub-stream
+        let parent = Box::new(Self::open(
+            self.url.clone(),
+            Some(self.manager.chunk_size()),
+            Some(DEFAULT_MAX_CACHED_CHUNKS),
+        )?) as Box<dyn BaseStream>;
+
+        // Wrap in SubStream to provide the restricted view
+        let sub = super::sub_stream::SubStream::new(parent, start, length)?;
+        Ok(Box::new(sub))
     }
 }
 
