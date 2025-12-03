@@ -4,7 +4,21 @@ use super::error::{PDFError, PDFResult};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Helper function to standardize mutex lock error handling for the file handle.
+#[inline]
+fn lock_file(file: &Arc<Mutex<File>>) -> PDFResult<MutexGuard<File>> {
+    file.lock()
+        .map_err(|_| PDFError::StreamError("Failed to lock file handle (mutex poisoned)".to_string()))
+}
+
+/// Helper function to standardize mutex lock error handling for the chunk manager.
+#[inline]
+fn lock_manager(manager: &Arc<Mutex<ChunkManager>>) -> PDFResult<MutexGuard<ChunkManager>> {
+    manager.lock()
+        .map_err(|_| PDFError::StreamError("Failed to lock chunk manager (mutex poisoned)".to_string()))
+}
 
 /// A chunked stream that progressively loads data from a filesystem file.
 ///
@@ -29,18 +43,19 @@ pub struct FileChunkedStream {
     pos: usize,
     /// Starting offset in the file
     start: usize,
+    /// Cached chunk size (immutable, no need to lock manager)
+    chunk_size: usize,
+    /// Cached total file length (immutable, no need to lock manager)
+    total_length: usize,
 }
 
 impl ChunkLoader for FileChunkedStream {
     fn request_chunk(&mut self, chunk_num: usize) -> PDFResult<Vec<u8>> {
-        let chunk_start = chunk_num * self.chunk_size();
-        let chunk_end = std::cmp::min(chunk_start + self.chunk_size(), self.total_length());
+        let chunk_start = chunk_num * self.chunk_size;
+        let chunk_end = std::cmp::min(chunk_start + self.chunk_size, self.total_length);
         let chunk_length = chunk_end - chunk_start;
 
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|e| PDFError::StreamError(format!("Failed to lock file: {}", e)))?;
+        let mut file = lock_file(&self.file)?;
 
         file.seek(SeekFrom::Start(chunk_start as u64))
             .map_err(|e| PDFError::StreamError(format!("Failed to seek to chunk: {}", e)))?;
@@ -53,17 +68,11 @@ impl ChunkLoader for FileChunkedStream {
     }
 
     fn chunk_size(&self) -> usize {
-        self.manager
-            .lock()
-            .map(|m| m.chunk_size())
-            .unwrap_or(0)
+        self.chunk_size
     }
 
     fn total_length(&self) -> usize {
-        self.manager
-            .lock()
-            .map(|m| m.length())
-            .unwrap_or(0)
+        self.total_length
     }
 }
 
@@ -96,12 +105,18 @@ impl FileChunkedStream {
 
         let manager = ChunkManager::new(length, chunk_size, max_cached_chunks);
 
+        // Cache immutable values to avoid repeated mutex locking
+        let cached_chunk_size = manager.chunk_size();
+        let cached_length = manager.length();
+
         Ok(FileChunkedStream {
             file: Arc::new(Mutex::new(file)),
             file_path,
             manager: Arc::new(Mutex::new(manager)),
             pos: 0,
             start: 0,
+            chunk_size: cached_chunk_size,
+            total_length: cached_length,
         })
     }
 
@@ -112,6 +127,8 @@ impl FileChunkedStream {
         file: Arc<Mutex<File>>,
         file_path: PathBuf,
         manager: Arc<Mutex<ChunkManager>>,
+        chunk_size: usize,
+        total_length: usize,
     ) -> Self {
         FileChunkedStream {
             file,
@@ -119,6 +136,8 @@ impl FileChunkedStream {
             manager,
             pos: 0,
             start: 0,
+            chunk_size,
+            total_length,
         }
     }
 
@@ -126,19 +145,13 @@ impl FileChunkedStream {
     ///
     /// If not already loaded, requests the chunk and sends it to the manager.
     fn ensure_chunk_loaded(&mut self, chunk_num: usize) -> PDFResult<()> {
-        let mut manager = self
-            .manager
-            .lock()
-            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let mut manager = lock_manager(&self.manager)?;
 
         if !manager.has_chunk(chunk_num) {
             // Release lock before loading
             drop(manager);
             let data = self.request_chunk(chunk_num)?;
-            let mut manager = self
-                .manager
-                .lock()
-                .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+            let mut manager = lock_manager(&self.manager)?;
             manager.on_receive_data(chunk_num, data)?;
         } else if manager.is_chunk_cached(chunk_num) {
             manager.mark_chunk_accessed(chunk_num);
@@ -146,10 +159,7 @@ impl FileChunkedStream {
             // Chunk was loaded before but evicted from cache, reload it
             drop(manager);
             let data = self.request_chunk(chunk_num)?;
-            let mut manager = self
-                .manager
-                .lock()
-                .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+            let mut manager = lock_manager(&self.manager)?;
             manager.on_receive_data(chunk_num, data)?;
         }
         Ok(())
@@ -194,10 +204,7 @@ impl FileChunkedStream {
 
     /// Preloads a range of chunks into the cache.
     pub fn preload_range(&mut self, begin: usize, end: usize) -> PDFResult<()> {
-        let manager = self
-            .manager
-            .lock()
-            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let manager = lock_manager(&self.manager)?;
 
         let begin_chunk = manager.get_chunk_number(begin);
         let end_chunk = manager.get_chunk_number(end.saturating_sub(1));
@@ -248,19 +255,13 @@ impl BaseStream for FileChunkedStream {
             return Err(PDFError::UnexpectedEndOfStream);
         }
 
-        let manager = self
-            .manager
-            .lock()
-            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let manager = lock_manager(&self.manager)?;
         let chunk_num = manager.get_chunk_number(self.pos);
         drop(manager);
 
         self.ensure_chunk_loaded(chunk_num)?;
 
-        let manager = self
-            .manager
-            .lock()
-            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let manager = lock_manager(&self.manager)?;
         let byte = manager.get_byte_from_cache(self.pos)?;
         drop(manager);
 
@@ -278,10 +279,7 @@ impl BaseStream for FileChunkedStream {
         }
 
         // Load all required chunks
-        let manager = self
-            .manager
-            .lock()
-            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let manager = lock_manager(&self.manager)?;
         let begin_chunk = manager.get_chunk_number(self.pos);
         let end_chunk = manager.get_chunk_number(end_pos - 1);
         let chunk_size = manager.chunk_size();
@@ -293,10 +291,7 @@ impl BaseStream for FileChunkedStream {
 
         // Collect bytes from cache efficiently by copying chunk slices
         let mut result = Vec::with_capacity(actual_length);
-        let manager = self
-            .manager
-            .lock()
-            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let manager = lock_manager(&self.manager)?;
 
         for chunk_num in begin_chunk..=end_chunk {
             let chunk = manager
@@ -337,10 +332,7 @@ impl BaseStream for FileChunkedStream {
             return Err(PDFError::InvalidByteRange { begin, end });
         }
 
-        let manager = self
-            .manager
-            .lock()
-            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let manager = lock_manager(&self.manager)?;
 
         let begin_chunk = manager.get_chunk_number(begin);
         let end_chunk = manager.get_chunk_number(end - 1);
@@ -409,6 +401,8 @@ impl BaseStream for FileChunkedStream {
             Arc::clone(&self.file),
             self.file_path.clone(),
             Arc::clone(&self.manager),
+            self.chunk_size,
+            self.total_length,
         );
 
         // Wrap in SubStream to provide the restricted view

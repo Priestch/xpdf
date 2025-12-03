@@ -618,6 +618,14 @@ impl Lexer {
         // Otherwise it's a command/operator
         Ok(Token::Command(str_buf))
     }
+
+    /// Gets a single raw byte from the stream (for reading stream data).
+    ///
+    /// This is used by the parser when reading binary stream data between
+    /// 'stream' and 'endstream' keywords.
+    pub fn get_stream_byte(&mut self) -> PDFResult<u8> {
+        self.stream.get_byte()
+    }
 }
 
 #[cfg(test)]

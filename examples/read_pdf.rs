@@ -71,6 +71,24 @@ fn print_object(obj: &PDFObject, indent: usize) {
         PDFObject::Ref { num, generation } => {
             println!("{}{} {} R", indent_str, num, generation)
         }
+        PDFObject::Stream { dict, data } => {
+            println!("{}stream ({}  bytes)", indent_str, data.len());
+            println!("{}<<", indent_str);
+            for (key, value) in dict {
+                print!("{}/{}:", "  ".repeat(indent + 1), key);
+                match value {
+                    PDFObject::Dictionary(_) | PDFObject::Array(_) => {
+                        println!();
+                        print_object(value, indent + 1);
+                    }
+                    _ => {
+                        print!(" ");
+                        print_object(value, 0);
+                    }
+                }
+            }
+            println!("{}>>", indent_str);
+        }
         PDFObject::EOF => println!("{}EOF", indent_str),
     }
 }

@@ -50,7 +50,7 @@ PDF-X follows the layered architecture of PDF.js:
 
 ## Project Status
 
-**Current Phase:** Core parsing infrastructure complete ✅
+**Current Phase:** Page tree traversal and lazy page loading complete ✅
 
 ### Completed Layers
 
@@ -75,7 +75,7 @@ PDF-X follows the layered architecture of PDF.js:
 
 4. ✅ **XRef Layer** - Cross-reference table parsing
    - XRef table parsing (free/uncompressed entries)
-   - Indirect object resolution and caching
+   - Indirect object resolution and caching with Rc<PDFObject>
    - Trailer dictionary extraction
    - 6 comprehensive tests
 
@@ -86,13 +86,29 @@ PDF-X follows the layered architecture of PDF.js:
    - Pages dictionary access
    - 4 comprehensive tests
 
-**Test Coverage:** 107 tests passing (all green ✅)
+6. ✅ **Page Layer** - Page tree traversal and lazy loading
+   - Hierarchical page tree traversal (depth-first search)
+   - Lazy page loading with caching
+   - Support for flat and multi-level page trees
+   - Circular reference detection
+   - Page dictionary access (MediaBox, Resources, Contents)
+   - **Inheritable properties**: Automatic resolution of inherited properties (MediaBox, Resources, CropBox, Rotate) from parent Pages nodes
+   - 10 comprehensive tests including hierarchical page trees and property inheritance
+
+7. ✅ **Stream Parsing & Compression** - FlateDecode and object streams
+   - Stream object parsing (dictionary + binary data)
+   - FlateDecode (zlib/deflate) decompression
+   - **Compressed object streams (ObjStm)**: Support for PDFs that compress multiple objects into a single stream
+   - Automatic decompression and object extraction
+   - 4 comprehensive tests for stream decompression
+
+**Test Coverage:** 120 tests passing (all green ✅)
 
 ### In Progress / Next Steps
 
-- [ ] Compressed object streams (ObjStm)
+- [x] Compressed object streams (ObjStm) - Basic implementation complete
+- [ ] XRef streams (compressed cross-reference tables)
 - [ ] Linearized PDF optimization
-- [ ] Page tree traversal and lazy page loading
 - [ ] Content stream parsing
 - [ ] Text extraction
 - [ ] Image rendering
@@ -167,6 +183,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pages_dict = doc.pages_dict()?;
     println!("Pages: {:?}", pages_dict);
 
+    // Lazily load a specific page (pages are cached)
+    let page = doc.get_page(0)?;  // Get first page (0-indexed)
+    println!("Page {}: {:?}", page.index(), page.dict());
+
+    // Access page properties (with automatic inheritance from parent Pages nodes)
+    let media_box = doc.get_media_box(&page)?;
+    println!("MediaBox: {:?}", media_box);
+
+    // Get Resources (inheritable)
+    if let Ok(resources) = doc.get_resources(&page) {
+        println!("Resources: {:?}", resources);
+    }
+
     Ok(())
 }
 ```
@@ -176,10 +205,22 @@ See `examples/read_pdf.rs` for a complete working example.
 ### Running Examples
 
 ```bash
-# Run the PDF reader example (parses a minimal test PDF)
+# Run the basic PDF reader example (parses a minimal test PDF)
 cargo run --example read_pdf
 
-# Run tests
+# Run the file chunked stream example (demonstrates progressive loading from file)
+cargo run --example file_chunked_stream <path_to_pdf>
+
+# Example:
+cargo run --example file_chunked_stream ~/Documents/document.pdf
+
+# Run the HTTP chunked stream example (demonstrates progressive loading from HTTP)
+cargo run --example http_chunked_stream <pdf_url>
+
+# Example:
+cargo run --example http_chunked_stream https://mozilla.github.io/pdf.js/legacy/web/compressed.tracemonkey-pldi-09.pdf
+
+# Run all tests
 cargo test
 
 # Run specific test module
@@ -187,6 +228,14 @@ cargo test lexer
 cargo test parser
 cargo test xref
 ```
+
+The chunked stream examples demonstrate:
+- **Progressive PDF loading** from file or HTTP
+- **Lazy page loading** (pages loaded on-demand)
+- **Page caching** (pages cached after first access)
+- **Inheritable property resolution** (MediaBox, Resources automatically inherited from parent Pages nodes)
+- **Hierarchical page tree traversal** (DFS through multi-level page trees)
+- **Memory-efficient streaming** with LRU caching (max 640KB for chunk cache)
 
 ## Contributing
 

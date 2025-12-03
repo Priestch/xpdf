@@ -32,6 +32,12 @@ pub enum PDFObject {
     /// Dictionary (key-value pairs)
     Dictionary(HashMap<String, PDFObject>),
 
+    /// Stream object (dictionary + binary data)
+    Stream {
+        dict: HashMap<String, PDFObject>,
+        data: Vec<u8>,
+    },
+
     /// Indirect object reference (like "5 0 R")
     Ref { num: u32, generation: u32 },
 
@@ -242,7 +248,104 @@ impl Parser {
             dict.insert(key, value);
         }
 
+        // Check if this dictionary is followed by a stream
+        // Format: << /Key value >> stream\n...binary data...endstream
+        if let Some(Token::Command(cmd)) = &self.buf1 {
+            if cmd == "stream" {
+                return self.parse_stream(dict);
+            }
+        }
+
         Ok(PDFObject::Dictionary(dict))
+    }
+
+    /// Parses a stream object (dictionary followed by stream data).
+    ///
+    /// Format:
+    /// ```text
+    /// << /Length 100 >> stream
+    /// ...binary data...
+    /// endstream
+    /// ```
+    ///
+    /// Based on PDF.js Parser.makeStream()
+    fn parse_stream(&mut self, dict: HashMap<String, PDFObject>) -> PDFResult<PDFObject> {
+        // We're currently positioned after the '>>' with 'stream' in buf1
+        self.shift()?; // Consume 'stream' keyword
+
+        // Skip to next line (stream data starts after newline)
+        // The lexer should have positioned us correctly, but we need to read raw bytes now
+        // Get the Length from the dictionary
+        let length = dict
+            .get("Length")
+            .and_then(|obj| match obj {
+                PDFObject::Number(n) => Some(*n as usize),
+                PDFObject::Ref { num: _, generation: _ } => {
+                    // Length is an indirect reference - we can't resolve it here
+                    // For now, we'll try to find 'endstream' by scanning
+                    None
+                }
+                _ => None,
+            });
+
+        // Read the stream data
+        let data = if let Some(len) = length {
+            // We know the length, read exactly that many bytes
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                match self.lexer.get_stream_byte() {
+                    Ok(b) => bytes.push(b),
+                    Err(_) => break, // EOF or error
+                }
+            }
+            bytes
+        } else {
+            // No length or indirect length - scan for 'endstream'
+            // This is a simplified implementation
+            let mut bytes = Vec::new();
+            let endstream_marker = b"endstream";
+            let mut match_pos = 0;
+
+            loop {
+                match self.lexer.get_stream_byte() {
+                    Ok(b) => {
+                        bytes.push(b);
+
+                        // Check if we're matching 'endstream'
+                        if b == endstream_marker[match_pos] {
+                            match_pos += 1;
+                            if match_pos == endstream_marker.len() {
+                                // Found endstream - remove it from bytes
+                                bytes.truncate(bytes.len() - endstream_marker.len());
+                                // Also trim trailing whitespace before endstream
+                                while bytes.last() == Some(&b'\n')
+                                    || bytes.last() == Some(&b'\r')
+                                    || bytes.last() == Some(&b' ')
+                                {
+                                    bytes.pop();
+                                }
+                                break;
+                            }
+                        } else {
+                            match_pos = 0;
+                        }
+                    }
+                    Err(_) => {
+                        return Err(PDFError::Generic(
+                            "EOF while reading stream data".to_string(),
+                        ))
+                    }
+                }
+            }
+            bytes
+        };
+
+        // Skip past 'endstream' if we haven't already
+        // We need to refill the token buffer
+        self.buf1 = Some(self.lexer.get_object()?);
+        self.buf2 = Some(self.lexer.get_object()?);
+
+        Ok(PDFObject::Stream { dict, data })
     }
 
     /// Checks if there are more objects to parse.

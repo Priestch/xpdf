@@ -1,8 +1,10 @@
 use super::base_stream::BaseStream;
 use super::error::{PDFError, PDFResult};
+use super::page::{Page, PageTreeCache};
 use super::parser::PDFObject;
 use super::stream::Stream;
 use super::xref::XRef;
+use std::collections::HashSet;
 
 /// PDF Document reader.
 ///
@@ -17,6 +19,9 @@ pub struct PDFDocument {
 
     /// The document catalog (root dictionary)
     catalog: Option<PDFObject>,
+
+    /// Page tree cache for efficient page lookups
+    page_cache: PageTreeCache,
 }
 
 impl PDFDocument {
@@ -50,7 +55,11 @@ impl PDFDocument {
         // Load the catalog
         let catalog = Some(xref.catalog()?);
 
-        Ok(PDFDocument { xref, catalog })
+        Ok(PDFDocument {
+            xref,
+            catalog,
+            page_cache: PageTreeCache::new(),
+        })
     }
 
     /// Finds the byte offset of the cross-reference table.
@@ -173,6 +182,271 @@ impl PDFDocument {
             _ => Err(PDFError::Generic("/Count is not a number".to_string())),
         }
     }
+
+    /// Traverses the page tree to find a specific page by index.
+    ///
+    /// PDF page trees can be hierarchical with intermediate "Pages" nodes
+    /// containing "Kids" arrays. This method implements depth-first traversal
+    /// similar to PDF.js's getPageDict method.
+    ///
+    /// # Arguments
+    /// * `page_index` - The 0-based page index to retrieve
+    ///
+    /// # Returns
+    /// Returns (page_dict, page_ref) where page_ref is the indirect reference if available
+    fn get_page_dict(&mut self, page_index: usize) -> PDFResult<(PDFObject, Option<(u32, u32)>)> {
+        // Get the root Pages dictionary
+        let root_pages = self.pages_dict()?;
+
+        // Stack for depth-first traversal: (node, is_reference)
+        let mut nodes_to_visit: Vec<(PDFObject, Option<(u32, u32)>)> = vec![(root_pages, None)];
+        let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
+        let mut current_page_index = 0;
+
+        while let Some((current_node, node_ref)) = nodes_to_visit.pop() {
+            // Handle references
+            let (node_obj, obj_ref) = match &current_node {
+                PDFObject::Ref { num, generation } => {
+                    let ref_key = (*num, *generation);
+
+                    // Prevent circular references
+                    if visited_refs.contains(&ref_key) {
+                        return Err(PDFError::Generic(
+                            "Circular reference in page tree".to_string(),
+                        ));
+                    }
+                    visited_refs.insert(ref_key);
+
+                    // Fetch the object
+                    let fetched = self.xref.fetch(*num, *generation)?;
+                    let obj = (*fetched).clone();
+                    (obj, Some(ref_key))
+                }
+                _ => (current_node.clone(), node_ref),
+            };
+
+            // Check if this is a dictionary
+            let dict = match &node_obj {
+                PDFObject::Dictionary(d) => d,
+                _ => continue,
+            };
+
+            // Check the Type field
+            let type_obj = dict.get("Type");
+            let is_page = match type_obj {
+                Some(PDFObject::Name(name)) => name == "Page",
+                _ => !dict.contains_key("Kids"), // If no Type, check for Kids (leaf node)
+            };
+
+            if is_page {
+                // This is a page node
+                if current_page_index == page_index {
+                    return Ok((node_obj, obj_ref));
+                }
+                current_page_index += 1;
+                continue;
+            }
+
+            // This is an intermediate Pages node - traverse its Kids
+            let kids = dict.get("Kids").ok_or_else(|| {
+                PDFError::Generic("Pages node missing Kids array".to_string())
+            })?;
+
+            // Get the kids array (either directly or by resolving a reference)
+            let kids_array = match kids {
+                PDFObject::Array(arr) => arr.clone(),
+                PDFObject::Ref { num, generation } => {
+                    // Kids is a reference, fetch it
+                    let fetched = self.xref.fetch(*num, *generation)?;
+                    match &*fetched {
+                        PDFObject::Array(arr) => arr.clone(),
+                        _ => {
+                            return Err(PDFError::Generic(
+                                "Kids reference doesn't point to array".to_string(),
+                            ))
+                        }
+                    }
+                }
+                _ => {
+                    return Err(PDFError::Generic(
+                        "Kids is not an array or reference".to_string(),
+                    ))
+                }
+            };
+
+            // Add kids to stack in reverse order (to maintain order during DFS)
+            for kid in kids_array.iter().rev() {
+                nodes_to_visit.push((kid.clone(), None));
+            }
+        }
+
+        Err(PDFError::Generic(format!(
+            "Page index {} not found in page tree",
+            page_index
+        )))
+    }
+
+    /// Gets a specific page by index (0-based).
+    ///
+    /// Pages are loaded lazily and cached. The first call for a page will
+    /// traverse the page tree; subsequent calls return the cached page.
+    ///
+    /// # Arguments
+    /// * `page_index` - The 0-based page index (0 = first page)
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// let pdf_data = std::fs::read("document.pdf").unwrap();
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    ///
+    /// // Get the first page
+    /// let page = doc.get_page(0).unwrap();
+    /// println!("Page index: {}", page.index());
+    /// ```
+    pub fn get_page(&mut self, page_index: usize) -> PDFResult<Page> {
+        // Check cache first
+        if let Some(cached_page) = self.page_cache.get(page_index) {
+            return Ok(cached_page.clone());
+        }
+
+        // Traverse the page tree to find the page
+        let (page_dict, page_ref) = self.get_page_dict(page_index)?;
+
+        // Create the Page object
+        let page = Page::new(page_index, page_dict, page_ref);
+
+        // Cache it
+        self.page_cache.put(page_index, page.clone());
+
+        Ok(page)
+    }
+
+    /// Gets an inheritable property from a page dictionary.
+    ///
+    /// PDF pages can inherit certain properties from parent Pages nodes in the
+    /// page tree. This method walks up the tree following "Parent" references
+    /// until it finds the property.
+    ///
+    /// Inheritable properties include:
+    /// - Resources: Fonts, images, and other resources
+    /// - MediaBox: Page dimensions
+    /// - CropBox: Visible page area
+    /// - Rotate: Page rotation
+    ///
+    /// # Arguments
+    /// * `page` - The page to start searching from
+    /// * `key` - The property name (e.g., "MediaBox", "Resources")
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// # let pdf_data = vec![];  // Placeholder for example
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    /// let page = doc.get_page(0).unwrap();
+    ///
+    /// // Get MediaBox (might be inherited from parent)
+    /// let media_box = doc.get_inheritable_property(&page, "MediaBox").ok();
+    /// ```
+    pub fn get_inheritable_property(&mut self, page: &Page, key: &str) -> PDFResult<PDFObject> {
+        let mut current_dict = page.dict().clone();
+        let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
+
+        loop {
+            // Get the dictionary
+            let dict = match &current_dict {
+                PDFObject::Dictionary(d) => d,
+                _ => return Err(PDFError::Generic("Not a dictionary".to_string())),
+            };
+
+            // Check if this dictionary has the property
+            if let Some(value) = dict.get(key) {
+                // Found it! Resolve if it's a reference
+                return self.xref.fetch_if_ref(value);
+            }
+
+            // Not found, try parent
+            let parent = dict.get("Parent").ok_or_else(|| {
+                PDFError::Generic(format!("Property '{}' not found in page tree", key))
+            })?;
+
+            // Resolve parent if it's a reference
+            match parent {
+                PDFObject::Ref { num, generation } => {
+                    let ref_key = (*num, *generation);
+
+                    // Prevent circular references
+                    if visited_refs.contains(&ref_key) {
+                        return Err(PDFError::Generic(
+                            "Circular reference in page tree".to_string(),
+                        ));
+                    }
+                    visited_refs.insert(ref_key);
+
+                    // Fetch the parent dictionary
+                    let parent_obj = self.xref.fetch(*num, *generation)?;
+                    current_dict = (*parent_obj).clone();
+                }
+                _ => {
+                    // Parent is not a reference, use it directly
+                    current_dict = parent.clone();
+                }
+            }
+        }
+    }
+
+    /// Gets the MediaBox for a page, using inheritance if needed.
+    ///
+    /// MediaBox defines the boundaries of the physical medium on which the page
+    /// is to be printed. It's an array of 4 numbers: [llx, lly, urx, ury]
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// # let pdf_data = vec![];  // Placeholder for example
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    /// let page = doc.get_page(0).unwrap();
+    /// let media_box = doc.get_media_box(&page).unwrap();
+    /// ```
+    pub fn get_media_box(&mut self, page: &Page) -> PDFResult<PDFObject> {
+        self.get_inheritable_property(page, "MediaBox")
+    }
+
+    /// Gets the Resources dictionary for a page, using inheritance if needed.
+    ///
+    /// Resources contains fonts, images, and other resources used by the page.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// # let pdf_data = vec![];  // Placeholder for example
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    /// let page = doc.get_page(0).unwrap();
+    /// let resources = doc.get_resources(&page).ok();
+    /// ```
+    pub fn get_resources(&mut self, page: &Page) -> PDFResult<PDFObject> {
+        self.get_inheritable_property(page, "Resources")
+    }
+
+    /// Gets the CropBox for a page, using inheritance if needed.
+    ///
+    /// CropBox defines the region to which the contents of the page should be
+    /// clipped when displayed or printed.
+    pub fn get_crop_box(&mut self, page: &Page) -> PDFResult<PDFObject> {
+        self.get_inheritable_property(page, "CropBox")
+    }
+
+    /// Gets the Rotate value for a page, using inheritance if needed.
+    ///
+    /// Rotate specifies the number of degrees by which the page should be
+    /// rotated clockwise when displayed or printed. Must be a multiple of 90.
+    pub fn get_rotate(&mut self, page: &Page) -> PDFResult<PDFObject> {
+        self.get_inheritable_property(page, "Rotate")
+    }
 }
 
 #[cfg(test)]
@@ -202,7 +476,7 @@ mod tests {
             0000000000 65535 f\n\
             0000000009 00000 n\n\
             0000000058 00000 n\n\
-            0000000117 00000 n\n\
+            0000000115 00000 n\n\
             trailer\n\
             << /Size 4 /Root 1 0 R >>\n\
             startxref\n\
@@ -263,5 +537,341 @@ mod tests {
 
         let count = doc.page_count().unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_get_page_simple() {
+        let pdf = create_minimal_pdf();
+        let mut doc = PDFDocument::open(pdf).unwrap();
+
+        // Get the first (and only) page
+        let page = doc.get_page(0).unwrap();
+        assert_eq!(page.index(), 0);
+
+        // Verify it's a page dictionary
+        match page.dict() {
+            PDFObject::Dictionary(dict) => {
+                assert_eq!(
+                    dict.get("Type"),
+                    Some(&PDFObject::Name("Page".to_string()))
+                );
+                assert!(dict.contains_key("Parent"));
+            }
+            _ => panic!("Expected page dict to be a dictionary"),
+        }
+    }
+
+    #[test]
+    fn test_get_page_multiple_pages() {
+        // Create a PDF with 3 pages (flat structure)
+        let pdf = b"%PDF-1.4\n\
+            1 0 obj\n\
+            << /Type /Catalog /Pages 2 0 R >>\n\
+            endobj\n\
+            2 0 obj\n\
+            << /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\n\
+            endobj\n\
+            3 0 obj\n\
+            << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            4 0 obj\n\
+            << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            5 0 obj\n\
+            << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            xref\n\
+            0 6\n\
+            0000000000 65535 f\n\
+            0000000009 00000 n\n\
+            0000000058 00000 n\n\
+            0000000127 00000 n\n\
+            0000000198 00000 n\n\
+            0000000269 00000 n\n\
+            trailer\n\
+            << /Size 6 /Root 1 0 R >>\n\
+            startxref\n\
+            340\n\
+            %%EOF\n";
+
+        let mut doc = PDFDocument::open(pdf.to_vec()).unwrap();
+
+        // Verify page count
+        assert_eq!(doc.page_count().unwrap(), 3);
+
+        // Get each page and verify index
+        let page0 = doc.get_page(0).unwrap();
+        assert_eq!(page0.index(), 0);
+
+        let page1 = doc.get_page(1).unwrap();
+        assert_eq!(page1.index(), 1);
+
+        let page2 = doc.get_page(2).unwrap();
+        assert_eq!(page2.index(), 2);
+    }
+
+    #[test]
+    fn test_page_caching() {
+        let pdf = create_minimal_pdf();
+        let mut doc = PDFDocument::open(pdf).unwrap();
+
+        // Get the page twice
+        let page1 = doc.get_page(0).unwrap();
+        let page2 = doc.get_page(0).unwrap();
+
+        // Both should have the same index (verifies caching works)
+        assert_eq!(page1.index(), page2.index());
+        assert_eq!(page1.index(), 0);
+    }
+
+    #[test]
+    fn test_get_page_out_of_bounds() {
+        let pdf = create_minimal_pdf();
+        let mut doc = PDFDocument::open(pdf).unwrap();
+
+        // Try to get a page that doesn't exist
+        let result = doc.get_page(99);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hierarchical_page_tree() {
+        // Create a PDF with 2-level page tree:
+        // Root Pages -> 2 intermediate Pages nodes -> 2 pages each
+        let pdf = b"%PDF-1.4\n\
+            1 0 obj\n\
+            << /Type /Catalog /Pages 2 0 R >>\n\
+            endobj\n\
+            2 0 obj\n\
+            << /Type /Pages /Kids [3 0 R 4 0 R] /Count 4 >>\n\
+            endobj\n\
+            3 0 obj\n\
+            << /Type /Pages /Kids [5 0 R 6 0 R] /Count 2 /Parent 2 0 R >>\n\
+            endobj\n\
+            4 0 obj\n\
+            << /Type /Pages /Kids [7 0 R 8 0 R] /Count 2 /Parent 2 0 R >>\n\
+            endobj\n\
+            5 0 obj\n\
+            << /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            6 0 obj\n\
+            << /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            7 0 obj\n\
+            << /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            8 0 obj\n\
+            << /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            xref\n\
+            0 9\n\
+            0000000000 65535 f\n\
+            0000000009 00000 n\n\
+            0000000058 00000 n\n\
+            0000000121 00000 n\n\
+            0000000198 00000 n\n\
+            0000000275 00000 n\n\
+            0000000346 00000 n\n\
+            0000000417 00000 n\n\
+            0000000488 00000 n\n\
+            trailer\n\
+            << /Size 9 /Root 1 0 R >>\n\
+            startxref\n\
+            559\n\
+            %%EOF\n";
+
+        let mut doc = PDFDocument::open(pdf.to_vec()).unwrap();
+
+        // Verify page count
+        assert_eq!(doc.page_count().unwrap(), 4);
+
+        // Get all 4 pages and verify they have correct indices
+        for i in 0..4 {
+            let page = doc.get_page(i).unwrap();
+            assert_eq!(page.index(), i);
+
+            // Verify it's a page
+            match page.dict() {
+                PDFObject::Dictionary(dict) => {
+                    assert_eq!(
+                        dict.get("Type"),
+                        Some(&PDFObject::Name("Page".to_string()))
+                    );
+                }
+                _ => panic!("Expected page dict to be a dictionary"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_inherited_media_box() {
+        // Create a PDF where MediaBox is defined at the Pages level, not on individual pages
+        let pdf = b"%PDF-1.4\n\
+            1 0 obj\n\
+            << /Type /Catalog /Pages 2 0 R >>\n\
+            endobj\n\
+            2 0 obj\n\
+            << /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            3 0 obj\n\
+            << /Type /Page /Parent 2 0 R >>\n\
+            endobj\n\
+            xref\n\
+            0 4\n\
+            0000000000 65535 f\n\
+            0000000009 00000 n\n\
+            0000000058 00000 n\n\
+            0000000139 00000 n\n\
+            trailer\n\
+            << /Size 4 /Root 1 0 R >>\n\
+            startxref\n\
+            186\n\
+            %%EOF\n";
+
+        let mut doc = PDFDocument::open(pdf.to_vec()).unwrap();
+        let page = doc.get_page(0).unwrap();
+
+        // Page itself doesn't have MediaBox
+        assert!(page.get("MediaBox").is_none());
+
+        // But we can get it via inheritance
+        let media_box = doc.get_media_box(&page).unwrap();
+        match media_box {
+            PDFObject::Array(arr) => {
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], PDFObject::Number(0.0));
+                assert_eq!(arr[1], PDFObject::Number(0.0));
+                assert_eq!(arr[2], PDFObject::Number(612.0));
+                assert_eq!(arr[3], PDFObject::Number(792.0));
+            }
+            _ => panic!("Expected MediaBox to be an array"),
+        }
+    }
+
+    #[test]
+    fn test_inherited_resources() {
+        // Create a PDF where Resources is defined at the Pages level
+        let pdf = b"%PDF-1.4\n\
+            1 0 obj\n\
+            << /Type /Catalog /Pages 2 0 R >>\n\
+            endobj\n\
+            2 0 obj\n\
+            << /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << >> >> >>\n\
+            endobj\n\
+            3 0 obj\n\
+            << /Type /Page /Parent 2 0 R >>\n\
+            endobj\n\
+            xref\n\
+            0 4\n\
+            0000000000 65535 f\n\
+            0000000009 00000 n\n\
+            0000000058 00000 n\n\
+            0000000144 00000 n\n\
+            trailer\n\
+            << /Size 4 /Root 1 0 R >>\n\
+            startxref\n\
+            191\n\
+            %%EOF\n";
+
+        let mut doc = PDFDocument::open(pdf.to_vec()).unwrap();
+        let page = doc.get_page(0).unwrap();
+
+        // Get Resources via inheritance
+        let resources = doc.get_resources(&page).unwrap();
+        match resources {
+            PDFObject::Dictionary(dict) => {
+                assert!(dict.contains_key("Font"));
+            }
+            _ => panic!("Expected Resources to be a dictionary"),
+        }
+    }
+
+    #[test]
+    fn test_property_override() {
+        // Create a PDF where MediaBox is defined at both Pages and Page level
+        // Page level should take precedence
+        let pdf = b"%PDF-1.4\n\
+            1 0 obj\n\
+            << /Type /Catalog /Pages 2 0 R >>\n\
+            endobj\n\
+            2 0 obj\n\
+            << /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            3 0 obj\n\
+            << /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] >>\n\
+            endobj\n\
+            xref\n\
+            0 4\n\
+            0000000000 65535 f\n\
+            0000000009 00000 n\n\
+            0000000058 00000 n\n\
+            0000000139 00000 n\n\
+            trailer\n\
+            << /Size 4 /Root 1 0 R >>\n\
+            startxref\n\
+            210\n\
+            %%EOF\n";
+
+        let mut doc = PDFDocument::open(pdf.to_vec()).unwrap();
+        let page = doc.get_page(0).unwrap();
+
+        // Should get the page-level MediaBox (300x400), not the inherited one (612x792)
+        let media_box = doc.get_media_box(&page).unwrap();
+        match media_box {
+            PDFObject::Array(arr) => {
+                assert_eq!(arr[2], PDFObject::Number(300.0));
+                assert_eq!(arr[3], PDFObject::Number(400.0));
+            }
+            _ => panic!("Expected MediaBox to be an array"),
+        }
+    }
+
+    #[test]
+    fn test_multi_level_inheritance() {
+        // Create a hierarchical page tree where MediaBox is at the root Pages level
+        let pdf = b"%PDF-1.4\n\
+            1 0 obj\n\
+            << /Type /Catalog /Pages 2 0 R >>\n\
+            endobj\n\
+            2 0 obj\n\
+            << /Type /Pages /Kids [3 0 R] /Count 2 /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            3 0 obj\n\
+            << /Type /Pages /Kids [4 0 R 5 0 R] /Count 2 /Parent 2 0 R >>\n\
+            endobj\n\
+            4 0 obj\n\
+            << /Type /Page /Parent 3 0 R >>\n\
+            endobj\n\
+            5 0 obj\n\
+            << /Type /Page /Parent 3 0 R >>\n\
+            endobj\n\
+            xref\n\
+            0 6\n\
+            0000000000 65535 f\n\
+            0000000009 00000 n\n\
+            0000000058 00000 n\n\
+            0000000139 00000 n\n\
+            0000000216 00000 n\n\
+            0000000263 00000 n\n\
+            trailer\n\
+            << /Size 6 /Root 1 0 R >>\n\
+            startxref\n\
+            310\n\
+            %%EOF\n";
+
+        let mut doc = PDFDocument::open(pdf.to_vec()).unwrap();
+
+        // Both pages should inherit MediaBox from the root Pages level
+        for i in 0..2 {
+            let page = doc.get_page(i).unwrap();
+            let media_box = doc.get_media_box(&page).unwrap();
+            match media_box {
+                PDFObject::Array(arr) => {
+                    assert_eq!(arr[2], PDFObject::Number(612.0));
+                    assert_eq!(arr[3], PDFObject::Number(792.0));
+                }
+                _ => panic!("Expected MediaBox to be an array"),
+            }
+        }
     }
 }

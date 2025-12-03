@@ -1,8 +1,11 @@
 use super::base_stream::BaseStream;
+use super::decode;
 use super::error::{PDFError, PDFResult};
 use super::lexer::Lexer;
 use super::parser::{PDFObject, Parser};
+use super::stream::Stream;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Cross-reference table entry.
 ///
@@ -50,7 +53,8 @@ pub struct XRef {
     entries: Vec<Option<XRefEntry>>,
 
     /// Cache of parsed objects (object number -> PDFObject)
-    cache: HashMap<u32, PDFObject>,
+    /// Uses Rc to avoid expensive cloning of large objects
+    cache: HashMap<u32, Rc<PDFObject>>,
 
     /// The trailer dictionary
     trailer: Option<PDFObject>,
@@ -244,14 +248,153 @@ impl XRef {
         self.entries.get(obj_num as usize)?.as_ref()
     }
 
+    /// Fetches an object from a compressed object stream (ObjStm).
+    ///
+    /// Object streams contain multiple PDF objects in a compressed format.
+    /// The stream format is:
+    /// ```text
+    /// N1 offset1 N2 offset2 ... Nn offsetn [object1] [object2] ... [objectn]
+    /// ```
+    ///
+    /// Based on PDF.js fetchCompressed method.
+    ///
+    /// # Arguments
+    /// * `obj_stream_num` - The object number of the ObjStm
+    /// * `index` - The index of the object within the stream (0-based)
+    ///
+    /// # Returns
+    /// The requested object wrapped in Rc
+    fn fetch_compressed(&mut self, obj_stream_num: u32, index: u32) -> PDFResult<Rc<PDFObject>> {
+        // First, fetch the object stream itself (as an uncompressed object)
+        let obj_stream_obj = self.fetch(obj_stream_num, 0)?;
+
+        // The object stream must be a Stream object with dictionary and data
+        match &*obj_stream_obj {
+            PDFObject::Stream { dict, data } => {
+                // Check if this is an ObjStm
+                if let Some(PDFObject::Name(type_name)) = dict.get("Type") {
+                    if type_name != "ObjStm" {
+                        return Err(PDFError::Generic(format!(
+                            "Expected ObjStm type, got /{}",
+                            type_name
+                        )));
+                    }
+                }
+
+                // Get N (number of objects) and First (byte offset of first object)
+                let n = dict
+                    .get("N")
+                    .and_then(|obj| match obj {
+                        PDFObject::Number(n) => Some(*n as u32),
+                        _ => None,
+                    })
+                    .ok_or_else(|| PDFError::Generic("ObjStm missing /N parameter".to_string()))?;
+
+                let first = dict
+                    .get("First")
+                    .and_then(|obj| match obj {
+                        PDFObject::Number(n) => Some(*n as usize),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        PDFError::Generic("ObjStm missing /First parameter".to_string())
+                    })?;
+
+                if index >= n {
+                    return Err(PDFError::Generic(format!(
+                        "Index {} out of range for ObjStm with {} objects",
+                        index, n
+                    )));
+                }
+
+                // Decompress the stream data if needed
+                let filter_name = dict.get("Filter").and_then(|f| match f {
+                    PDFObject::Name(name) => Some(name.as_str()),
+                    _ => None,
+                });
+
+                let decompressed_data = decode::decode_stream(data, filter_name)?;
+
+                // Parse the object number/offset pairs (first N pairs of integers)
+                let index_stream = Stream::from_bytes(decompressed_data[..first].to_vec());
+                let lexer = Lexer::new(Box::new(index_stream) as Box<dyn BaseStream>)?;
+                let mut parser = Parser::new(lexer)?;
+
+                // Read all object numbers and offsets
+                let mut obj_nums = Vec::with_capacity(n as usize);
+                let mut offsets = Vec::with_capacity(n as usize);
+
+                for _ in 0..n {
+                    let num = parser.get_object()?;
+                    let offset = parser.get_object()?;
+
+                    let obj_num = match num {
+                        PDFObject::Number(n) => n as u32,
+                        _ => {
+                            return Err(PDFError::Generic(format!(
+                                "Expected object number, got {:?}",
+                                num
+                            )))
+                        }
+                    };
+
+                    let obj_offset = match offset {
+                        PDFObject::Number(n) => n as usize,
+                        _ => {
+                            return Err(PDFError::Generic(format!(
+                                "Expected offset, got {:?}",
+                                offset
+                            )))
+                        }
+                    };
+
+                    obj_nums.push(obj_num);
+                    offsets.push(obj_offset);
+                }
+
+                // Now parse the object at the requested index
+                let obj_offset = first + offsets[index as usize];
+                let obj_length = if (index as usize) < offsets.len() - 1 {
+                    offsets[index as usize + 1]
+                } else {
+                    decompressed_data.len() - obj_offset
+                };
+
+                // Create a stream for just this object's data
+                let obj_data = decompressed_data[obj_offset..obj_offset + obj_length].to_vec();
+                let obj_stream = Stream::from_bytes(obj_data);
+                let obj_lexer = Lexer::new(Box::new(obj_stream) as Box<dyn BaseStream>)?;
+                let mut obj_parser = Parser::new(obj_lexer)?;
+
+                // Parse the object (no "obj"/"endobj" wrappers in ObjStm)
+                let object = Rc::new(obj_parser.get_object()?);
+
+                // Cache it with the actual object number
+                let actual_obj_num = obj_nums[index as usize];
+                self.cache.insert(actual_obj_num, Rc::clone(&object));
+
+                Ok(object)
+            }
+            PDFObject::Dictionary(_) => {
+                // If it's just a dictionary without stream data, we can't decompress it yet
+                Err(PDFError::Generic(
+                    "ObjStm is a dictionary but stream data parsing not yet implemented".to_string(),
+                ))
+            }
+            _ => Err(PDFError::Generic(
+                "ObjStm is not a stream or dictionary".to_string(),
+            )),
+        }
+    }
+
     /// Fetches an indirect object by reference.
     ///
     /// This resolves an indirect reference like "5 0 R" to its actual object.
-    /// The object is cached after being parsed.
-    pub fn fetch(&mut self, obj_num: u32, generation: u32) -> PDFResult<PDFObject> {
-        // Check cache first
+    /// The object is cached after being parsed. Returns an Rc to avoid expensive cloning.
+    pub fn fetch(&mut self, obj_num: u32, generation: u32) -> PDFResult<Rc<PDFObject>> {
+        // Check cache first - Rc::clone is cheap (just increments refcount)
         if let Some(cached) = self.cache.get(&obj_num) {
-            return Ok(cached.clone());
+            return Ok(Rc::clone(cached));
         }
 
         // Get xref entry
@@ -280,16 +423,16 @@ impl XRef {
                 // Clone the offset to avoid borrow checker issues
                 let offset_value = *offset;
 
-                // Seek to the object's position
-                let original_pos = self.stream.pos();
-                self.stream.set_pos(offset_value as usize)?;
+                // Create a sub-stream starting at the object's position
+                // No need to manipulate parent stream position - sub-stream is independent
+                let sub_stream = self.stream.make_sub_stream(
+                    offset_value as usize,
+                    self.stream.length() - offset_value as usize,
+                )?;
 
                 // Parse the indirect object
                 // Format: N G obj ... endobj
-                let lexer = Lexer::new(self.stream.make_sub_stream(
-                    offset_value as usize,
-                    self.stream.length() - offset_value as usize,
-                )?)?;
+                let lexer = Lexer::new(sub_stream)?;
                 let mut parser = Parser::new(lexer)?;
 
                 // Read object number
@@ -340,27 +483,34 @@ impl XRef {
                 }
 
                 // Read the actual object
-                let object = parser.get_object()?;
+                let object = Rc::new(parser.get_object()?);
 
-                // Restore stream position
-                self.stream.set_pos(original_pos)?;
-
-                // Cache the object
-                self.cache.insert(obj_num, object.clone());
+                // Cache the Rc - cheap clone
+                self.cache.insert(obj_num, Rc::clone(&object));
 
                 Ok(object)
             }
 
-            XRefEntry::Compressed { .. } => Err(PDFError::Generic(
-                "Compressed object streams not yet implemented".to_string(),
-            )),
+            XRefEntry::Compressed {
+                obj_stream_num,
+                index,
+            } => {
+                // Fetch from compressed object stream
+                self.fetch_compressed(*obj_stream_num, *index)
+            }
         }
     }
 
     /// Fetches an object if it's a reference, otherwise returns the object as-is.
+    ///
+    /// Returns an owned PDFObject (cloned from Rc if fetched from cache).
+    /// Use `fetch()` directly if you want an Rc to avoid the clone.
     pub fn fetch_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
         match obj {
-            PDFObject::Ref { num, generation } => self.fetch(*num, *generation),
+            PDFObject::Ref { num, generation } => {
+                let rc_obj = self.fetch(*num, *generation)?;
+                Ok((*rc_obj).clone())
+            }
             _ => Ok(obj.clone()),
         }
     }
@@ -394,7 +544,13 @@ impl XRef {
                 .clone()
         };
 
-        self.fetch_if_ref(&root_ref)
+        // Fetch and dereference the Rc
+        let rc_catalog = match &root_ref {
+            PDFObject::Ref { num, generation } => self.fetch(*num, *generation)?,
+            _ => return Ok(root_ref),
+        };
+
+        Ok((*rc_catalog).clone())
     }
 
     /// Returns the number of entries in the xref table.
@@ -527,7 +683,7 @@ mod tests {
 
         // Fetch object 1
         let obj = xref.fetch(1, 0).unwrap();
-        assert_eq!(obj, PDFObject::Number(42.0));
+        assert_eq!(*obj, PDFObject::Number(42.0));
     }
 
     #[test]
