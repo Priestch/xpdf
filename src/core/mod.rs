@@ -1,15 +1,23 @@
 pub mod base_stream;
 pub mod chunk_manager;
+pub mod document;
 pub mod error;
 pub mod file_chunked_stream;
 pub mod http_chunked_stream;
+pub mod lexer;
+pub mod parser;
 pub mod stream;
 pub mod sub_stream;
+pub mod xref;
 
 pub use base_stream::BaseStream;
 pub use chunk_manager::{ChunkLoader, ChunkManager};
+pub use document::PDFDocument;
 pub use error::PDFError;
 pub use file_chunked_stream::FileChunkedStream;
 pub use http_chunked_stream::HttpChunkedStream;
+pub use lexer::{Lexer, Token};
+pub use parser::{PDFObject, Parser};
 pub use stream::Stream;
 pub use sub_stream::SubStream;
+pub use xref::{XRef, XRefEntry};

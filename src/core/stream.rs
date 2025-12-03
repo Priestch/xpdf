@@ -1,14 +1,18 @@
 use super::base_stream::BaseStream;
 use super::error::{PDFError, PDFResult};
+use std::sync::Arc;
 
 /// A simple in-memory stream implementation.
 ///
 /// This is the basic stream type that holds PDF data in memory.
 /// It serves as a foundation for other stream types and is useful
 /// for testing and when the entire PDF is already in memory.
+///
+/// The underlying data is stored in an Arc, allowing sub-streams to
+/// share the same data without cloning.
 pub struct Stream {
-    /// The underlying byte buffer
-    bytes: Vec<u8>,
+    /// The underlying byte buffer (shared via Arc)
+    bytes: Arc<Vec<u8>>,
     /// Current read position
     pos: usize,
     /// Starting offset in the buffer
@@ -32,10 +36,22 @@ impl Stream {
         };
 
         Stream {
-            bytes,
+            bytes: Arc::new(bytes),
             pos: start,
             start,
             length: actual_length,
+        }
+    }
+
+    /// Creates a new Stream from an Arc-wrapped byte vector.
+    ///
+    /// This is used internally for creating sub-streams that share data.
+    fn from_arc(bytes: Arc<Vec<u8>>, start: usize, length: usize) -> Self {
+        Stream {
+            bytes,
+            pos: start,
+            start,
+            length,
         }
     }
 
@@ -132,7 +148,12 @@ impl BaseStream for Stream {
             });
         }
 
-        Ok(Box::new(Stream::new(self.bytes.clone(), start, length)))
+        // Share the Arc instead of cloning the data
+        Ok(Box::new(Stream::from_arc(
+            Arc::clone(&self.bytes),
+            start,
+            length,
+        )))
     }
 }
 
@@ -239,5 +260,18 @@ mod tests {
         assert_eq!(sub.length(), 4);
         assert_eq!(sub.get_byte().unwrap(), 3);
         assert_eq!(sub.get_byte().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_sub_stream_shares_data() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let stream = Stream::from_bytes(data);
+
+        // Create two sub-streams
+        let sub1 = stream.make_sub_stream(0, 5).unwrap();
+        let sub2 = stream.make_sub_stream(5, 5).unwrap();
+
+        // They should share the same underlying Arc
+        assert_eq!(Arc::strong_count(&stream.bytes), 3); // stream + sub1 + sub2
     }
 }

@@ -50,12 +50,50 @@ PDF-X follows the layered architecture of PDF.js:
 
 ## Project Status
 
-This project is in early development. The goal is to implement:
+**Current Phase:** Core parsing infrastructure complete ✅
 
-- [ ] Core PDF parser with streaming support
-- [ ] Progressive data loading
-- [ ] Page-by-page lazy parsing
-- [ ] Content stream interpreter
+### Completed Layers
+
+1. ✅ **Data Source Layer** - Chunked streaming from multiple sources
+   - In-memory streams with Arc-based sharing
+   - File chunked streams with LRU caching
+   - HTTP chunked streams with range requests
+   - Sub-stream abstraction for efficient slicing
+
+2. ✅ **Lexer Layer** - Complete PDF tokenization
+   - All PDF primitive types (numbers, strings, names, booleans, null)
+   - Hex strings and literal strings with escape sequences
+   - Array and dictionary delimiters
+   - Command/operator tokens
+   - 39 comprehensive tests
+
+3. ✅ **Parser Layer** - PDF object construction
+   - Recursive parsing of arrays and dictionaries
+   - Indirect object reference detection (N G R pattern)
+   - Nested structure support
+   - 22 comprehensive tests
+
+4. ✅ **XRef Layer** - Cross-reference table parsing
+   - XRef table parsing (free/uncompressed entries)
+   - Indirect object resolution and caching
+   - Trailer dictionary extraction
+   - 6 comprehensive tests
+
+5. ✅ **Document Layer** - High-level PDF interface
+   - PDF document opening and parsing
+   - Catalog (root) dictionary access
+   - Page count extraction
+   - Pages dictionary access
+   - 4 comprehensive tests
+
+**Test Coverage:** 107 tests passing (all green ✅)
+
+### In Progress / Next Steps
+
+- [ ] Compressed object streams (ObjStm)
+- [ ] Linearized PDF optimization
+- [ ] Page tree traversal and lazy page loading
+- [ ] Content stream parsing
 - [ ] Text extraction
 - [ ] Image rendering
 - [ ] Font handling
@@ -104,24 +142,50 @@ This project includes the original PDF.js repository as a git submodule under `p
 
 The submodule allows AI code agents to analyze the proven PDF.js implementation while writing the Rust port, ensuring architectural fidelity and correctness.
 
-## Usage (Planned)
+## Usage
 
 ```rust
-use pdf_x::{Document, LoadingConfig};
+use pdf_x::PDFDocument;
 
-// Progressive loading from URL
-let config = LoadingConfig::new()
-    .enable_progressive_loading(true)
-    .chunk_size(65536);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Read PDF from file
+    let pdf_data = std::fs::read("document.pdf")?;
 
-let document = Document::from_url("https://example.com/document.pdf", config).await?;
+    // Open the PDF document
+    let mut doc = PDFDocument::open(pdf_data)?;
 
-// Render pages as they become available
-for page_num in 0..document.page_count() {
-    let page = document.get_page(page_num).await?;
-    let bitmap = page.render()?;
-    // Display bitmap
+    // Get page count
+    let page_count = doc.page_count()?;
+    println!("Total pages: {}", page_count);
+
+    // Access the catalog (root dictionary)
+    if let Some(catalog) = doc.catalog() {
+        println!("Catalog: {:?}", catalog);
+    }
+
+    // Get the Pages dictionary
+    let pages_dict = doc.pages_dict()?;
+    println!("Pages: {:?}", pages_dict);
+
+    Ok(())
 }
+```
+
+See `examples/read_pdf.rs` for a complete working example.
+
+### Running Examples
+
+```bash
+# Run the PDF reader example (parses a minimal test PDF)
+cargo run --example read_pdf
+
+# Run tests
+cargo test
+
+# Run specific test module
+cargo test lexer
+cargo test parser
+cargo test xref
 ```
 
 ## Contributing

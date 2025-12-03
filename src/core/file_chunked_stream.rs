@@ -1,9 +1,10 @@
 use super::base_stream::BaseStream;
-use super::chunk_manager::{ChunkLoader, ChunkManager, DEFAULT_MAX_CACHED_CHUNKS};
+use super::chunk_manager::{ChunkLoader, ChunkManager};
 use super::error::{PDFError, PDFResult};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// A chunked stream that progressively loads data from a filesystem file.
 ///
@@ -12,15 +13,18 @@ use std::path::{Path, PathBuf};
 /// - Maintaining an LRU cache of recently used chunks
 /// - Not loading the entire file into memory
 ///
+/// The file handle and chunk manager are shared via Arc, allowing sub-streams
+/// to reuse the same resources and cache.
+///
 /// This mirrors PDF.js's ChunkedStream but optimized for filesystem access
 /// with minimal memory footprint.
 pub struct FileChunkedStream {
-    /// File handle for reading chunks
-    file: File,
-    /// Path to the file (stored for sub-stream creation)
+    /// File handle for reading chunks (shared)
+    file: Arc<Mutex<File>>,
+    /// Path to the file (stored for reference)
     file_path: PathBuf,
-    /// The chunk manager that tracks loaded chunks
-    manager: ChunkManager,
+    /// The chunk manager that tracks loaded chunks (shared)
+    manager: Arc<Mutex<ChunkManager>>,
     /// Current read position
     pos: usize,
     /// Starting offset in the file
@@ -33,24 +37,33 @@ impl ChunkLoader for FileChunkedStream {
         let chunk_end = std::cmp::min(chunk_start + self.chunk_size(), self.total_length());
         let chunk_length = chunk_end - chunk_start;
 
-        self.file
-            .seek(SeekFrom::Start(chunk_start as u64))
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|e| PDFError::StreamError(format!("Failed to lock file: {}", e)))?;
+
+        file.seek(SeekFrom::Start(chunk_start as u64))
             .map_err(|e| PDFError::StreamError(format!("Failed to seek to chunk: {}", e)))?;
 
         let mut buffer = vec![0u8; chunk_length];
-        self.file
-            .read_exact(&mut buffer)
+        file.read_exact(&mut buffer)
             .map_err(|e| PDFError::StreamError(format!("Failed to read chunk: {}", e)))?;
 
         Ok(buffer)
     }
 
     fn chunk_size(&self) -> usize {
-        self.manager.chunk_size()
+        self.manager
+            .lock()
+            .map(|m| m.chunk_size())
+            .unwrap_or(0)
     }
 
     fn total_length(&self) -> usize {
-        self.manager.length()
+        self.manager
+            .lock()
+            .map(|m| m.length())
+            .unwrap_or(0)
     }
 }
 
@@ -84,49 +97,94 @@ impl FileChunkedStream {
         let manager = ChunkManager::new(length, chunk_size, max_cached_chunks);
 
         Ok(FileChunkedStream {
+            file: Arc::new(Mutex::new(file)),
+            file_path,
+            manager: Arc::new(Mutex::new(manager)),
+            pos: 0,
+            start: 0,
+        })
+    }
+
+    /// Creates a new FileChunkedStream that shares resources with another stream.
+    ///
+    /// This is used internally for creating sub-streams.
+    fn from_shared(
+        file: Arc<Mutex<File>>,
+        file_path: PathBuf,
+        manager: Arc<Mutex<ChunkManager>>,
+    ) -> Self {
+        FileChunkedStream {
             file,
             file_path,
             manager,
             pos: 0,
             start: 0,
-        })
+        }
     }
 
     /// Ensures a chunk is loaded into the manager.
     ///
     /// If not already loaded, requests the chunk and sends it to the manager.
     fn ensure_chunk_loaded(&mut self, chunk_num: usize) -> PDFResult<()> {
-        if !self.manager.has_chunk(chunk_num) {
+        let mut manager = self
+            .manager
+            .lock()
+            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+
+        if !manager.has_chunk(chunk_num) {
+            // Release lock before loading
+            drop(manager);
             let data = self.request_chunk(chunk_num)?;
-            self.manager.on_receive_data(chunk_num, data)?;
-        } else if self.manager.is_chunk_cached(chunk_num) {
-            self.manager.mark_chunk_accessed(chunk_num);
+            let mut manager = self
+                .manager
+                .lock()
+                .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+            manager.on_receive_data(chunk_num, data)?;
+        } else if manager.is_chunk_cached(chunk_num) {
+            manager.mark_chunk_accessed(chunk_num);
         } else {
             // Chunk was loaded before but evicted from cache, reload it
+            drop(manager);
             let data = self.request_chunk(chunk_num)?;
-            self.manager.on_receive_data(chunk_num, data)?;
+            let mut manager = self
+                .manager
+                .lock()
+                .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+            manager.on_receive_data(chunk_num, data)?;
         }
         Ok(())
     }
 
     /// Returns the number of chunks currently loaded in the cache.
     pub fn num_chunks_loaded(&self) -> usize {
-        self.manager.num_chunks_loaded()
+        self.manager
+            .lock()
+            .map(|m| m.num_chunks_loaded())
+            .unwrap_or(0)
     }
 
     /// Returns the total number of chunks in the file.
     pub fn num_chunks(&self) -> usize {
-        self.manager.num_chunks()
+        self.manager
+            .lock()
+            .map(|m| m.num_chunks())
+            .unwrap_or(0)
     }
 
     /// Returns true if all chunks are loaded.
     pub fn is_fully_loaded(&self) -> bool {
-        self.manager.is_data_loaded()
+        self.manager
+            .lock()
+            .map(|m| m.is_data_loaded())
+            .unwrap_or(false)
     }
 
     /// Returns a list of chunk numbers that are not currently loaded.
     pub fn get_missing_chunks(&self) -> Vec<usize> {
-        self.manager.get_missing_chunks()
+        self.manager
+            .lock()
+            .map(|m| m.get_missing_chunks())
+            .unwrap_or_default()
     }
 
     /// Preloads a specific chunk into the cache.
@@ -136,10 +194,17 @@ impl FileChunkedStream {
 
     /// Preloads a range of chunks into the cache.
     pub fn preload_range(&mut self, begin: usize, end: usize) -> PDFResult<()> {
-        let begin_chunk = self.manager.get_chunk_number(begin);
-        let end_chunk = self.manager.get_chunk_number(end.saturating_sub(1));
+        let manager = self
+            .manager
+            .lock()
+            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
 
-        for chunk in begin_chunk..=end_chunk.min(self.manager.num_chunks() - 1) {
+        let begin_chunk = manager.get_chunk_number(begin);
+        let end_chunk = manager.get_chunk_number(end.saturating_sub(1));
+        let num_chunks = manager.num_chunks();
+        drop(manager);
+
+        for chunk in begin_chunk..=end_chunk.min(num_chunks - 1) {
             self.ensure_chunk_loaded(chunk)?;
         }
 
@@ -149,11 +214,14 @@ impl FileChunkedStream {
 
 impl BaseStream for FileChunkedStream {
     fn length(&self) -> usize {
-        self.manager.length()
+        self.manager
+            .lock()
+            .map(|m| m.length())
+            .unwrap_or(0)
     }
 
     fn is_empty(&self) -> bool {
-        self.manager.length() == 0
+        self.length() == 0
     }
 
     fn pos(&self) -> usize {
@@ -161,10 +229,10 @@ impl BaseStream for FileChunkedStream {
     }
 
     fn set_pos(&mut self, pos: usize) -> PDFResult<()> {
-        if pos > self.manager.length() {
+        if pos > self.length() {
             return Err(PDFError::InvalidPosition {
                 pos,
-                length: self.manager.length(),
+                length: self.length(),
             });
         }
         self.pos = pos;
@@ -172,24 +240,37 @@ impl BaseStream for FileChunkedStream {
     }
 
     fn is_data_loaded(&self) -> bool {
-        self.manager.is_data_loaded()
+        self.is_fully_loaded()
     }
 
     fn get_byte(&mut self) -> PDFResult<u8> {
-        if self.pos >= self.manager.length() {
+        if self.pos >= self.length() {
             return Err(PDFError::UnexpectedEndOfStream);
         }
 
-        let chunk_num = self.manager.get_chunk_number(self.pos);
+        let manager = self
+            .manager
+            .lock()
+            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let chunk_num = manager.get_chunk_number(self.pos);
+        drop(manager);
+
         self.ensure_chunk_loaded(chunk_num)?;
 
-        let byte = self.manager.get_byte_from_cache(self.pos)?;
+        let manager = self
+            .manager
+            .lock()
+            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let byte = manager.get_byte_from_cache(self.pos)?;
+        drop(manager);
+
         self.pos += 1;
         Ok(byte)
     }
 
     fn get_bytes(&mut self, length: usize) -> PDFResult<Vec<u8>> {
-        let end_pos = std::cmp::min(self.pos + length, self.manager.length());
+        let total_length = self.length();
+        let end_pos = std::cmp::min(self.pos + length, total_length);
         let actual_length = end_pos - self.pos;
 
         if actual_length == 0 {
@@ -197,8 +278,14 @@ impl BaseStream for FileChunkedStream {
         }
 
         // Load all required chunks
-        let begin_chunk = self.manager.get_chunk_number(self.pos);
-        let end_chunk = self.manager.get_chunk_number(end_pos - 1);
+        let manager = self
+            .manager
+            .lock()
+            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+        let begin_chunk = manager.get_chunk_number(self.pos);
+        let end_chunk = manager.get_chunk_number(end_pos - 1);
+        let chunk_size = manager.chunk_size();
+        drop(manager);
 
         for chunk in begin_chunk..=end_chunk {
             self.ensure_chunk_loaded(chunk)?;
@@ -206,15 +293,18 @@ impl BaseStream for FileChunkedStream {
 
         // Collect bytes from cache efficiently by copying chunk slices
         let mut result = Vec::with_capacity(actual_length);
+        let manager = self
+            .manager
+            .lock()
+            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
 
         for chunk_num in begin_chunk..=end_chunk {
-            let chunk = self
-                .manager
+            let chunk = manager
                 .get_chunk(chunk_num)
                 .ok_or(PDFError::DataNotLoaded { chunk: chunk_num })?;
 
             // Calculate the start offset within this chunk
-            let chunk_start_pos = chunk_num * self.manager.chunk_size();
+            let chunk_start_pos = chunk_num * chunk_size;
 
             // Determine which part of this chunk we need
             let read_start = if chunk_num == begin_chunk {
@@ -242,31 +332,37 @@ impl BaseStream for FileChunkedStream {
             return Err(PDFError::InvalidByteRange { begin, end });
         }
 
-        if end > self.manager.length() {
+        let total_length = self.length();
+        if end > total_length {
             return Err(PDFError::InvalidByteRange { begin, end });
         }
 
-        let begin_chunk = self.manager.get_chunk_number(begin);
-        let end_chunk = self.manager.get_chunk_number(end - 1);
+        let manager = self
+            .manager
+            .lock()
+            .map_err(|e| PDFError::StreamError(format!("Failed to lock manager: {}", e)))?;
+
+        let begin_chunk = manager.get_chunk_number(begin);
+        let end_chunk = manager.get_chunk_number(end - 1);
 
         // Check if all required chunks are loaded
         for chunk in begin_chunk..=end_chunk {
-            if !self.manager.has_chunk(chunk) {
+            if !manager.has_chunk(chunk) {
                 return Err(PDFError::DataNotLoaded { chunk });
             }
         }
 
         // Collect bytes from cache efficiently by copying chunk slices
         let mut result = Vec::with_capacity(end - begin);
+        let chunk_size = manager.chunk_size();
 
         for chunk_num in begin_chunk..=end_chunk {
-            let chunk = self
-                .manager
+            let chunk = manager
                 .get_chunk(chunk_num)
                 .ok_or(PDFError::DataNotLoaded { chunk: chunk_num })?;
 
             // Calculate the start offset within this chunk
-            let chunk_start_pos = chunk_num * self.manager.chunk_size();
+            let chunk_start_pos = chunk_num * chunk_size;
 
             // Determine which part of this chunk we need
             let read_start = if chunk_num == begin_chunk {
@@ -301,22 +397,22 @@ impl BaseStream for FileChunkedStream {
     }
 
     fn make_sub_stream(&self, start: usize, length: usize) -> PDFResult<Box<dyn BaseStream>> {
-        if start + length > self.manager.length() {
+        if start + length > self.length() {
             return Err(PDFError::InvalidByteRange {
                 begin: start,
                 end: start + length,
             });
         }
 
-        // Create a new FileChunkedStream for the sub-stream by reopening the file
-        let parent = Box::new(Self::open(
-            &self.file_path,
-            Some(self.manager.chunk_size()),
-            Some(DEFAULT_MAX_CACHED_CHUNKS),
-        )?) as Box<dyn BaseStream>;
+        // Create a new FileChunkedStream sharing the same file handle and manager
+        let new_stream = FileChunkedStream::from_shared(
+            Arc::clone(&self.file),
+            self.file_path.clone(),
+            Arc::clone(&self.manager),
+        );
 
         // Wrap in SubStream to provide the restricted view
-        let sub = super::sub_stream::SubStream::new(parent, start, length)?;
+        let sub = super::sub_stream::SubStream::new(Box::new(new_stream), start, length)?;
         Ok(Box::new(sub))
     }
 }
@@ -433,5 +529,19 @@ mod tests {
         let byte = stream.peek_byte().unwrap();
         assert_eq!(byte, 0);
         assert_eq!(stream.pos(), 0); // Position should not change
+    }
+
+    #[test]
+    fn test_sub_stream_shares_resources() {
+        let temp_file = create_test_file(1024);
+        let stream = FileChunkedStream::open(temp_file.path(), None, None).unwrap();
+
+        // Create two sub-streams
+        let sub1 = stream.make_sub_stream(0, 512).unwrap();
+        let sub2 = stream.make_sub_stream(512, 512).unwrap();
+
+        // They should share the same file handle and manager
+        assert_eq!(Arc::strong_count(&stream.file), 3); // stream + sub1 + sub2
+        assert_eq!(Arc::strong_count(&stream.manager), 3); // stream + sub1 + sub2
     }
 }
