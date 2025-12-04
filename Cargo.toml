@@ -6,6 +6,10 @@ authors = ["PDF-X Contributors"]
 description = "A Rust port of PDF.js with progressive loading support"
 license = "Apache-2.0"
 
+[[bin]]
+name = "pdf-inspect"
+path = "src/main.rs"
+
 [dependencies]
 # HTTP client for range requests
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
