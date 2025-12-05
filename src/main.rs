@@ -189,6 +189,29 @@ fn print_object(obj: &PDFObject, indent: usize) {
                 println!("{}>>", indent_str);
             }
         }
+        PDFObject::Stream { dict, data } => {
+            println!("{}stream ({} bytes)", indent_str, data.len());
+            println!("{}<<", indent_str);
+            // Sort keys for consistent output
+            let mut keys: Vec<_> = dict.keys().collect();
+            keys.sort();
+
+            for key in keys {
+                let value = &dict[key];
+                print!("{}/{}:", "  ".repeat(indent + 1), key);
+                match value {
+                    PDFObject::Dictionary(_) | PDFObject::Array(_) => {
+                        println!();
+                        print_object(value, indent + 2);
+                    }
+                    _ => {
+                        print!(" ");
+                        print_object_inline(value);
+                    }
+                }
+            }
+            println!("{}>>", indent_str);
+        }
         PDFObject::Ref { num, generation } => {
             println!("{}{} {} R", indent_str, num, generation)
         }
@@ -226,6 +249,7 @@ fn print_object_inline(obj: &PDFObject) {
         PDFObject::Name(n) => println!("/{}", n),
         PDFObject::Array(_) => println!("[...]"),
         PDFObject::Dictionary(_) => println!("<< ... >>"),
+        PDFObject::Stream { dict: _, data } => println!("stream ({} bytes)", data.len()),
         PDFObject::Ref { num, generation } => println!("{} {} R", num, generation),
         PDFObject::EOF => println!("EOF"),
     }
