@@ -90,6 +90,110 @@ The Data Source Layer must provide a trait/interface that all loaders implement,
 
 Reference `pdf.js/src/core/stream.js` and `pdf.js/src/core/chunked_stream.js` for implementation patterns.
 
+### **CRITICAL RULE: Exception-Driven Progressive Loading**
+
+This is a **NON-NEGOTIABLE** architectural principle that MUST be followed in all code:
+
+**Load as little PDF data as possible. Operations should attempt to proceed with available data and raise exceptions when data is missing. The caller catches these exceptions, loads the required chunks, and retries the operation.**
+
+This follows PDF.js's exception-driven data loading pattern:
+
+```rust
+// ✅ CORRECT APPROACH - Exception-driven loading
+loop {
+    match parser.parse_xref() {
+        Ok(result) => break result,
+        Err(PDFError::DataMissing { position, length }) => {
+            // Load the missing chunk
+            stream.ensure_range(position, length)?;
+            // Retry the operation - it will now succeed or fail with a different missing range
+            continue;
+        }
+        Err(e) => return Err(e), // Other errors propagate
+    }
+}
+```
+
+```rust
+// ❌ WRONG APPROACH - Loading all data upfront (NEVER DO THIS)
+let all_data = stream.get_all_bytes()?; // Violates progressive loading
+parser.parse_xref(&all_data)?;
+```
+
+**Implementation Requirements:**
+
+1. **Never preload data**: Don't use methods like `read_all()`, `load_complete()`, or similar patterns
+2. **Define DataMissing error**: Create a `PDFError::DataMissing { position: usize, length: usize }` variant
+3. **Throw on missing data**: When a read operation would require unavailable data, immediately throw `DataMissing`
+4. **Retry loops at call sites**: Callers implement retry loops that load chunks and retry operations
+5. **Minimal chunk requests**: Request only the specific byte range needed, not arbitrary large chunks
+6. **No buffering layers**: Don't add caching/buffering that hides the progressive nature from upper layers
+
+**When Evaluating External Crates:**
+
+Before using any external Rust crate for PDF functionality, you must evaluate whether it supports progressive loading:
+
+1. ✅ **Acceptable: Isolated operation crates**
+   - Stream decoders (e.g., `flate2` for FlateDecode)
+   - Image decoders (e.g., `png`, `jpeg-decoder`)
+   - Compression algorithms that work on already-loaded data
+   - Utility functions for parsing small data structures
+   - These are acceptable because they operate on data you've already explicitly loaded
+
+2. ❌ **Reject: Full-file processing crates**
+   - Any crate requiring `Arc<[u8]>`, `Vec<u8>`, or similar for the entire PDF
+   - Crates with `load()`, `open(path)`, `from_file()` APIs that load complete files
+   - Crates that use `std::fs::read()` or equivalent in their examples
+   - Crates with internal buffering that loads large file portions without your control
+
+3. ✅ **Acceptable: Learning from source code**
+   - You CAN read external crate source code to understand algorithms
+   - You CAN copy/adapt implementation patterns and utility functions
+   - You CAN use their approach to solving specific problems
+   - You CANNOT use them as dependencies if they violate progressive loading
+
+**Examples:**
+
+```rust
+// ✅ GOOD - Using flate2 for stream decompression
+// (You already loaded this stream data progressively)
+use flate2::read::ZlibDecoder;
+let decompressed = decode_flate(&already_loaded_stream_data)?;
+
+// ❌ BAD - Using hypothetical full-file crate
+use some_pdf_crate::Pdf;
+let data = std::fs::read(path)?;  // Loads entire file
+let pdf = Pdf::new(Arc::new(data))?;  // Requires full data
+
+// ✅ GOOD - Learning from external crate source
+// Copy algorithm pattern, adapt to progressive loading
+fn parse_xref_field(stream: &mut ChunkedStream, offset: usize, width: u8)
+    -> Result<u32, PDFError>
+{
+    // This pattern learned from external crate source
+    // But adapted to use YOUR chunked stream with DataMissing errors
+    let bytes = stream.get_bytes(offset, width as usize)?;  // Can throw DataMissing
+    Ok(match width {
+        0 => 0,
+        1 => bytes[0] as u32,
+        2 => u16::from_be_bytes([bytes[0], bytes[1]]) as u32,
+        3 => u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]),
+        4 => u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        _ => return Err(PDFError::InvalidData("Invalid field width".into())),
+    })
+}
+```
+
+**Progressive Loading is Non-Negotiable:**
+
+This rule exists to enable:
+- **Fast first-page display**: Start rendering before full PDF download completes
+- **Low memory usage**: Only load needed portions, critical for large PDFs
+- **Network efficiency**: HTTP range requests only fetch required data
+- **Responsive UI**: No blocking on full file load
+
+If a feature cannot be implemented with progressive loading, it should be redesigned or deferred. **External crates are valuable for learning algorithms and patterns, but the core parsing infrastructure must support progressive loading.**
+
 ## Current Project Status
 
 This is an **early-stage project**. No Rust implementation exists yet. When developing:
