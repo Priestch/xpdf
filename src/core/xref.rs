@@ -114,7 +114,7 @@ impl XRef {
         let obj = parser.get_object()?;
 
         match obj {
-            PDFObject::Name(ref name) if name == "xref" => {
+            obj if obj.is_command("xref") => {
                 // Traditional xref table
                 self.read_xref_table(&mut parser)?;
 
@@ -259,7 +259,8 @@ impl XRef {
             _ => None,
         });
 
-        let decompressed_data = decode::decode_stream(data, filter_name)?;
+        let decompressed_data = decode::decode_stream(data, filter_name)
+            .map_err(|e| PDFError::Generic(format!("XRef stream decode error: {}", e)))?;
 
         // Parse entries from the decompressed data
         let (w1, w2, w3) = widths;
@@ -451,8 +452,8 @@ impl XRef {
         // Read type (f = free, n = in use)
         let type_obj = parser.get_object()?;
         let entry_type = match type_obj {
-            PDFObject::Name(ref name) if name == "f" => "f",
-            PDFObject::Name(ref name) if name == "n" => "n",
+            obj if obj.is_command("f") => "f",
+            obj if obj.is_command("n") => "n",
             _ => {
                 return Err(PDFError::Generic(format!(
                     "Expected 'f' or 'n' in xref entry, got {:?}",
@@ -543,7 +544,8 @@ impl XRef {
                     _ => None,
                 });
 
-                let decompressed_data = decode::decode_stream(data, filter_name)?;
+                let decompressed_data = decode::decode_stream(data, filter_name)
+            .map_err(|e| PDFError::Generic(format!("XRef stream decode error: {}", e)))?;
 
                 // Parse the object number/offset pairs (first N pairs of integers)
                 let index_stream = Stream::from_bytes(decompressed_data[..first].to_vec());

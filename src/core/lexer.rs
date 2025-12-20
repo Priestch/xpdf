@@ -619,12 +619,45 @@ impl Lexer {
         Ok(Token::Command(str_buf))
     }
 
+    /// Skips the end-of-line marker after the 'stream' keyword.
+    ///
+    /// Per PDF spec, stream data begins after either LF or CRLF following the 'stream' keyword.
+    /// This method skips exactly one end-of-line sequence.
+    pub fn skip_stream_start(&mut self) -> PDFResult<()> {
+        // Current char should be CR (0x0D) or LF (0x0A)
+        if self.current_char == 0x0D {
+            // CR - check if followed by LF
+            self.next_char()?;
+            if self.current_char == 0x0A {
+                // CRLF - skip the LF too
+                self.next_char()?;
+            }
+        } else if self.current_char == 0x0A {
+            // LF
+            self.next_char()?;
+        }
+        // If current_char is neither CR nor LF, we don't skip anything
+        // (some malformed PDFs might not have the newline)
+        Ok(())
+    }
+
     /// Gets a single raw byte from the stream (for reading stream data).
     ///
     /// This is used by the parser when reading binary stream data between
     /// 'stream' and 'endstream' keywords.
+    ///
+    /// IMPORTANT: This uses current_char if available, then reads from stream.
     pub fn get_stream_byte(&mut self) -> PDFResult<u8> {
-        self.stream.get_byte()
+        let byte = if self.current_char >= 0 {
+            self.current_char as u8
+        } else {
+            return Err(PDFError::UnexpectedEndOfStream);
+        };
+
+        // Advance to next character
+        self.current_char = Self::read_char(&mut self.stream)?;
+
+        Ok(byte)
     }
 }
 

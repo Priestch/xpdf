@@ -28,14 +28,33 @@ use std::io::Read;
 /// let decompressed = decode_flate(&compressed).unwrap();
 /// ```
 pub fn decode_flate(compressed_data: &[u8]) -> PDFResult<Vec<u8>> {
+    // Try zlib format first (most common)
     let mut decoder = ZlibDecoder::new(compressed_data);
     let mut decompressed = Vec::new();
 
-    decoder
-        .read_to_end(&mut decompressed)
-        .map_err(|e| PDFError::Generic(format!("FlateDecode error: {}", e)))?;
+    match decoder.read_to_end(&mut decompressed) {
+        Ok(_) => return Ok(decompressed),
+        Err(zlib_err) => {
+            // Zlib failed, try raw deflate (some PDFs use this)
+            use flate2::read::DeflateDecoder;
 
-    Ok(decompressed)
+            decompressed.clear();
+            let mut raw_decoder = DeflateDecoder::new(compressed_data);
+            match raw_decoder.read_to_end(&mut decompressed) {
+                Ok(_) => Ok(decompressed),
+                Err(deflate_err) => {
+                    // Both failed - provide detailed error
+                    Err(PDFError::Generic(format!(
+                        "FlateDecode error: zlib failed ({}), raw deflate failed ({}). Data length: {} bytes, first 10 bytes: {:02x?}",
+                        zlib_err,
+                        deflate_err,
+                        compressed_data.len(),
+                        &compressed_data[..compressed_data.len().min(10)]
+                    )))
+                }
+            }
+        }
+    }
 }
 
 /// Decodes a stream based on its Filter entry.

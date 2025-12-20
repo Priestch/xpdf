@@ -43,6 +43,10 @@ pub enum PDFObject {
 
     /// End of file marker
     EOF,
+
+    /// Command/operator (like 'q', 'Q', 'cm', 'Tj')
+    /// Only used in content streams to distinguish operators from operands
+    Command(String),
 }
 
 impl PDFObject {
@@ -58,11 +62,17 @@ impl PDFObject {
 
     /// Returns true if this object is a command/operator.
     pub fn is_command(&self, cmd: &str) -> bool {
-        if let PDFObject::Name(name) = self {
-            name == cmd
-        } else {
-            false
+        match self {
+            PDFObject::Name(name) => name == cmd,
+            PDFObject::Command(command) => command == cmd,
+            _ => false,
         }
+    }
+
+    /// Returns true if this object looks like a command (operator).
+    /// Used for content stream parsing to distinguish operators from operands.
+    pub fn is_command_like(&self) -> bool {
+        matches!(self, PDFObject::Command(_))
     }
 }
 
@@ -163,7 +173,7 @@ impl Parser {
             Token::String(s) => Ok(PDFObject::String(s)),
             Token::HexString(s) => Ok(PDFObject::HexString(s)),
             Token::Name(n) => Ok(PDFObject::Name(n)),
-            Token::Command(c) => Ok(PDFObject::Name(c)), // Commands treated as names
+            Token::Command(c) => Ok(PDFObject::Command(c)), // Keep as Command for content streams
         }
     }
 
@@ -273,8 +283,10 @@ impl Parser {
         // We're currently positioned after the '>>' with 'stream' in buf1
         self.shift()?; // Consume 'stream' keyword
 
-        // Skip to next line (stream data starts after newline)
-        // The lexer should have positioned us correctly, but we need to read raw bytes now
+        // Skip the newline after 'stream' keyword
+        // PDF spec: stream data starts after CR, LF, or CRLF following the 'stream' keyword
+        self.lexer.skip_stream_start()?;
+
         // Get the Length from the dictionary
         let length = dict
             .get("Length")

@@ -1,5 +1,6 @@
 pub mod base_stream;
 pub mod chunk_manager;
+pub mod content_stream;
 pub mod decode;
 pub mod document;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod xref;
 
 pub use base_stream::BaseStream;
 pub use chunk_manager::{ChunkLoader, ChunkManager};
+pub use content_stream::{ContentStreamEvaluator, OpCode, Operation};
 pub use document::PDFDocument;
 pub use error::PDFError;
 pub use file_chunked_stream::FileChunkedStream;

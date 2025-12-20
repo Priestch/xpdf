@@ -15,6 +15,7 @@ fn main() {
         eprintln!("  --trailer        Show trailer dictionary");
         eprintln!("  --pages          Show pages dictionary");
         eprintln!("  --object <num>   Show specific object by number");
+        eprintln!("  --version        Show PDF version");
         eprintln!("  --all            Show all information (default)");
         process::exit(1);
     }
@@ -54,6 +55,8 @@ fn main() {
         Ok(doc) => doc,
         Err(e) => {
             eprintln!("Error parsing PDF: {:?}", e);
+            eprintln!("\nNote: Some PDFs with compressed streams may not be fully supported yet.");
+            eprintln!("This is a known limitation that will be addressed in future updates.");
             process::exit(1);
         }
     };
@@ -152,6 +155,7 @@ fn print_object(obj: &PDFObject, indent: usize) {
             }
         }
         PDFObject::Name(n) => println!("{}/{}", indent_str, n),
+        PDFObject::Command(c) => println!("{}{}", indent_str, c),
         PDFObject::Array(arr) => {
             if arr.is_empty() {
                 println!("{}[]", indent_str);
@@ -247,6 +251,7 @@ fn print_object_inline(obj: &PDFObject) {
             }
         }
         PDFObject::Name(n) => println!("/{}", n),
+        PDFObject::Command(c) => println!("{}", c),
         PDFObject::Array(_) => println!("[...]"),
         PDFObject::Dictionary(_) => println!("<< ... >>"),
         PDFObject::Stream { dict: _, data } => println!("stream ({} bytes)", data.len()),
