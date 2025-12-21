@@ -94,6 +94,10 @@ pub struct Parser {
 
     /// Second lookahead token
     buf2: Option<Token>,
+
+    /// Optional reference resolver for resolving indirect references during parsing
+    /// This is needed when parsing streams with indirect /Length references
+    ref_resolver: Option<Box<dyn Fn(u32, u32) -> PDFResult<PDFObject>>>,
 }
 
 impl Parser {
@@ -103,7 +107,21 @@ impl Parser {
         let buf1 = Some(lexer.get_object()?);
         let buf2 = Some(lexer.get_object()?);
 
-        Ok(Parser { lexer, buf1, buf2 })
+        Ok(Parser {
+            lexer,
+            buf1,
+            buf2,
+            ref_resolver: None,
+        })
+    }
+
+    /// Sets a reference resolver function that can resolve indirect references.
+    /// This is needed when parsing streams with indirect /Length references.
+    pub fn set_ref_resolver<F>(&mut self, resolver: F)
+    where
+        F: Fn(u32, u32) -> PDFResult<PDFObject> + 'static,
+    {
+        self.ref_resolver = Some(Box::new(resolver));
     }
 
     /// Shifts the token buffer, advancing to the next token.
@@ -193,8 +211,30 @@ impl Parser {
                 return Err(PDFError::Generic("Unterminated array (missing ']')".to_string()));
             }
 
-            // Parse the next object in the array
-            array.push(self.get_object()?);
+            // Parse the next object in the array with error recovery
+            match self.get_object() {
+                Ok(obj) => array.push(obj),
+                Err(e) => {
+                    // Try to recover by inserting null and continuing
+                    eprintln!("Warning: Error parsing array element: {:?}, using null", e);
+                    array.push(PDFObject::Null);
+                    // Try to recover by finding the next token that looks like array end
+                    // Skip ahead until we find ']' or some reasonable stopping point
+                    let mut recovery_attempts = 0;
+                    while recovery_attempts < 10 {
+                        if let Some(Token::ArrayEnd) = &self.buf1 {
+                            break;
+                        }
+                        if let Some(Token::EOF) = &self.buf1 {
+                            break;
+                        }
+                        if recovery_attempts > 0 {
+                            self.shift()?; // Try to advance
+                        }
+                        recovery_attempts += 1;
+                    }
+                }
+            }
         }
 
         Ok(PDFObject::Array(array))
@@ -221,15 +261,23 @@ impl Parser {
             // The key must be a name
             let key = match &self.buf1 {
                 Some(Token::Name(name)) => name.clone(),
-                Some(Token::Command(cmd)) => cmd.clone(), // Commands can be keys too
+                Some(Token::Command(cmd)) => {
+                    // Commands might be keys in some malformed PDFs
+                    cmd.clone()
+                }
                 Some(other) => {
-                    // Malformed dictionary: skip this token and continue
-                    eprintln!(
-                        "Warning: Malformed dictionary - expected name key, got {:?}",
-                        other
-                    );
-                    self.shift()?;
-                    continue;
+                    // Malformed dictionary: try to recover by treating other tokens as keys
+                    match other {
+                        Token::Number(n) => format!("{}", *n),
+                        Token::Boolean(b) => format!("{}", b),
+                        Token::String(s) => String::from_utf8_lossy(s).to_string(),
+                        Token::HexString(s) => format!("<{:?}>", s),
+                        _ => {
+                            // Skip this token and continue
+                            self.shift()?;
+                            continue;
+                        }
+                    }
                 }
                 None => {
                     return Err(PDFError::Generic(
@@ -253,15 +301,47 @@ impl Parser {
                 break;
             }
 
-            // Parse the value
-            let value = self.get_object()?;
+            // Parse the value with error recovery
+            let value = match self.get_object() {
+                Ok(val) => val,
+                Err(e) => {
+                    // Try to recover from parsing errors by inserting null
+                    // and continuing with the next key-value pair
+                    eprintln!("Warning: Error parsing dictionary value for key '{}': {:?}, using null", key, e);
+                    PDFObject::Null
+                }
+            };
             dict.insert(key, value);
         }
 
         // Check if this dictionary is followed by a stream
         // Format: << /Key value >> stream\n...binary data...endstream
+        // IMPORTANT: We need to save the position NOW, before checking buf1,
+        // because buf2 has already been filled and consumed bytes from the stream.
+        // After the dictionary ends, the lexer is positioned like this:
+        // - buf1 = next token (might be "stream" or something else)
+        // - buf2 = token after that (if buf1 is "stream", buf2 consumed stream data!)
+        // - lexer.position = where buf2 finished reading
+        //
+        // If buf1 is "stream", we need to know where to start reading stream data.
+        // That position is: right after the "stream" keyword + newline.
+        // But we can't easily calculate that because we don't know how buf1 was tokenized.
+        //
+        // Solution: Save the lexer position BEFORE we filled buf1 with "stream".
+        // But we've already filled both buf1 and buf2 at this point!
+        //
+        // Better solution: When we detect "stream", consume ONLY buf1 (the "stream" keyword),
+        // then manually skip the newline, then start reading stream bytes.
+        // DON'T use buf2 at all - it contains corrupt data.
+
         if let Some(Token::Command(cmd)) = &self.buf1 {
             if cmd == "stream" {
+                // Detected stream! At this point:
+                // - buf1 = "stream" token
+                // - buf2 = CORRUPT (already read ahead into stream data)
+                // - We need to re-synchronize to the correct stream start position
+
+                // Pass the dictionary to parse_stream which will handle the position fix
                 return self.parse_stream(dict);
             }
         }
@@ -279,28 +359,97 @@ impl Parser {
     /// ```
     ///
     /// Based on PDF.js Parser.makeStream()
+    ///
+    /// CRITICAL ISSUE: When this is called, buf1="stream" and buf2 has already consumed
+    /// bytes from the stream data (because get_object() skips whitespace including 0x00).
+    /// We need to scan backward or use heuristics to find the actual stream start.
     fn parse_stream(&mut self, dict: HashMap<String, PDFObject>) -> PDFResult<PDFObject> {
-        // We're currently positioned after the '>>' with 'stream' in buf1
-        self.shift()?; // Consume 'stream' keyword
+        // SOLUTION: Use get_byte_range() to search backward for "stream\n" or "stream\r\n"
+        // in the raw stream data, then position after that newline.
+        //
+        // The problem we're solving: buf2 has already consumed bytes from the stream data.
+        // We need to find the actual start of the stream data.
 
-        // Skip the newline after 'stream' keyword
-        // PDF spec: stream data starts after CR, LF, or CRLF following the 'stream' keyword
-        self.lexer.skip_stream_start()?;
+        self.buf1 = None;
+        self.buf2 = None;
+
+        // Get current lexer position
+        let current_pos = self.lexer.get_position();
+
+        // Search backward up to 100 bytes for "stream\n" or "stream\r\n"
+        // We'll look from current_pos backward to current_pos - 100
+        let search_start = current_pos.saturating_sub(100);
+        let search_data = self.lexer.get_byte_range(search_start, current_pos)?;
+
+        // Find "stream" followed by newline
+        let stream_keyword = b"stream";
+        let mut stream_start_pos = None;
+
+        for i in 0..search_data.len() {
+            if i + stream_keyword.len() + 1 <= search_data.len() {
+                if &search_data[i..i + stream_keyword.len()] == stream_keyword {
+                    // Found "stream", check what follows
+                    let next_byte = search_data[i + stream_keyword.len()];
+                    if next_byte == b'\n' {
+                        // "stream\n" found
+                        stream_start_pos = Some(search_start + i + stream_keyword.len() + 1);
+                        break;
+                    } else if next_byte == b'\r' && i + stream_keyword.len() + 2 <= search_data.len() {
+                        let byte_after = search_data[i + stream_keyword.len() + 1];
+                        if byte_after == b'\n' {
+                            // "stream\r\n" found
+                            stream_start_pos = Some(search_start + i + stream_keyword.len() + 2);
+                            break;
+                        } else {
+                            // "stream\r" (without \n) - position after \r
+                            stream_start_pos = Some(search_start + i + stream_keyword.len() + 1);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let stream_start_pos = stream_start_pos.ok_or_else(|| {
+            PDFError::Generic("Could not find 'stream' keyword before stream data".to_string())
+        })?;
 
         // Get the Length from the dictionary
         let length = dict
             .get("Length")
             .and_then(|obj| match obj {
                 PDFObject::Number(n) => Some(*n as usize),
-                PDFObject::Ref { num: _, generation: _ } => {
-                    // Length is an indirect reference - we can't resolve it here
-                    // For now, we'll try to find 'endstream' by scanning
-                    None
+                PDFObject::Ref { num, generation } => {
+                    // Length is an indirect reference - try to resolve it if we have a resolver
+                    if let Some(ref resolver) = self.ref_resolver {
+                        match resolver(*num, *generation) {
+                            Ok(resolved) => match resolved {
+                                PDFObject::Number(n) => Some(n as usize),
+                                _ => {
+                                    eprintln!("Warning: Resolved /Length is not a number, scanning for endstream");
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("Warning: Failed to resolve /Length reference {} {} R: {:?}, scanning for endstream", num, generation, e);
+                                None
+                            }
+                        }
+                    } else {
+                        // No resolver available, fall back to scanning
+                        eprintln!("Warning: /Length is an indirect reference but no resolver available, scanning for endstream");
+                        None
+                    }
                 }
                 _ => None,
             });
 
         // Read the stream data
+        // CRITICAL: Seek to the saved stream start position before reading
+        // This ensures we read from the correct offset, not from wherever the
+        // lookahead buffer consumption left us
+        self.lexer.set_position(stream_start_pos)?;
+
         let data = if let Some(len) = length {
             // We know the length, read exactly that many bytes
             let mut bytes = Vec::with_capacity(len);

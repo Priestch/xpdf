@@ -1,3 +1,4 @@
+use super::error::{PDFResult, PDFError};
 use super::parser::PDFObject;
 use std::collections::HashMap;
 
@@ -89,6 +90,83 @@ impl Page {
     pub fn contents(&self) -> Option<&PDFObject> {
         self.get("Contents")
     }
+
+    /// Extracts text from this page's content streams.
+    ///
+    /// This method processes all content streams for the page and extracts
+    /// text content with position and font information.
+    ///
+    /// # Returns
+    /// A vector of TextItem objects containing the extracted text
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// let pdf_data = std::fs::read("document.pdf").unwrap();
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    /// let page = doc.get_page(0).unwrap();
+    ///
+    /// let text_items = page.extract_text(&mut doc).unwrap();
+    /// for item in text_items {
+    ///     println!("Text: '{}' at {:?}", item.text, item.position);
+    /// }
+    /// ```
+    pub fn extract_text(&self, xref: &mut super::xref::XRef) -> PDFResult<Vec<super::content_stream::TextItem>> {
+        use super::{ContentStreamEvaluator, Lexer, Stream};
+
+        let contents = match self.contents() {
+            Some(contents) => contents,
+            None => return Ok(Vec::new()), // No content streams
+        };
+
+        let mut all_text_items = Vec::new();
+
+        // Handle single content stream
+        let content_streams = match contents {
+            PDFObject::Stream { dict, data } => {
+                vec![(dict.clone(), data.clone())]
+            }
+            PDFObject::Array(arr) => {
+                // Multiple content streams - fetch each one
+                let mut streams = Vec::new();
+                for content_obj in arr {
+                    match xref.fetch_if_ref(content_obj)? {
+                        PDFObject::Stream { dict, data } => {
+                            streams.push((dict, data));
+                        }
+                        _ => {
+                            return Err(super::PDFError::Generic(
+                                "Contents array contains non-stream object".to_string(),
+                            ));
+                        }
+                    }
+                }
+                streams
+            }
+            _ => {
+                // Handle unexpected Contents types gracefully
+                // Some PDFs may have null Contents, references to null, or other formats
+                // This commonly occurs with image-only pages or empty pages
+                return Ok(Vec::new());
+            }
+        };
+
+        // Process each content stream
+        for (_dict, data) in content_streams {
+            // Create a stream from the content data
+            let stream = Box::new(Stream::from_bytes(data)) as Box<dyn super::BaseStream>;
+            let lexer = Lexer::new(stream)?;
+            let parser = super::Parser::new(lexer)?;
+            let mut evaluator = ContentStreamEvaluator::new(parser);
+
+            // Extract text from this stream
+            let text_items = evaluator.extract_text()?;
+            all_text_items.extend(text_items);
+        }
+
+        Ok(all_text_items)
+    }
 }
 
 /// Page tree cache for efficient page lookups.
@@ -137,5 +215,124 @@ impl PageTreeCache {
 impl Default for PageTreeCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl crate::core::image::ImageExtraction for Page {
+    /// Extract image metadata from the page without full decoding.
+    fn get_image_metadata(&self) -> PDFResult<Vec<crate::core::image::ImageMetadata>> {
+        let mut images = Vec::new();
+
+        // Get the Resources dictionary from the page
+        if let Some(resources) = self.resources() {
+            // Look for XObject dictionary
+            if let PDFObject::Dictionary(xobject_dict) = resources {
+                // Check if there's an XObject entry
+                if let Some(xobject_entry) = xobject_dict.get("XObject") {
+                    // Follow reference if needed
+                    let xobject_dict = match xobject_entry {
+                        PDFObject::Ref { .. } => {
+                            // For now, we can't resolve references without document context
+                            return Err(PDFError::Generic(
+                                "Resolving XObject references requires document context".to_string()
+                            ));
+                        }
+                        PDFObject::Dictionary(dict) => dict,
+                        _ => return Ok(images), // No XObject dictionary found
+                    };
+
+                    for (name_key, _xobject_ref) in xobject_dict {
+                        // name_key is a String key, not a PDFObject
+                        println!("  🖼️  Found XObject: {} (reference resolution needs document context)", name_key);
+
+                        // Create placeholder metadata - in real implementation would resolve the reference
+                        let metadata = crate::core::image::ImageMetadata::new(
+                            name_key.clone(),
+                            crate::core::image::ImageFormat::Unknown
+                        );
+                        images.push(metadata);
+                    }
+                }
+            }
+        }
+
+        Ok(images)
+    }
+
+    /// Extract complete images with full decoding.
+    fn extract_images(&self) -> PDFResult<Vec<crate::core::image::DecodedImage>> {
+        // For now, return empty list since we need xref access to resolve references
+        // In a full implementation, this would require document context
+        println!("  ⚠️  Full image extraction requires document context to resolve XObject references");
+        Ok(Vec::new())
+    }
+}
+
+impl Page {
+    /// Helper method to fetch an object, following references if needed.
+    /// This provides access to the document's xref table for resolving object references.
+    /// Note: This is a simplified implementation that requires document context.
+    pub fn fetch_if_ref(&self, obj: &PDFObject, xref: &mut super::xref::XRef) -> PDFResult<PDFObject> {
+        match obj {
+            PDFObject::Ref { num, generation } => {
+                match xref.fetch(*num, *generation)? {
+                    rc_obj => Ok((*rc_obj).clone()),
+                }
+            }
+            _ => Ok(obj.clone()),
+        }
+    }
+
+    /// Helper method to get XObject data by name.
+    /// This retrieves the actual image data from the page's XObject resources.
+    pub fn get_xobject_data(&self, name: &str, xref: &mut super::xref::XRef) -> PDFResult<Vec<u8>> {
+        // Get the Resources dictionary from the page
+        if let Some(resources) = self.resources() {
+            // Look for XObject dictionary
+            if let PDFObject::Dictionary(xobject_dict) = resources {
+                // Check if there's an XObject entry
+                if let Some(xobject_entry) = xobject_dict.get("XObject") {
+                    // Follow reference if needed
+                    let xobject_dict = match self.fetch_if_ref(xobject_entry, xref)? {
+                        PDFObject::Dictionary(dict) => dict,
+                        _ => return Err(PDFError::Generic(
+                            "XObject is not a dictionary".to_string()
+                        )),
+                    };
+
+                    // Find the XObject with the given name
+                    for (name_key, xobject_ref) in xobject_dict {
+                        if name_key == name {
+                            // Follow the reference to get the actual XObject
+                            let xobject = self.fetch_if_ref(&xobject_ref, xref)?;
+
+                            // Check if it's an image stream and return the data
+                            if let PDFObject::Stream { dict: _, data } = xobject {
+                                return Ok(data);
+                            } else {
+                                return Err(PDFError::Generic(
+                                    format!("XObject '{}' is not a stream", name)
+                                ));
+                            }
+                        }
+                    }
+                    return Err(PDFError::Generic(
+                        format!("XObject '{}' not found in page resources", name)
+                    ));
+                } else {
+                    return Err(PDFError::Generic(
+                        "No XObject found in page resources".to_string()
+                    ));
+                }
+            } else {
+                return Err(PDFError::Generic(
+                    "Resources is not a dictionary".to_string()
+                ));
+            }
+        } else {
+            Err(PDFError::Generic(
+                "No resources dictionary found in page".to_string()
+            ))
+        }
     }
 }

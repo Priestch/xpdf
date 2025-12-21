@@ -8,14 +8,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Helper function to standardize mutex lock error handling for the file handle.
 #[inline]
-fn lock_file(file: &Arc<Mutex<File>>) -> PDFResult<MutexGuard<File>> {
+fn lock_file(file: &Arc<Mutex<File>>) -> PDFResult<MutexGuard<'_, File>> {
     file.lock()
         .map_err(|_| PDFError::StreamError("Failed to lock file handle (mutex poisoned)".to_string()))
 }
 
 /// Helper function to standardize mutex lock error handling for the chunk manager.
 #[inline]
-fn lock_manager(manager: &Arc<Mutex<ChunkManager>>) -> PDFResult<MutexGuard<ChunkManager>> {
+fn lock_manager(manager: &Arc<Mutex<ChunkManager>>) -> PDFResult<MutexGuard<'_, ChunkManager>> {
     manager.lock()
         .map_err(|_| PDFError::StreamError("Failed to lock chunk manager (mutex poisoned)".to_string()))
 }

@@ -214,17 +214,31 @@ impl Lexer {
                     self.next_char()?;
                     Ok(Token::DictEnd)
                 } else {
-                    Err(PDFError::Generic(format!(
-                        "Unexpected character: >{}",
-                        next_ch
-                    )))
+                    // Single '>' could be part of malformed hex string or other construct
+                    // Try to recover by treating it as a command
+                    let mut cmd_str = String::new();
+                    cmd_str.push('>');
+                    if next_ch > 0 && !Self::is_special(next_ch) {
+                        cmd_str.push(next_ch as u8 as char);
+                        // Read additional non-special characters
+                        while let Ok(peek_ch) = self.peek_char() {
+                            if peek_ch > 0 && !Self::is_special(peek_ch) {
+                                cmd_str.push(peek_ch as u8 as char);
+                                self.next_char()?;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Token::Command(cmd_str))
                 }
             }
 
-            // Closing paren is an error if encountered here
+            // Closing paren - could be part of malformed string, treat as command
             0x29 => {
                 self.next_char()?;
-                Err(PDFError::Generic(format!("Illegal character: {}", ch)))
+                // Try to recover by treating ')' as part of a command
+                Ok(Token::Command(")".to_string()))
             }
 
             // Everything else is a command/keyword
@@ -658,6 +672,29 @@ impl Lexer {
         self.current_char = Self::read_char(&mut self.stream)?;
 
         Ok(byte)
+    }
+
+    /// Gets the current stream position, accounting for lookahead.
+    ///
+    /// The position is where the NEXT byte will be read from (current_char has already been read).
+    pub fn get_position(&self) -> usize {
+        self.stream.pos()
+    }
+
+    /// Sets the stream position.
+    ///
+    /// After setting position, current_char will be invalid and must be refilled.
+    pub fn set_position(&mut self, pos: usize) -> PDFResult<()> {
+        self.stream.set_pos(pos)?;
+        self.current_char = Self::read_char(&mut self.stream)?;
+        Ok(())
+    }
+
+    /// Gets a range of bytes from the stream without changing position.
+    ///
+    /// This is used by the parser to search for stream markers.
+    pub fn get_byte_range(&self, begin: usize, end: usize) -> PDFResult<Vec<u8>> {
+        self.stream.get_byte_range(begin, end)
     }
 }
 

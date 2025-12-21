@@ -1,0 +1,154 @@
+{
+  "version": "1.0",
+  "description": "Test manifest for PDF-X. Based on PDF.js testing approach.",
+  "tests": [
+    {
+      "id": "basicapi-load",
+      "file": "pdfs/basicapi.pdf",
+      "type": "load",
+      "description": "Basic PDF document loading and parsing",
+      "pages": 3,
+      "priority": "critical"
+    },
+    {
+      "id": "tracemonkey-load",
+      "file": "pdfs/tracemonkey.pdf",
+      "type": "load",
+      "description": "Complex document with multiple fonts and images",
+      "pages": 14,
+      "priority": "high"
+    },
+    {
+      "id": "empty-load",
+      "file": "pdfs/empty.pdf",
+      "type": "load",
+      "description": "Empty PDF document with no pages",
+      "pages": 0,
+      "priority": "critical"
+    },
+    {
+      "id": "xref-stream-load",
+      "file": "pdfs/xref-stream.pdf",
+      "type": "load",
+      "description": "PDF with cross-reference stream (PDF 1.5+)",
+      "pages": 1,
+      "priority": "high",
+      "features": ["xref-stream"]
+    },
+    {
+      "id": "linearized-load",
+      "file": "pdfs/linearized.pdf",
+      "type": "load",
+      "description": "Linearized PDF for progressive display",
+      "pages": 1,
+      "priority": "high",
+      "features": ["linearized"]
+    },
+    {
+      "id": "compressed-object-stream-load",
+      "file": "pdfs/compressed-object-stream.pdf",
+      "type": "load",
+      "description": "PDF with compressed object streams",
+      "pages": 1,
+      "priority": "high",
+      "features": ["object-stream", "flate"]
+    },
+    {
+      "id": "multiple-xref-load",
+      "file": "pdfs/issue3115.pdf",
+      "type": "load",
+      "description": "PDF with multiple cross-reference sections (incremental updates)",
+      "pages": 1,
+      "priority": "medium",
+      "features": ["incremental-update"]
+    },
+    {
+      "id": "asciihex-decode",
+      "file": "pdfs/asciihexdecode.pdf",
+      "type": "decode",
+      "description": "PDF with ASCIIHexDecode filter",
+      "pages": 1,
+      "priority": "medium",
+      "features": ["asciihex-decode"]
+    },
+    {
+      "id": "flate-decode",
+      "file": "pdfs/flatedecode.pdf",
+      "type": "decode",
+      "description": "PDF with FlateDecode compression",
+      "pages": 1,
+      "priority": "high",
+      "features": ["flate"]
+    },
+    {
+      "id": "simpletype3-font",
+      "file": "pdfs/simpletype3font.pdf",
+      "type": "font",
+      "description": "Simple Type 3 font",
+      "pages": 1,
+      "priority": "low",
+      "features": ["type3-font"]
+    },
+    {
+      "id": "truetype-without-cmap",
+      "file": "pdfs/TrueType_without_cmap.pdf",
+      "type": "font",
+      "description": "TrueType font without cmap",
+      "pages": 1,
+      "priority": "low",
+      "features": ["truetype-font"]
+    },
+    {
+      "id": "progressive-large-doc",
+      "file": "pdfs/large-document.pdf.link",
+      "type": "progressive",
+      "description": "Large document for testing progressive loading",
+      "pages": 100,
+      "priority": "critical",
+      "features": ["progressive-loading"],
+      "link": true
+    },
+    {
+      "id": "annotation-text",
+      "file": "pdfs/annotation-text.pdf",
+      "type": "annotation",
+      "description": "PDF with text annotations",
+      "pages": 1,
+      "priority": "low",
+      "features": ["annotations"]
+    },
+    {
+      "id": "malformed-xref",
+      "file": "pdfs/bad-xref.pdf",
+      "type": "error-recovery",
+      "description": "PDF with malformed cross-reference table",
+      "pages": 1,
+      "priority": "medium",
+      "features": ["error-recovery"]
+    },
+    {
+      "id": "rotation-test",
+      "file": "pdfs/rotation.pdf",
+      "type": "structure",
+      "description": "PDF with rotated pages",
+      "pages": 4,
+      "priority": "medium",
+      "features": ["rotation"]
+    }
+  ],
+  "categories": {
+    "load": "Basic document loading and parsing",
+    "decode": "Stream decoding and decompression",
+    "font": "Font parsing and rendering",
+    "progressive": "Progressive/chunked loading",
+    "annotation": "Annotation parsing",
+    "error-recovery": "Error handling and recovery",
+    "structure": "Document structure features"
+  },
+  "priorities": {
+    "critical": "Must pass for basic functionality",
+    "high": "Important for core features",
+    "medium": "Important but not critical",
+    "low": "Nice to have, can be deferred"
+  }
+}

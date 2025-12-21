@@ -17,5 +17,21 @@ ureq = { version = "2.12", default-features = false, features = ["tls"] }
 # Compression support for FlateDecode streams
 flate2 = "1.0"
 
+# Image decoding - follow hayro's specialized approach
+# Use hayro's proven architecture with zune-jpeg for JPEG (DCTDecode)
+zune-jpeg = { version = "0.5", optional = true }  # For JPEG (DCTDecode) - fast and SIMD-optimized
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }  # For PNG support
+
+# Optional advanced image decoders (feature-gated)
+# Use hayro's specialized decoders for complete format support
+hayro-jpeg2000 = { path = "./hayro/hayro-jpeg2000", optional = true, default-features = false }  # For JPEG2000 (JpxDecode) - complete spec support
+hayro-jbig2 = { path = "./hayro/hayro-jbig2", optional = true }      # For JBIG2 (Jbig2Decode) - document compression
+
+[features]
+default = ["jpeg-decoding"]
+jpeg-decoding = ["zune-jpeg"]
+png-decoding = ["image"]
+advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
+
 [dev-dependencies]
 tempfile = "3.14"

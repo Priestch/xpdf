@@ -1,3 +1,6 @@
 [submodule "pdf.js"]
 	path = pdf.js
 	url = https://github.com/mozilla/pdf.js
+[submodule "hayro"]
+	path = hayro
+	url = https://github.com/LaurenzV/hayro.git

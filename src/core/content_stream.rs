@@ -305,7 +305,7 @@ impl OpCode {
             "BX" => Ok(OpCode::BeginCompat),
             "EX" => Ok(OpCode::EndCompat),
 
-            _ => Err(PDFError::Generic(format!("Unknown operator: {}", cmd))),
+            _ => Err(PDFError::content_stream_error(format!("Unknown PDF operator: '{}'", cmd))),
         }
     }
 
@@ -426,6 +426,25 @@ impl fmt::Display for Operation {
     }
 }
 
+/// Text extraction information from content streams.
+#[derive(Debug, Clone)]
+pub struct TextItem {
+    /// The text content
+    pub text: String,
+
+    /// Font name (if available)
+    pub font_name: Option<String>,
+
+    /// Font size (if available)
+    pub font_size: Option<f64>,
+
+    /// Text position (x, y) in user space
+    pub position: Option<(f64, f64)>,
+
+    /// Text rendering mode
+    pub rendering_mode: Option<i32>,
+}
+
 /// Content stream evaluator/preprocessor.
 ///
 /// Reads operations from a PDF content stream, following the PDF.js
@@ -435,6 +454,49 @@ impl fmt::Display for Operation {
 /// Based on PDF.js src/core/evaluator.js EvaluatorPreprocessor class.
 pub struct ContentStreamEvaluator {
     parser: Parser,
+
+    /// Text extraction state
+    text_state: TextExtractionState,
+}
+
+/// State for text extraction from content streams.
+#[derive(Debug, Clone)]
+struct TextExtractionState {
+    /// Current text matrix (Tm)
+    text_matrix: [f64; 6],
+
+    /// Current text line matrix (Tlm)
+    text_line_matrix: [f64; 6],
+
+    /// Current font
+    current_font: Option<String>,
+
+    /// Current font size
+    current_font_size: Option<f64>,
+
+    /// Current text rendering mode
+    text_rendering_mode: Option<i32>,
+
+    /// Whether we're in a text object (BT...ET)
+    in_text_object: bool,
+
+    /// Extracted text items
+    extracted_text: Vec<TextItem>,
+}
+
+impl Default for TextExtractionState {
+    fn default() -> Self {
+        Self {
+            // Identity matrix
+            text_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            text_line_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            current_font: None,
+            current_font_size: None,
+            text_rendering_mode: None,
+            in_text_object: false,
+            extracted_text: Vec::new(),
+        }
+    }
 }
 
 impl ContentStreamEvaluator {
@@ -443,7 +505,166 @@ impl ContentStreamEvaluator {
     /// # Arguments
     /// * `parser` - Parser positioned at the start of the content stream
     pub fn new(parser: Parser) -> Self {
-        ContentStreamEvaluator { parser }
+        ContentStreamEvaluator {
+            parser,
+            text_state: TextExtractionState::default(),
+        }
+    }
+
+    /// Extracts all text from the content stream.
+    ///
+    /// This method processes the entire content stream and extracts text content
+    /// with position and font information. It's a simplified implementation that
+    /// handles basic text showing operators (Tj, TJ).
+    ///
+    /// # Returns
+    /// A vector of TextItem objects containing the extracted text
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::content_stream::ContentStreamEvaluator;
+    /// # use pdf_x::core::{Parser, Lexer, Stream};
+    /// # let stream = Box::new(Stream::from_bytes(vec![]));
+    /// # let lexer = Lexer::new(stream).unwrap();
+    /// # let parser = Parser::new(lexer).unwrap();
+    ///
+    /// let mut evaluator = ContentStreamEvaluator::new(parser);
+    /// let text_items = evaluator.extract_text().unwrap();
+    ///
+    /// for item in text_items {
+    ///     println!("Text: '{}' at position {:?}", item.text, item.position);
+    /// }
+    /// ```
+    pub fn extract_text(&mut self) -> PDFResult<Vec<TextItem>> {
+        // Reset text state
+        self.text_state = TextExtractionState::default();
+
+        // Process all operations
+        while let Some(op) = self.read_operation()? {
+            self.process_text_operation(&op)?;
+        }
+
+        Ok(self.text_state.extracted_text.clone())
+    }
+
+    /// Processes an operation for text extraction.
+    fn process_text_operation(&mut self, op: &Operation) -> PDFResult<()> {
+        match op.op {
+            OpCode::BeginText => {
+                self.text_state.in_text_object = true;
+                // Initialize text matrices
+                self.text_state.text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+                self.text_state.text_line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+            }
+            OpCode::EndText => {
+                self.text_state.in_text_object = false;
+            }
+            OpCode::SetFont => {
+                if op.args.len() >= 2 {
+                    if let PDFObject::Name(font_name) = &op.args[0] {
+                        self.text_state.current_font = Some(font_name.clone());
+                    }
+                    if let PDFObject::Number(font_size) = &op.args[1] {
+                        self.text_state.current_font_size = Some(*font_size);
+                    }
+                }
+            }
+            OpCode::SetTextRenderingMode => {
+                if op.args.len() >= 1 {
+                    if let PDFObject::Number(mode) = &op.args[0] {
+                        self.text_state.text_rendering_mode = Some(*mode as i32);
+                    }
+                }
+            }
+            OpCode::SetTextMatrix => {
+                if op.args.len() >= 6 {
+                    // Set text matrix from 6 numbers [a b c d e f]
+                    for i in 0..6 {
+                        if let PDFObject::Number(n) = &op.args[i] {
+                            self.text_state.text_matrix[i] = *n;
+                            self.text_state.text_line_matrix[i] = *n;
+                        }
+                    }
+                }
+            }
+            OpCode::MoveText => {
+                if op.args.len() >= 2 && self.text_state.in_text_object {
+                    // Td - move text position
+                    if let (PDFObject::Number(tx), PDFObject::Number(ty)) = (&op.args[0], &op.args[1]) {
+                        // Update line matrix: Tlm = Tlm * [1 0 0 1 tx ty]
+                        self.text_state.text_line_matrix[4] += tx;
+                        self.text_state.text_line_matrix[5] += ty;
+                        // Copy to text matrix
+                        self.text_state.text_matrix = self.text_state.text_line_matrix;
+                    }
+                }
+            }
+            OpCode::NextLine => {
+                if self.text_state.in_text_object {
+                    // T* - move to next line using leading
+                    self.text_state.text_line_matrix[5] -= self.text_state.text_line_matrix[5] * 0.0; // Simplified
+                    self.text_state.text_matrix = self.text_state.text_line_matrix;
+                }
+            }
+            OpCode::ShowText => {
+                if op.args.len() >= 1 && self.text_state.in_text_object {
+                    if let PDFObject::String(text_bytes) = &op.args[0] {
+                        let text = String::from_utf8_lossy(text_bytes);
+                        let position = Some((
+                            self.text_state.text_matrix[4],
+                            self.text_state.text_matrix[5],
+                        ));
+
+                        let text_item = TextItem {
+                            text: text.to_string(),
+                            font_name: self.text_state.current_font.clone(),
+                            font_size: self.text_state.current_font_size,
+                            position,
+                            rendering_mode: self.text_state.text_rendering_mode,
+                        };
+
+                        self.text_state.extracted_text.push(text_item);
+                    }
+                }
+            }
+            OpCode::ShowSpacedText => {
+                if op.args.len() >= 1 && self.text_state.in_text_object {
+                    // TJ - array with text and spacing adjustments
+                    if let PDFObject::Array(items) = &op.args[0] {
+                        for item in items {
+                            match item {
+                                PDFObject::String(text_bytes) => {
+                                    let text = String::from_utf8_lossy(text_bytes);
+                                    let position = Some((
+                                        self.text_state.text_matrix[4],
+                                        self.text_state.text_matrix[5],
+                                    ));
+
+                                    let text_item = TextItem {
+                                        text: text.to_string(),
+                                        font_name: self.text_state.current_font.clone(),
+                                        font_size: self.text_state.current_font_size,
+                                        position,
+                                        rendering_mode: self.text_state.text_rendering_mode,
+                                    };
+
+                                    self.text_state.extracted_text.push(text_item);
+                                }
+                                PDFObject::Number(spacing) => {
+                                    // Adjust text position for spacing (simplified)
+                                    self.text_state.text_matrix[4] -= spacing * self.text_state.current_font_size.unwrap_or(12.0) * 0.001;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Other operators are ignored for text extraction
+            }
+        }
+        Ok(())
     }
 
     /// Reads the next operation from the content stream.
@@ -636,5 +857,58 @@ mod tests {
         let mut eval = create_evaluator("10 20 XYZ");
         let result = eval.read_operation();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_simple_text() {
+        let mut eval = create_evaluator("BT\n/F1 12 Tf\n100 200 Td\n(Hello World) Tj\nET");
+
+        let text_items = eval.extract_text().unwrap();
+
+        assert_eq!(text_items.len(), 1);
+        let item = &text_items[0];
+        assert_eq!(item.text, "Hello World");
+        assert_eq!(item.font_name, Some("F1".to_string()));
+        assert_eq!(item.font_size, Some(12.0));
+        assert_eq!(item.position, Some((100.0, 200.0)));
+    }
+
+    #[test]
+    fn test_extract_multiple_text_items() {
+        let content = "BT\n/F1 12 Tf\n50 100 Td\n(First) Tj\n0 20 Td\n(Second) Tj\nET";
+        let mut eval = create_evaluator(content);
+
+        let text_items = eval.extract_text().unwrap();
+
+        assert_eq!(text_items.len(), 2);
+        assert_eq!(text_items[0].text, "First");
+        assert_eq!(text_items[1].text, "Second");
+    }
+
+    #[test]
+    fn test_extract_text_with_spacing() {
+        let content = "BT\n/F1 12 Tf\n100 200 Td\n[(He) -50 (llo) 100 ( Wo)-50 (rld)] TJ\nET";
+        let mut eval = create_evaluator(content);
+
+        let text_items = eval.extract_text().unwrap();
+
+        // Should extract individual text strings from TJ array
+        assert_eq!(text_items.len(), 4);
+        assert_eq!(text_items[0].text, "He");
+        assert_eq!(text_items[1].text, "llo");
+        assert_eq!(text_items[2].text, " Wo");
+        assert_eq!(text_items[3].text, "rld");
+    }
+
+    #[test]
+    fn test_extract_text_ignores_graphics() {
+        let content = "10 20 m\n30 40 l\nS\nBT\n/F1 12 Tf\n100 200 Td\n(Text) Tj\nET";
+        let mut eval = create_evaluator(content);
+
+        let text_items = eval.extract_text().unwrap();
+
+        // Should only extract the text, not the graphics operations
+        assert_eq!(text_items.len(), 1);
+        assert_eq!(text_items[0].text, "Text");
     }
 }

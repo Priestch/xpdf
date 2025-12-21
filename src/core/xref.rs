@@ -262,6 +262,7 @@ impl XRef {
         let decompressed_data = decode::decode_stream(data, filter_name)
             .map_err(|e| PDFError::Generic(format!("XRef stream decode error: {}", e)))?;
 
+        
         // Parse entries from the decompressed data
         let (w1, w2, w3) = widths;
         let entry_size = w1 + w2 + w3;
@@ -336,9 +337,9 @@ impl XRef {
                         index: field3 as u32,
                     },
                     _ => {
-                        return Err(PDFError::Generic(format!(
-                            "Invalid XRef entry type: {}",
-                            entry_type
+                        return Err(PDFError::xref_error(format!(
+                            "Invalid XRef entry type: {} at object {}",
+                            entry_type, obj_num
                         )))
                     }
                 };
@@ -715,12 +716,13 @@ impl XRef {
                 }
 
                 // Read the actual object
-                let object = Rc::new(parser.get_object()?);
+                let object = parser.get_object()?;
+                let object_rc = Rc::new(object);
 
                 // Cache the Rc - cheap clone
-                self.cache.insert(obj_num, Rc::clone(&object));
+                self.cache.insert(obj_num, Rc::clone(&object_rc));
 
-                Ok(object)
+                Ok(object_rc)
             }
 
             XRefEntry::Compressed {
@@ -965,10 +967,8 @@ mod tests {
         assert_eq!(result, PDFObject::Number(100.0));
     }
 
-    // TODO: Fix test - stream data format needs correction
-    // The issue is how the `stream` keyword's trailing newline is handled
     #[test]
-    #[ignore]
+    #[ignore] // TODO: Fix test - stream data needs to be properly positioned in complete PDF
     fn test_parse_xref_stream() {
         // Create a minimal XRef stream
         // This tests parsing of PDF 1.5+ XRef streams (compressed cross-reference tables)
@@ -994,19 +994,21 @@ mod tests {
         // Build the PDF data manually
         let mut data = Vec::new();
 
-        // Object header - include /Length for the stream
+            // Binary XRef stream data (12 bytes total: 3 entries * 4 bytes each)
+        let xref_data = vec![
+            // Entry 0: type=0, next_free=0 (0x0000), generation=255 (0xFF)
+            0x00, 0x00, 0x00, 0xFF,
+            // Entry 1: type=1, offset=15 (0x000F), generation=0
+            0x01, 0x00, 0x0F, 0x00,
+            // Entry 2: type=1, offset=79 (0x004F), generation=0
+            0x01, 0x00, 0x4F, 0x00,
+        ];
+
+        // Object header
         data.extend_from_slice(b"1 0 obj\n");
         data.extend_from_slice(b"<< /Type /XRef /Size 3 /W [1 2 1] /Length 12 >>\n");
-        data.extend_from_slice(b"stream");  // No newline yet!
-
-        // Binary XRef stream data (12 bytes total: 3 entries * 4 bytes each)
-        // Entry 0: type=0, next_free=0 (0x0000), generation=255 (0xFF)
-        data.extend_from_slice(&[0x00, 0x00, 0x00, 0xFF]);
-        // Entry 1: type=1, offset=15 (0x000F), generation=0
-        data.extend_from_slice(&[0x01, 0x00, 0x0F, 0x00]);
-        // Entry 2: type=1, offset=79 (0x004F), generation=0
-        data.extend_from_slice(&[0x01, 0x00, 0x4F, 0x00]);
-
+        data.extend_from_slice(b"stream\n");
+        data.extend_from_slice(&xref_data);
         data.extend_from_slice(b"endstream\nendobj\n");
 
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
@@ -1062,10 +1064,8 @@ mod tests {
         }
     }
 
-    // TODO: Fix test - stream data format needs correction
-    // The issue is how the `stream` keyword's trailing newline is handled
     #[test]
-    #[ignore]
+    #[ignore] // TODO: Fix test - stream data needs to be properly positioned in complete PDF
     fn test_parse_xref_stream_with_compressed_entries() {
         // Test XRef stream with type 2 (compressed) entries
         // This represents objects stored in ObjStm (object streams)
@@ -1076,19 +1076,21 @@ mod tests {
 
         let mut data = Vec::new();
 
-        // Object header - include /Length for the stream
+          // Binary XRef stream data (12 bytes total: 3 entries * 4 bytes each)
+        let xref_data = vec![
+            // Entry 0: free
+            0x00, 0x00, 0x00, 0xFF,
+            // Entry 1: compressed in stream 5, index 0
+            0x02, 0x00, 0x05, 0x00,
+            // Entry 2: compressed in stream 5, index 1
+            0x02, 0x00, 0x05, 0x01,
+        ];
+
+        // Object header
         data.extend_from_slice(b"1 0 obj\n");
         data.extend_from_slice(b"<< /Type /XRef /Size 3 /W [1 2 1] /Length 12 >>\n");
-        data.extend_from_slice(b"stream");  // No newline yet!
-
-        // Binary XRef stream data (12 bytes total: 3 entries * 4 bytes each)
-        // Entry 0: free
-        data.extend_from_slice(&[0x00, 0x00, 0x00, 0xFF]);
-        // Entry 1: compressed in stream 5, index 0
-        data.extend_from_slice(&[0x02, 0x00, 0x05, 0x00]);
-        // Entry 2: compressed in stream 5, index 1
-        data.extend_from_slice(&[0x02, 0x00, 0x05, 0x01]);
-
+        data.extend_from_slice(b"stream\n");
+        data.extend_from_slice(&xref_data);
         data.extend_from_slice(b"endstream\nendobj\n");
 
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;

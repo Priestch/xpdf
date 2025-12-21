@@ -3,11 +3,26 @@
 /// PDF streams can be compressed using various filters like FlateDecode.
 /// This module provides utilities to decompress stream data.
 ///
-/// Based on PDF.js src/core/flate_stream.js and decode_stream.js
+/// Based on PDF.js src/core/flate_stream.js, decode_stream.js, and predictor_stream.js
 
 use super::error::{PDFError, PDFResult};
 use flate2::read::ZlibDecoder;
 use std::io::Read;
+
+/// PNG predictor algorithm types (used in DecodeParms)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PngPredictor {
+    /// No prediction
+    None = 0,
+    /// Sub - predicts from left pixel
+    Sub = 1,
+    /// Up - predicts from pixel above
+    Up = 2,
+    /// Average - predicts from average of left and above
+    Average = 3,
+    /// Paeth - uses Paeth predictor algorithm
+    Paeth = 4,
+}
 
 /// Decodes a FlateDecode (zlib/deflate) compressed stream.
 ///
@@ -55,6 +70,138 @@ pub fn decode_flate(compressed_data: &[u8]) -> PDFResult<Vec<u8>> {
             }
         }
     }
+}
+
+/// Applies PNG predictor decoding to decompressed data.
+///
+/// PNG predictors are used to improve compression by predicting pixel values
+/// based on neighboring pixels. This function reverses that prediction.
+///
+/// # Arguments
+/// * `data` - The decompressed data with PNG prediction applied
+/// * `colors` - Number of color components per pixel (1=Gray, 3=RGB, 4=CMYK)
+/// * `bits_per_component` - Bits per color component (usually 8)
+/// * `columns` - Number of pixels per row
+///
+/// # Returns
+/// The data with PNG prediction reversed (raw pixel data)
+pub fn decode_png_predictor(
+    data: &[u8],
+    colors: usize,
+    bits_per_component: usize,
+    columns: usize,
+) -> PDFResult<Vec<u8>> {
+    // Calculate bytes per pixel and bytes per row
+    let pix_bytes = (colors * bits_per_component + 7) / 8;
+    let row_bytes = (columns * colors * bits_per_component + 7) / 8;
+
+    // Each row has: 1 predictor byte + row_bytes data
+    let stride = 1 + row_bytes;
+
+    // Calculate expected output size
+    let num_rows = data.len() / stride;
+    if data.len() % stride != 0 {
+        return Err(PDFError::Generic(format!(
+            "PNG predictor data size mismatch: {} bytes doesn't divide evenly by stride {}",
+            data.len(),
+            stride
+        )));
+    }
+
+    let mut output = Vec::with_capacity(num_rows * row_bytes);
+    let mut prev_row = vec![0u8; row_bytes];
+
+    for row_idx in 0..num_rows {
+        let row_start = row_idx * stride;
+        let predictor_byte = data[row_start];
+        let raw_bytes = &data[row_start + 1..row_start + 1 + row_bytes];
+
+        // Decode based on predictor type
+        match predictor_byte {
+            0 => {
+                // None - no prediction, copy as-is
+                output.extend_from_slice(raw_bytes);
+                prev_row.copy_from_slice(raw_bytes);
+            }
+            1 => {
+                // Sub - predicts from left pixel
+                for i in 0..pix_bytes {
+                    let val = raw_bytes[i];
+                    output.push(val);
+                    prev_row[i] = val;
+                }
+                for i in pix_bytes..row_bytes {
+                    let val = (output[output.len() - pix_bytes].wrapping_add(raw_bytes[i])) & 0xFF;
+                    output.push(val);
+                    prev_row[i] = val;
+                }
+            }
+            2 => {
+                // Up - predicts from pixel above
+                for i in 0..row_bytes {
+                    let val = (prev_row[i].wrapping_add(raw_bytes[i])) & 0xFF;
+                    output.push(val);
+                    prev_row[i] = val;
+                }
+            }
+            3 => {
+                // Average - predicts from average of left and above
+                for i in 0..pix_bytes {
+                    let val = ((prev_row[i] as u16 / 2) as u8).wrapping_add(raw_bytes[i]);
+                    output.push(val);
+                    prev_row[i] = val;
+                }
+                for i in pix_bytes..row_bytes {
+                    let left = output[output.len() - pix_bytes] as u16;
+                    let up = prev_row[i] as u16;
+                    let avg = ((left + up) / 2) as u8;
+                    let val = avg.wrapping_add(raw_bytes[i]);
+                    output.push(val);
+                    prev_row[i] = val;
+                }
+            }
+            4 => {
+                // Paeth - uses Paeth predictor algorithm
+                for i in 0..pix_bytes {
+                    let up = prev_row[i];
+                    let val = up.wrapping_add(raw_bytes[i]);
+                    output.push(val);
+                    prev_row[i] = val;
+                }
+                for i in pix_bytes..row_bytes {
+                    let left = output[output.len() - pix_bytes];
+                    let up = prev_row[i];
+                    let up_left = prev_row[i - pix_bytes];
+
+                    // Paeth algorithm
+                    let p = (left as i32) + (up as i32) - (up_left as i32);
+                    let pa = (p - left as i32).abs();
+                    let pb = (p - up as i32).abs();
+                    let pc = (p - up_left as i32).abs();
+
+                    let paeth = if pa <= pb && pa <= pc {
+                        left
+                    } else if pb <= pc {
+                        up
+                    } else {
+                        up_left
+                    };
+
+                    let val = paeth.wrapping_add(raw_bytes[i]);
+                    output.push(val);
+                    prev_row[i] = val;
+                }
+            }
+            _ => {
+                return Err(PDFError::Generic(format!(
+                    "Unsupported PNG predictor: {}",
+                    predictor_byte
+                )))
+            }
+        }
+    }
+
+    Ok(output)
 }
 
 /// Decodes a stream based on its Filter entry.
