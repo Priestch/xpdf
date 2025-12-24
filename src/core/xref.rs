@@ -82,6 +82,7 @@ impl XRef {
     /// Parses the cross-reference table starting at the current stream position.
     ///
     /// This reads either a traditional xref table or an XRef stream (PDF 1.5+).
+    /// It also follows /Prev entries to handle incremental updates.
     ///
     /// Traditional xref table format:
     /// ```text
@@ -104,87 +105,141 @@ impl XRef {
     /// endobj
     /// ```
     pub fn parse(&mut self) -> PDFResult<()> {
-        let lexer = Lexer::new(self.stream.make_sub_stream(
-            self.stream.pos(),
-            self.stream.length() - self.stream.pos(),
-        )?)?;
-        let mut parser = Parser::new(lexer)?;
+        let start_pos = self.stream.pos();
 
-        // First token could be "xref" (traditional) or a number (XRef stream object)
-        let obj = parser.get_object()?;
+        // Queue of xref positions to process (handles /Prev chain)
+        let mut xref_queue = vec![start_pos];
 
-        match obj {
-            obj if obj.is_command("xref") => {
-                // Traditional xref table
-                self.read_xref_table(&mut parser)?;
+        // Cache to prevent infinite loops from circular /Prev references
+        let mut parsed_positions = std::collections::HashSet::new();
 
-                // read_xref_table consumed the "trailer" keyword, so read the dictionary directly
-                let trailer = parser.get_object()?;
-                if !matches!(trailer, PDFObject::Dictionary(_)) {
-                    return Err(PDFError::Generic(
-                        "Expected trailer dictionary".to_string(),
-                    ));
-                }
+        // The first trailer we encounter (from the end of the file) is the main trailer
+        let mut main_trailer: Option<PDFObject> = None;
 
-                self.trailer = Some(trailer);
-                Ok(())
+        while let Some(pos) = xref_queue.pop() {
+            // Skip if we've already parsed this position (circular reference protection)
+            if !parsed_positions.insert(pos) {
+                continue;
             }
-            PDFObject::Number(_obj_num) => {
-                // Might be an XRef stream - format: N 0 obj << /Type /XRef >> stream...endstream
-                let generation = parser.get_object()?;
-                let obj_keyword = parser.get_object()?;
 
-                // Verify this is an indirect object
-                if !matches!(generation, PDFObject::Number(0.0)) {
-                    return Err(PDFError::Generic(
-                        "XRef stream must have generation 0".to_string(),
-                    ));
-                }
+            // Position stream at this xref location
+            self.stream.set_pos(pos)?;
 
-                if !obj_keyword.is_command("obj") {
-                    return Err(PDFError::Generic(format!(
-                        "Expected 'obj' keyword, got {:?}",
-                        obj_keyword
-                    )));
-                }
+            let lexer = Lexer::new(self.stream.make_sub_stream(
+                pos,
+                self.stream.length() - pos,
+            )?)?;
+            let mut parser = Parser::new(lexer)?;
 
-                // Read the object (should be a Stream with /Type /XRef)
-                let xref_obj = parser.get_object()?;
+            // First token could be "xref" (traditional) or a number (XRef stream object)
+            let obj = parser.get_object()?;
 
-                match xref_obj {
-                    PDFObject::Stream { dict, data } => {
-                        // Verify it's an XRef stream
-                        if let Some(PDFObject::Name(type_name)) = dict.get("Type") {
-                            if type_name != "XRef" {
-                                return Err(PDFError::Generic(format!(
-                                    "Expected /Type /XRef, got /Type /{}",
-                                    type_name
-                                )));
-                            }
-                        } else {
-                            return Err(PDFError::Generic(
-                                "XRef stream missing /Type entry".to_string(),
-                            ));
-                        }
+            let trailer = match obj {
+                obj if obj.is_command("xref") => {
+                    // Traditional xref table
+                    self.read_xref_table(&mut parser)?;
 
-                        // Parse the XRef stream
-                        self.parse_xref_stream(&dict, &data)?;
-
-                        // The trailer dictionary is the stream dictionary itself
-                        self.trailer = Some(PDFObject::Dictionary(dict));
-
-                        Ok(())
+                    // read_xref_table consumed the "trailer" keyword, so read the dictionary directly
+                    let trailer = parser.get_object()?;
+                    if !matches!(trailer, PDFObject::Dictionary(_)) {
+                        return Err(PDFError::Generic(
+                            "Expected trailer dictionary".to_string(),
+                        ));
                     }
-                    _ => Err(PDFError::Generic(
-                        "Expected XRef stream object".to_string(),
-                    )),
+
+                    trailer
+                }
+                PDFObject::Number(_obj_num) => {
+                    // Might be an XRef stream - format: N 0 obj << /Type /XRef >> stream...endstream
+                    let generation = parser.get_object()?;
+                    let obj_keyword = parser.get_object()?;
+
+                    // Verify this is an indirect object
+                    if !matches!(generation, PDFObject::Number(0.0)) {
+                        return Err(PDFError::Generic(
+                            "XRef stream must have generation 0".to_string(),
+                        ));
+                    }
+
+                    if !obj_keyword.is_command("obj") {
+                        return Err(PDFError::Generic(format!(
+                            "Expected 'obj' keyword, got {:?}",
+                            obj_keyword
+                        )));
+                    }
+
+                    // Read the object (should be a Stream with /Type /XRef)
+                    let xref_obj = parser.get_object()?;
+
+                    match xref_obj {
+                        PDFObject::Stream { dict, data } => {
+                            // Verify it's an XRef stream
+                            if let Some(PDFObject::Name(type_name)) = dict.get("Type") {
+                                if type_name != "XRef" {
+                                    return Err(PDFError::Generic(format!(
+                                        "Expected /Type /XRef, got /Type /{}",
+                                        type_name
+                                    )));
+                                }
+                            } else {
+                                return Err(PDFError::Generic(
+                                    "XRef stream missing /Type entry".to_string(),
+                                ));
+                            }
+
+                            // Parse the XRef stream
+                            self.parse_xref_stream(&dict, &data)?;
+
+                            // The trailer dictionary is the stream dictionary itself
+                            PDFObject::Dictionary(dict)
+                        }
+                        _ => {
+                            return Err(PDFError::Generic(
+                                "Expected XRef stream object".to_string(),
+                            ))
+                        }
+                    }
+                }
+                _ => {
+                    return Err(PDFError::Generic(format!(
+                        "Expected 'xref' keyword or object number, got {:?}",
+                        obj
+                    )))
+                }
+            };
+
+            // Save the first trailer as the main trailer
+            if main_trailer.is_none() {
+                main_trailer = Some(trailer.clone());
+            }
+
+            // Check for /Prev entry and add to queue
+            if let PDFObject::Dictionary(ref dict) = trailer {
+                if let Some(prev_obj) = dict.get("Prev") {
+                    match prev_obj {
+                        PDFObject::Number(n) => {
+                            let prev_pos = *n as usize;
+                            xref_queue.push(prev_pos);
+                        }
+                        PDFObject::Ref { num, .. } => {
+                            // Non-compliant PDFs might use a reference for /Prev
+                            // The spec says it should be a direct number
+                            // We'll try to handle it anyway by using the object number as position
+                            // This is a heuristic and may not always work
+                            xref_queue.push(*num as usize);
+                        }
+                        _ => {
+                            // Invalid /Prev entry, ignore it
+                        }
+                    }
                 }
             }
-            _ => Err(PDFError::Generic(format!(
-                "Expected 'xref' keyword or object number, got {:?}",
-                obj
-            ))),
         }
+
+        // Set the main trailer
+        self.trailer = main_trailer;
+
+        Ok(())
     }
 
     /// Parses an XRef stream (PDF 1.5+).
@@ -259,8 +314,58 @@ impl XRef {
             _ => None,
         });
 
-        let decompressed_data = decode::decode_stream(data, filter_name)
+        let mut decompressed_data = decode::decode_stream(data, filter_name)
             .map_err(|e| PDFError::Generic(format!("XRef stream decode error: {}", e)))?;
+
+        // Apply PNG predictor if specified in DecodeParms
+        if let Some(decode_parms) = dict.get("DecodeParms") {
+            if let PDFObject::Dictionary(parms) = decode_parms {
+                // Check for Predictor
+                if let Some(PDFObject::Number(predictor)) = parms.get("Predictor") {
+                    let pred = *predictor as i32;
+                    // PNG predictor values are 10-14 (10 = None, 11 = Sub, 12 = Up, 13 = Average, 14 = Paeth)
+                    if pred >= 10 && pred <= 14 {
+                        // Get Columns parameter (required for PNG predictor)
+                        let columns = parms
+                            .get("Columns")
+                            .and_then(|obj| match obj {
+                                PDFObject::Number(n) => Some(*n as usize),
+                                _ => None,
+                            })
+                            .unwrap_or(1);
+
+                        // Get Colors parameter (default 1)
+                        let colors = parms
+                            .get("Colors")
+                            .and_then(|obj| match obj {
+                                PDFObject::Number(n) => Some(*n as usize),
+                                _ => None,
+                            })
+                            .unwrap_or(1);
+
+                        // Get BitsPerComponent (default 8)
+                        let bits_per_component = parms
+                            .get("BitsPerComponent")
+                            .and_then(|obj| match obj {
+                                PDFObject::Number(n) => Some(*n as usize),
+                                _ => None,
+                            })
+                            .unwrap_or(8);
+
+                        // Apply PNG predictor
+                        decompressed_data = decode::decode_png_predictor(
+                            &decompressed_data,
+                            colors,
+                            bits_per_component,
+                            columns,
+                        )
+                        .map_err(|e| {
+                            PDFError::Generic(format!("PNG predictor decode error: {}", e))
+                        })?;
+                    }
+                }
+            }
+        }
 
         
         // Parse entries from the decompressed data
@@ -545,8 +650,54 @@ impl XRef {
                     _ => None,
                 });
 
-                let decompressed_data = decode::decode_stream(data, filter_name)
-            .map_err(|e| PDFError::Generic(format!("XRef stream decode error: {}", e)))?;
+                let mut decompressed_data = decode::decode_stream(data, filter_name)
+                    .map_err(|e| PDFError::Generic(format!("ObjStm decode error: {}", e)))?;
+
+                // Apply PNG predictor if specified in DecodeParms
+                if let Some(decode_parms) = dict.get("DecodeParms") {
+                    if let PDFObject::Dictionary(parms) = decode_parms {
+                        // Check for Predictor
+                        if let Some(PDFObject::Number(predictor)) = parms.get("Predictor") {
+                            let pred = *predictor as i32;
+                            // PNG predictor values are 10-14
+                            if pred >= 10 && pred <= 14 {
+                                let columns = parms
+                                    .get("Columns")
+                                    .and_then(|obj| match obj {
+                                        PDFObject::Number(n) => Some(*n as usize),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(1);
+
+                                let colors = parms
+                                    .get("Colors")
+                                    .and_then(|obj| match obj {
+                                        PDFObject::Number(n) => Some(*n as usize),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(1);
+
+                                let bits_per_component = parms
+                                    .get("BitsPerComponent")
+                                    .and_then(|obj| match obj {
+                                        PDFObject::Number(n) => Some(*n as usize),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(8);
+
+                                decompressed_data = decode::decode_png_predictor(
+                                    &decompressed_data,
+                                    colors,
+                                    bits_per_component,
+                                    columns,
+                                )
+                                .map_err(|e| {
+                                    PDFError::Generic(format!("PNG predictor decode error: {}", e))
+                                })?;
+                            }
+                        }
+                    }
+                }
 
                 // Parse the object number/offset pairs (first N pairs of integers)
                 let index_stream = Stream::from_bytes(decompressed_data[..first].to_vec());

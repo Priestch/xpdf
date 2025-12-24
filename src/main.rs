@@ -439,25 +439,7 @@ fn extract_page_images(page: &Page, doc: &mut PDFDocument, total_size: &mut usiz
 fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFObject>, data: &[u8]) {
     println!("    📋 Image Information:");
     println!("      Name: {}", name);
-    println!("      Data size: {} bytes", data.len());
-
-    // Debug: Show first bytes of data
-    if data.len() >= 16 {
-        println!("      First 16 bytes: {:02x?}", &data[..16]);
-    }
-
-    // Debug: Show Length from dictionary
-    if let Some(length_obj) = dict.get("Length") {
-        println!("      Length in dict: {:?}", length_obj);
-    }
-
-    // Debug: Show all dictionary keys
-    println!("      Dictionary keys: {:?}", dict.keys().collect::<Vec<_>>());
-
-    // Debug: Show DecodeParms if present
-    if let Some(decode_parms) = dict.get("DecodeParms") {
-        println!("      DecodeParms: {:?}", decode_parms);
-    }
+    println!("      Data size: {} bytes ({:.1} KB)", data.len(), data.len() as f64 / 1024.0);
 
     // Detect format from PDF filter information first (more reliable for PDF images)
     let format = if let Some(filter) = dict.get("Filter") {
@@ -574,12 +556,27 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
     }
 
     if let Some(colorspace) = dict.get("ColorSpace") {
-        println!("      Color space: {:?}", colorspace);
+        let cs_name = match colorspace {
+            PDFObject::Name(name) => name.clone(),
+            PDFObject::Ref { num, generation } => format!("Ref({} {})", num, generation),
+            _ => "Unknown".to_string(),
+        };
+        println!("      Color space: {}", cs_name);
     }
 
-    // Show filter/compression info
+    // Show filter/compression info concisely
     if let Some(filter) = dict.get("Filter") {
-        println!("      Compression: {:?}", filter);
+        let filter_name = match filter {
+            PDFObject::Name(name) => name.clone(),
+            PDFObject::Array(filters) => {
+                let names: Vec<String> = filters.iter()
+                    .filter_map(|f| if let PDFObject::Name(n) = f { Some(n.clone()) } else { None })
+                    .collect();
+                names.join(", ")
+            }
+            _ => "Unknown".to_string(),
+        };
+        println!("      Filter: {}", filter_name);
     }
 
     // Test if we can decode this format
@@ -587,8 +584,6 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
     {
         match format {
             ImageFormat::JPEG | ImageFormat::PNG | ImageFormat::Raw => {
-                println!("      ✅ Decoding supported for this format");
-
                 // Attempt actual decoding
                 if format == ImageFormat::Raw {
                     // For Raw images with FlateDecode, the stream data might already be decompressed
@@ -601,7 +596,6 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
 
                     // Try using data as-is first (might already be decompressed)
                     let mut raw_data = data.to_vec();
-                    let mut tried_decompress = false;
 
                     // Extract metadata for decoding
                     let width = dict.get("Width")
@@ -623,17 +617,14 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
                             // Try decoding with current data
                             match ImageDecoder::decode_raw_image(&raw_data, width, height, bpc, color_space.clone()) {
                                 Ok(decoded) => {
-                                    println!("      ✨ Successfully decoded: {}x{} pixels, {} channels",
+                                    println!("      ✅ Decoded successfully: {}x{} ({} channels)",
                                         decoded.width, decoded.height, decoded.channels);
                                 }
                                 Err(e) => {
                                     // If decoding failed and we have FlateDecode, try decompressing first
-                                    if has_flate && !tried_decompress {
+                                    if has_flate {
                                         match decode_flate(&data) {
                                             Ok(mut decompressed) => {
-                                                println!("      🔓 Decompressed: {} bytes → {} bytes", data.len(), decompressed.len());
-                                                tried_decompress = true;
-
                                                 // Check for PNG predictor in DecodeParms
                                                 if let Some(decode_parms) = dict.get("DecodeParms") {
                                                     if let PDFObject::Dictionary(parms) = decode_parms {
@@ -649,11 +640,8 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
                                                                     .and_then(|c| if let PDFObject::Number(n) = c { Some(*n as usize) } else { None })
                                                                     .unwrap_or(width as usize);
 
-                                                                println!("      🎨 Applying PNG predictor (colors={}, columns={})", colors, columns);
-
                                                                 match decode_png_predictor(&decompressed, colors, bpc as usize, columns) {
                                                                     Ok(unpredicted) => {
-                                                                        println!("      🔓 Unpredicted: {} bytes → {} bytes", decompressed.len(), unpredicted.len());
                                                                         decompressed = unpredicted;
                                                                     }
                                                                     Err(pred_err) => {
@@ -670,21 +658,20 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
                                                 // Try decoding again with decompressed data
                                                 match ImageDecoder::decode_raw_image(&raw_data, width, height, bpc, color_space) {
                                                     Ok(decoded) => {
-                                                        println!("      ✨ Successfully decoded: {}x{} pixels, {} channels",
+                                                        println!("      ✅ Decoded successfully: {}x{} ({} channels)",
                                                             decoded.width, decoded.height, decoded.channels);
                                                     }
                                                     Err(decode_err) => {
-                                                        println!("      ⚠️  Raw image decoding failed: {:?}", decode_err);
+                                                        println!("      ⚠️  Decoding failed: {:?}", decode_err);
                                                     }
                                                 }
                                             }
                                             Err(decompress_err) => {
                                                 println!("      ⚠️  Decompression failed: {:?}", decompress_err);
-                                                println!("      ⚠️  Raw image decoding also failed: {:?}", e);
                                             }
                                         }
                                     } else {
-                                        println!("      ⚠️  Raw image decoding failed: {:?}", e);
+                                        println!("      ⚠️  Decoding failed: {:?}", e);
                                     }
                                 }
                             }
@@ -693,14 +680,14 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
                 }
             }
             _ => {
-                println!("      ⚠️  Decoding not supported for this format");
+                // Format not supported - silently skip
             }
         }
     }
 
     #[cfg(not(feature = "jpeg-decoding"))]
     {
-        println!("      ⚠️  Image decoding not enabled (use --features jpeg-decoding)");
+        // Image decoding not enabled
     }
 }
 

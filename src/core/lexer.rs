@@ -1152,4 +1152,71 @@ mod tests {
         assert_eq!(lexer.get_object().unwrap(), Token::Boolean(true));
         assert_eq!(lexer.get_object().unwrap(), Token::ArrayEnd);
     }
+
+    #[test]
+    fn test_number_with_line_break_after_sign() {
+        // Test: "-\r\n205.88" should parse as -205.88
+        let data = b"-\r\n205.88".to_vec();
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let mut lexer = Lexer::new(stream).unwrap();
+        assert_eq!(lexer.get_object().unwrap(), Token::Number(-205.88));
+
+        // Test: "+\r\n205.88" should parse as 205.88
+        let data2 = b"+\r\n205.88".to_vec();
+        let stream2 = Box::new(Stream::from_bytes(data2)) as Box<dyn BaseStream>;
+        let mut lexer2 = Lexer::new(stream2).unwrap();
+        assert_eq!(lexer2.get_object().unwrap(), Token::Number(205.88));
+    }
+
+    #[test]
+    fn test_single_decimal_or_sign_as_zero() {
+        // These should all parse as 0
+        let test_cases = vec![b".".to_vec(), b"-".to_vec(), b"+".to_vec(), b"-.".to_vec(), b"+.".to_vec()];
+
+        for data in test_cases {
+            let stream = Box::new(Stream::from_bytes(data.clone())) as Box<dyn BaseStream>;
+            let mut lexer = Lexer::new(stream).unwrap();
+            assert_eq!(lexer.get_object().unwrap(), Token::Number(0.0),
+                "Failed for input: {:?}", String::from_utf8_lossy(&data));
+        }
+    }
+
+    #[test]
+    fn test_glued_number_and_operator() {
+        // "123ET" should parse 123 and leave 'E' as current char
+        let data = b"123ET".to_vec();
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let mut lexer = Lexer::new(stream).unwrap();
+
+        assert_eq!(lexer.get_object().unwrap(), Token::Number(123.0));
+        // After reading 123, current_char should be 'E' (0x45)
+        assert_eq!(lexer.current_char, 0x45);
+    }
+
+    #[test]
+    fn test_hex_string_with_spaces_odd_digits() {
+        // "<7 0 2 15 5 2 2 2 4 3 2 4>" should handle odd number of hex digits with spaces
+        // '7 0 2 15 5 2 2 2 4 3 2 4' -> '70 21 55 22 24 32 40'
+        let data = b"<7 0 2 15 5 2 2 2 4 3 2 4>".to_vec();
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let mut lexer = Lexer::new(stream).unwrap();
+
+        let result = lexer.get_object().unwrap();
+        if let Token::HexString(bytes) = result {
+            // Expected: 0x70, 0x21, 0x55, 0x22, 0x24, 0x32, 0x40
+            assert_eq!(bytes, vec![0x70, 0x21, 0x55, 0x22, 0x24, 0x32, 0x40]);
+        } else {
+            panic!("Expected HexString, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_escaped_cr_lf_in_string() {
+        // "(\101\<CR><LF>\102)" should parse as "AB" (escaped newlines are ignored)
+        let data = b"(\\101\\\r\n\\102\\\r\\103\\\n\\104)".to_vec();
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let mut lexer = Lexer::new(stream).unwrap();
+
+        assert_eq!(lexer.get_object().unwrap(), Token::String(b"ABCD".to_vec()));
+    }
 }
