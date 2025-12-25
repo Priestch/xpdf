@@ -71,6 +71,26 @@ pub trait BaseStream: Send {
         true
     }
 
+    /// Ensures that a specific byte range is loaded and available.
+    ///
+    /// For progressive/chunked streams, this triggers loading of any missing chunks
+    /// needed to satisfy the range. For in-memory streams, this is a no-op.
+    ///
+    /// This is called by retry loops when DataMissing errors occur, following
+    /// PDF.js's exception-driven loading pattern.
+    ///
+    /// # Arguments
+    /// * `start` - Starting byte position (inclusive)
+    /// * `length` - Number of bytes needed
+    ///
+    /// # Returns
+    /// Ok(()) if the range is now available, or an error if loading fails
+    fn ensure_range(&mut self, _start: usize, _length: usize) -> PDFResult<()> {
+        // Default implementation: assume all data is available
+        // Chunked streams override this to load missing chunks
+        Ok(())
+    }
+
     /// Reads a single byte without advancing the position.
     ///
     /// Returns an error if the end of the stream is reached or data is not available.

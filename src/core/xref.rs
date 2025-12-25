@@ -819,6 +819,33 @@ impl XRef {
                 let lexer = Lexer::new(sub_stream)?;
                 let mut parser = Parser::new(lexer)?;
 
+                // CRITICAL FIX: Set up a reference resolver so the parser can resolve
+                // indirect /Length references in streams. Without this, streams with
+                // /Length references fall back to scanning for "endstream" which can
+                // read incorrect boundaries and capture "endobj" as stream data.
+                //
+                // We create a closure that captures a mutable reference to self.
+                // This is safe because:
+                // 1. The resolver is only called during parser.get_object() below
+                // 2. We're not modifying the XRef entries during fetch (only reading/caching)
+                // 3. Rust's borrow checker ensures no other mutable borrows exist
+                //
+                // However, we can't directly capture &mut self in the closure because
+                // it would create a self-referential struct. Instead, we'll use an
+                // unsafe pointer cast. This is safe because:
+                // - The parser lifetime is scoped to this function
+                // - We ensure no re-entrant calls that could invalidate the pointer
+                // - The XRef object is not moved or dropped during parsing
+                let self_ptr = self as *mut XRef;
+                parser.set_ref_resolver(move |num, generation| {
+                    // SAFETY: This is safe because:
+                    // 1. self_ptr is valid for the duration of parser.get_object()
+                    // 2. No other code can modify or move the XRef during this time
+                    // 3. We're only calling fetch() which is part of XRef's public API
+                    unsafe { (*self_ptr).fetch(num, generation) }
+                        .map(|rc| (*rc).clone())
+                });
+
                 // Read object number
                 let num_obj = parser.get_object()?;
                 let parsed_num = match num_obj {

@@ -1,10 +1,13 @@
 use super::base_stream::BaseStream;
+use super::chunk_manager::ChunkLoader;
 use super::error::{PDFError, PDFResult};
+use super::file_chunked_stream::FileChunkedStream;
 use super::page::{Page, PageTreeCache};
 use super::parser::PDFObject;
 use super::stream::Stream;
 use super::xref::XRef;
 use std::collections::HashSet;
+use std::path::Path;
 
 /// Information about a linearized PDF.
 #[derive(Debug, Clone)]
@@ -89,6 +92,127 @@ impl PDFDocument {
             page_cache: PageTreeCache::new(),
             linearized,
         })
+    }
+
+    /// Opens a PDF document from a file using progressive/chunked loading.
+    ///
+    /// This loads the PDF in chunks (default 64KB) rather than reading the entire
+    /// file into memory at once, enabling:
+    /// - Low memory usage for large PDFs
+    /// - Fast first-page display (especially for linearized PDFs)
+    /// - Efficient handling of network-served PDFs
+    ///
+    /// This is the **recommended** way to open PDFs, following PDF.js's progressive
+    /// loading architecture.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the PDF file
+    /// * `chunk_size` - Optional chunk size in bytes (default: 65536 = 64KB)
+    /// * `max_cached_chunks` - Optional maximum chunks to keep in memory (default: 10)
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// // Use default chunk size and cache
+    /// let doc = PDFDocument::open_file("document.pdf", None, None).unwrap();
+    ///
+    /// // Custom chunk size (128KB) and cache (20 chunks)
+    /// let doc = PDFDocument::open_file("large.pdf", Some(131072), Some(20)).unwrap();
+    /// ```
+    pub fn open_file<P: AsRef<Path>>(
+        path: P,
+        chunk_size: Option<usize>,
+        max_cached_chunks: Option<usize>,
+    ) -> PDFResult<Self> {
+        let mut stream = FileChunkedStream::open(path, chunk_size, max_cached_chunks)?;
+
+        // To find startxref, we need the last 1024 bytes of the file
+        // Preload the last chunk(s) to ensure we have that data
+        let file_length = stream.length();
+        let startxref_search_start = if file_length > 1024 {
+            file_length - 1024
+        } else {
+            0
+        };
+
+        // Preload the range containing startxref
+        stream.preload_range(startxref_search_start, file_length)?;
+
+        // Get the last 1024 bytes to find startxref
+        let search_data = stream.get_byte_range(startxref_search_start, file_length)?;
+
+        // Find startxref in the tail of the file
+        let startxref = Self::find_startxref_in_bytes(&search_data, startxref_search_start)?;
+
+        // Preload the chunk containing the xref table start
+        // (XRef tables are usually near the end, this improves initial load time)
+        let xref_preload_start = startxref;
+        let xref_preload_end = (startxref + stream.chunk_size()).min(file_length);
+        stream.preload_range(xref_preload_start, xref_preload_end)?;
+
+        // Create xref with the chunked stream
+        let boxed_stream = Box::new(stream) as Box<dyn BaseStream>;
+        let mut xref = XRef::new(boxed_stream);
+
+        // Position at xref table and parse
+        xref.set_stream_pos(startxref)?;
+        xref.parse()?;
+
+        // Load the catalog
+        let catalog = Some(xref.catalog()?);
+
+        // Check if this is a linearized PDF
+        let linearized = Self::check_linearized(&mut xref)?;
+
+        Ok(PDFDocument {
+            xref,
+            catalog,
+            page_cache: PageTreeCache::new(),
+            linearized,
+        })
+    }
+
+    /// Helper method to find startxref with a known offset adjustment.
+    ///
+    /// This is used by `open_file()` when we've read a slice from the end of the file.
+    fn find_startxref_in_bytes(data: &[u8], base_offset: usize) -> PDFResult<usize> {
+        // Find "startxref"
+        let keyword = b"startxref";
+        let pos = data
+            .windows(keyword.len())
+            .rposition(|window| window == keyword)
+            .ok_or_else(|| PDFError::Generic("startxref not found in PDF".to_string()))?;
+
+        // Skip past "startxref" and any whitespace
+        let mut offset_start = pos + keyword.len();
+
+        // Skip whitespace
+        while offset_start < data.len() && data[offset_start].is_ascii_whitespace() {
+            offset_start += 1;
+        }
+
+        // Read the offset number (as ASCII digits)
+        let mut offset_end = offset_start;
+        while offset_end < data.len() && data[offset_end].is_ascii_digit() {
+            offset_end += 1;
+        }
+
+        if offset_start == offset_end {
+            return Err(PDFError::Generic(
+                "No offset found after startxref".to_string(),
+            ));
+        }
+
+        // Parse the offset
+        let offset_str = std::str::from_utf8(&data[offset_start..offset_end])
+            .map_err(|_| PDFError::Generic("Invalid UTF-8 in startxref offset".to_string()))?;
+
+        let offset: usize = offset_str
+            .parse()
+            .map_err(|_| PDFError::Generic("Invalid startxref offset".to_string()))?;
+
+        Ok(offset)
     }
 
     /// Finds the byte offset of the cross-reference table.

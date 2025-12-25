@@ -1,175 +1,94 @@
-//! Advanced Text Extraction Example
-//!
-//! This example demonstrates comprehensive text extraction capabilities:
-//! - Extracting all text with formatting information
-//! - Analyzing font usage
-//! - Creating structured text output
-//! - Performance considerations
-//!
-//! Run with: cargo run --example text_extraction <pdf_file>
+/// Example demonstrating text extraction from PDF pages.
 
-use pdf_x::core::PDFDocument;
-use std::collections::HashMap;
+use pdf_x::PDFDocument;
 use std::env;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: cargo run --example text_extraction <pdf_file>");
-        eprintln!("\nThis example demonstrates advanced text extraction capabilities.");
-        return Ok(());
+        eprintln!("Text Extraction Demo");
+        eprintln!("Usage: {} <pdf-file> [page-number]", args[0]);
+        eprintln!("\nExtracts text from the specified page (default: page 1)");
+        std::process::exit(1);
     }
 
     let pdf_path = &args[1];
-    println!("📄 Extracting text from: {}", pdf_path);
+    let page_num = if args.len() > 2 {
+        args[2].parse::<usize>().unwrap_or(0)
+    } else {
+        0  // First page
+    };
 
-    // Read and parse PDF
-    let pdf_data = std::fs::read(pdf_path)?;
-    let mut doc = PDFDocument::open(pdf_data)?;
+    println!("═══════════════════════════════════════════════════════");
+    println!("  PDF Text Extraction Demo");
+    println!("═══════════════════════════════════════════════════════\n");
 
-    let page_count = doc.page_count()?;
-    println!("📊 PDF has {} pages", page_count);
+    println!("📄 Opening: {}", pdf_path);
+    println!("📖 Extracting text from page {}...\n", page_num + 1);
 
-    // Extract text from all pages
-    let mut all_text_items = Vec::new();
-    let mut font_stats: HashMap<String, usize> = HashMap::new();
+    // Open PDF with progressive loading
+    let mut doc = match PDFDocument::open_file(pdf_path, None, None) {
+        Ok(doc) => doc,
+        Err(e) => {
+            eprintln!("\n❌ Error opening PDF: {:?}", e);
+            std::process::exit(1);
+        }
+    };
 
-    for page_index in 0..page_count {
-        println!("\n📖 Processing page {}...", page_index + 1);
+    // Get the page
+    let page = match doc.get_page(page_num) {
+        Ok(page) => page,
+        Err(e) => {
+            eprintln!("\n❌ Error getting page {}: {:?}", page_num + 1, e);
+            std::process::exit(1);
+        }
+    };
 
-        let page = doc.get_page(page_index)?;
-        let text_items = page.extract_text(&mut doc.xref_mut())?;
+    // Extract text
+    let text_items = match page.extract_text(doc.xref_mut()) {
+        Ok(items) => items,
+        Err(e) => {
+            eprintln!("\n❌ Error extracting text: {:?}", e);
+            std::process::exit(1);
+        }
+    };
 
-        // Collect font statistics
-        for item in &text_items {
-            if let Some(font_name) = &item.font_name {
-                *font_stats.entry(font_name.clone()).or_insert(0) += 1;
+    println!("═══════════════ EXTRACTED TEXT ═══════════════");
+    println!("Found {} text items\n", text_items.len());
+
+    if text_items.is_empty() {
+        println!("ℹ️  No text found on this page");
+        println!("   (Page may contain only images or be blank)");
+    } else {
+        for (i, item) in text_items.iter().enumerate() {
+            println!("─── Text Item #{} ───", i + 1);
+            println!("  Content: \"{}\"", item.text);
+            
+            if let Some(font) = &item.font_name {
+                println!("  Font: {}", font);
             }
-        }
-
-        all_text_items.extend(text_items);
-    }
-
-    // Display extraction results
-    println!("\n📋 Text Extraction Results:");
-    println!("  Total text items: {}", all_text_items.len());
-    println!("  Total characters: {}", count_characters(&all_text_items));
-
-    // Display font usage statistics
-    if !font_stats.is_empty() {
-        println!("\n🔤 Font Usage:");
-        for (font_name, count) in font_stats.iter() {
-            println!("  {}: {} occurrences", font_name, count);
-        }
-    }
-
-    // Save structured output
-    save_structured_text(&all_text_items, "extracted_text.txt")?;
-    save_simple_text(&all_text_items, "simple_text.txt")?;
-
-    println!("\n💾 Output files:");
-    println!("  extracted_text.txt - Structured text with metadata");
-    println!("  simple_text.txt - Plain text content");
-
-    Ok(())
-}
-
-fn count_characters(text_items: &[pdf_x::core::TextItem]) -> usize {
-    text_items.iter().map(|item| item.text.len()).sum()
-}
-
-fn save_structured_text(text_items: &[pdf_x::core::TextItem], filename: &str) -> Result<(), std::io::Error> {
-    use std::fs::File;
-    use std::io::Write;
-
-    let mut file = File::create(filename)?;
-
-    writeln!(file, "# Structured Text Extraction Results")?;
-    writeln!(file, "# Generated by PDF-X text extraction example")?;
-    writeln!(file, "")?;
-
-    for (i, item) in text_items.iter().enumerate() {
-        writeln!(file, "Item {}:", i + 1)?;
-        writeln!(file, "  Text: \"{}\"", item.text)?;
-
-        if let Some(font_name) = &item.font_name {
-            writeln!(file, "  Font: {}", font_name)?;
-        }
-
-        if let Some(font_size) = item.font_size {
-            writeln!(file, "  Font size: {}", font_size)?;
-        }
-
-        if let Some((x, y)) = item.position {
-            writeln!(file, "  Position: ({:.1}, {:.1})", x, y)?;
-        }
-
-        if let Some(mode) = item.rendering_mode {
-            writeln!(file, "  Rendering mode: {}", mode)?;
-        }
-
-        writeln!(file, "")?;
-    }
-
-    Ok(())
-}
-
-fn save_simple_text(text_items: &[pdf_x::core::TextItem], filename: &str) -> Result<(), std::io::Error> {
-    use std::fs::File;
-    use std::io::Write;
-
-    let mut file = File::create(filename)?;
-
-    writeln!(file, "# Simple Text Extraction")?;
-    writeln!(file, "# Plain text content from PDF")?;
-    writeln!(file, "")?;
-
-    let mut page_number = 1;
-    let last_position = None;
-
-    for item in text_items {
-        // Check for position gaps to infer page breaks
-        if let Some((x, y)) = item.position {
-            if let Some((_, last_y)) = last_position {
-                if last_y - y > 100.0 {
-                    writeln!(file, "")?;
-                    writeln!(file, "--- Page {} ---", page_number)?;
-                    page_number += 1;
-                }
+            
+            if let Some(size) = item.font_size {
+                println!("  Size: {:.2} pt", size);
             }
-            last_position = Some((x, y));
+            
+            if let Some((x, y)) = item.position {
+                println!("  Position: ({:.2}, {:.2})", x, y);
+            }
+            
+            println!();
         }
 
-        writeln!(file, "{}", item.text)?;
+        // Show combined text
+        println!("═══════════════ COMBINED TEXT ═══════════════");
+        let combined: String = text_items.iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<&str>>()
+            .join(" ");
+        
+        println!("{}", combined);
     }
 
-    Ok(())
-}
-
-/// Performance measurement example
-#[allow(dead_code)]
-fn measure_performance() -> Result<(), Box<dyn std::error::Error>> {
-    use std::time::Instant;
-
-    let pdf_path = "example.pdf";
-    let pdf_data = std::fs::read(pdf_path)?;
-
-    // Measure parsing time
-    let start = Instant::now();
-    let mut doc = PDFDocument::open(pdf_data)?;
-    let parse_time = start.elapsed();
-
-    // Measure text extraction time
-    let start = Instant::now();
-    let page = doc.get_page(0)?;
-    let _text_items = page.extract_text(&mut doc.xref_mut())?;
-    let extract_time = start.elapsed();
-
-    println!("📈 Performance Metrics:");
-    println!("  Parse time: {:?}", parse_time);
-    println!("  Text extraction time: {:?}", extract_time);
-    println!("  PDF size: {} bytes", pdf_data.len());
-
-    Ok(())
+    println!("\n═══════════════════════════════════════════════════════");
 }

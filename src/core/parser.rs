@@ -247,7 +247,8 @@ impl Parser {
         loop {
             // Check if we've reached the end of the dictionary
             if let Some(Token::DictEnd) = &self.buf1 {
-                self.shift()?; // Consume the '>>'
+                // DON'T shift yet - we need to check buf2 for "stream" first
+                // (matches PDF.js behavior)
                 break;
             }
 
@@ -316,36 +317,30 @@ impl Parser {
 
         // Check if this dictionary is followed by a stream
         // Format: << /Key value >> stream\n...binary data...endstream
-        // IMPORTANT: We need to save the position NOW, before checking buf1,
-        // because buf2 has already been filled and consumed bytes from the stream.
-        // After the dictionary ends, the lexer is positioned like this:
-        // - buf1 = next token (might be "stream" or something else)
-        // - buf2 = token after that (if buf1 is "stream", buf2 consumed stream data!)
-        // - lexer.position = where buf2 finished reading
-        //
-        // If buf1 is "stream", we need to know where to start reading stream data.
-        // That position is: right after the "stream" keyword + newline.
-        // But we can't easily calculate that because we don't know how buf1 was tokenized.
-        //
-        // Solution: Save the lexer position BEFORE we filled buf1 with "stream".
-        // But we've already filled both buf1 and buf2 at this point!
-        //
-        // Better solution: When we detect "stream", consume ONLY buf1 (the "stream" keyword),
-        // then manually skip the newline, then start reading stream bytes.
-        // DON'T use buf2 at all - it contains corrupt data.
+        // IMPORTANT: PDF.js checks buf2 (the lookahead token) for "stream"
+        // At this point, buf1='>>',  buf2=next token (possibly "stream")
+        // We haven't consumed '>>' yet, so the lexer is positioned correctly.
 
-        if let Some(Token::Command(cmd)) = &self.buf1 {
+        if let Some(Token::Command(cmd)) = &self.buf2 {
             if cmd == "stream" {
-                // Detected stream! At this point:
-                // - buf1 = "stream" token
-                // - buf2 = CORRUPT (already read ahead into stream data)
-                // - We need to re-synchronize to the correct stream start position
+                // Detected stream! This matches PDF.js's approach.
+                // buf1 = '>>' (not yet consumed)
+                // buf2 = "stream" token
+                // lexer is positioned right after "stream"
 
-                // Pass the dictionary to parse_stream which will handle the position fix
+                // DON'T call shift() - it would try to fill buf2 from stream data!
+                // Instead, just clear both buffers and let parse_stream handle it.
+                self.buf1 = None;
+                self.buf2 = None;
+
+                // Pass the dictionary to parse_stream which will skip to next line
                 return self.parse_stream(dict);
             }
         }
 
+        // Not a stream - just a regular dictionary
+        // Consume the '>>' and return the dictionary
+        self.shift()?;
         Ok(PDFObject::Dictionary(dict))
     }
 
@@ -364,55 +359,41 @@ impl Parser {
     /// bytes from the stream data (because get_object() skips whitespace including 0x00).
     /// We need to scan backward or use heuristics to find the actual stream start.
     fn parse_stream(&mut self, dict: HashMap<String, PDFObject>) -> PDFResult<PDFObject> {
-        // SOLUTION: Use get_byte_range() to search backward for "stream\n" or "stream\r\n"
-        // in the raw stream data, then position after that newline.
-        //
-        // The problem we're solving: buf2 has already consumed bytes from the stream data.
-        // We need to find the actual start of the stream data.
+        // When this is called, buf1 and buf2 have already been cleared by parse_dictionary.
+        // The lexer is positioned right after the "stream" keyword.
+        // PDF.js approach: Skip forward to the next line from the current lexer position.
+        // This is simpler and more reliable than searching backward.
 
-        self.buf1 = None;
-        self.buf2 = None;
-
-        // Get current lexer position
-        let current_pos = self.lexer.get_position();
-
-        // Search backward up to 100 bytes for "stream\n" or "stream\r\n"
-        // We'll look from current_pos backward to current_pos - 100
-        let search_start = current_pos.saturating_sub(100);
-        let search_data = self.lexer.get_byte_range(search_start, current_pos)?;
-
-        // Find "stream" followed by newline
-        let stream_keyword = b"stream";
-        let mut stream_start_pos = None;
-
-        for i in 0..search_data.len() {
-            if i + stream_keyword.len() + 1 <= search_data.len() {
-                if &search_data[i..i + stream_keyword.len()] == stream_keyword {
-                    // Found "stream", check what follows
-                    let next_byte = search_data[i + stream_keyword.len()];
-                    if next_byte == b'\n' {
-                        // "stream\n" found
-                        stream_start_pos = Some(search_start + i + stream_keyword.len() + 1);
-                        break;
-                    } else if next_byte == b'\r' && i + stream_keyword.len() + 2 <= search_data.len() {
-                        let byte_after = search_data[i + stream_keyword.len() + 1];
-                        if byte_after == b'\n' {
-                            // "stream\r\n" found
-                            stream_start_pos = Some(search_start + i + stream_keyword.len() + 2);
-                            break;
-                        } else {
-                            // "stream\r" (without \n) - position after \r
-                            stream_start_pos = Some(search_start + i + stream_keyword.len() + 1);
-                            break;
-                        }
+        // Skip to the next line (consume bytes until we hit CR or LF, then consume the newline)
+        // This is equivalent to PDF.js's lexer.skipToNextLine()
+        loop {
+            match self.lexer.get_stream_byte() {
+                Ok(0x0D) => {
+                    // CR - check if next is LF
+                    if let Ok(0x0A) = self.lexer.get_stream_byte() {
+                        // CR+LF consumed
                     }
+                    // Either way, we're done
+                    break;
+                }
+                Ok(0x0A) => {
+                    // LF - consumed
+                    break;
+                }
+                Ok(_) => {
+                    // Some other character, keep going
+                    continue;
+                }
+                Err(_) => {
+                    // EOF or error
+                    break;
                 }
             }
         }
 
-        let stream_start_pos = stream_start_pos.ok_or_else(|| {
-            PDFError::Generic("Could not find 'stream' keyword before stream data".to_string())
-        })?;
+        // Now we're positioned right after the newline following "stream"
+        // This is where the stream data starts
+        let stream_start_pos = self.lexer.get_position();
 
         // Get the Length from the dictionary
         let length = dict
@@ -445,11 +426,7 @@ impl Parser {
             });
 
         // Read the stream data
-        // CRITICAL: Seek to the saved stream start position before reading
-        // This ensures we read from the correct offset, not from wherever the
-        // lookahead buffer consumption left us
-        self.lexer.set_position(stream_start_pos)?;
-
+        // We're already positioned at stream_start_pos (right after the newline)
         let data = if let Some(len) = length {
             // We know the length, read exactly that many bytes
             let mut bytes = Vec::with_capacity(len);

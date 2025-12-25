@@ -10,6 +10,7 @@ pub mod image;
 pub mod lexer;
 pub mod page;
 pub mod parser;
+pub mod retry;
 pub mod stream;
 pub mod sub_stream;
 pub mod xref;

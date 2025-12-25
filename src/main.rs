@@ -2,7 +2,6 @@ use pdf_x::{PDFDocument, PDFObject, XRefEntry};
 use pdf_x::core::{ImageDecoder, ImageFormat, Page};
 use pdf_x::core::decode::{decode_flate, decode_png_predictor};
 use std::env;
-use std::fs;
 use std::process;
 
 fn main() {
@@ -45,17 +44,9 @@ fn main() {
         None
     };
 
-    // Read PDF file
-    let pdf_data = match fs::read(pdf_path) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("Error reading PDF file '{}': {}", pdf_path, e);
-            process::exit(1);
-        }
-    };
-
-    // Open PDF document
-    let mut doc = match PDFDocument::open(pdf_data) {
+    // Open PDF document using progressive/chunked loading
+    // This loads the PDF in 64KB chunks rather than reading the entire file into memory
+    let mut doc = match PDFDocument::open_file(pdf_path, None, None) {
         Ok(doc) => doc,
         Err(e) => {
             eprintln!("Error parsing PDF: {:?}", e);

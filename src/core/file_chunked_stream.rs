@@ -250,6 +250,12 @@ impl BaseStream for FileChunkedStream {
         self.is_fully_loaded()
     }
 
+    fn ensure_range(&mut self, start: usize, length: usize) -> PDFResult<()> {
+        // This is the critical method for exception-driven progressive loading!
+        // When the parser throws DataMissing, it calls this to load the required chunks.
+        self.preload_range(start, start + length)
+    }
+
     fn get_byte(&mut self) -> PDFResult<u8> {
         if self.pos >= self.length() {
             return Err(PDFError::UnexpectedEndOfStream);

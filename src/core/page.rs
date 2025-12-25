@@ -114,11 +114,15 @@ impl Page {
     /// ```
     pub fn extract_text(&self, xref: &mut super::xref::XRef) -> PDFResult<Vec<super::content_stream::TextItem>> {
         use super::{ContentStreamEvaluator, Lexer, Stream};
+        use super::decode::decode_flate;
 
         let contents = match self.contents() {
             Some(contents) => contents,
             None => return Ok(Vec::new()), // No content streams
         };
+
+        // Dereference if it's a reference
+        let contents = xref.fetch_if_ref(contents)?;
 
         let mut all_text_items = Vec::new();
 
@@ -130,7 +134,7 @@ impl Page {
             PDFObject::Array(arr) => {
                 // Multiple content streams - fetch each one
                 let mut streams = Vec::new();
-                for content_obj in arr {
+                for content_obj in &arr {
                     match xref.fetch_if_ref(content_obj)? {
                         PDFObject::Stream { dict, data } => {
                             streams.push((dict, data));
@@ -153,9 +157,25 @@ impl Page {
         };
 
         // Process each content stream
-        for (_dict, data) in content_streams {
-            // Create a stream from the content data
-            let stream = Box::new(Stream::from_bytes(data)) as Box<dyn super::BaseStream>;
+        for (dict, data) in content_streams {
+            // Decode the stream if it's compressed
+            let decoded_data = if let Some(filter) = dict.get("Filter") {
+                match filter {
+                    PDFObject::Name(filter_name) if filter_name == "FlateDecode" => {
+                        // Decompress FlateDecode stream
+                        match decode_flate(&data) {
+                            Ok(decompressed) => decompressed,
+                            Err(_) => continue, // Skip this stream if decompression fails
+                        }
+                    }
+                    _ => data // Other filters not yet supported, use raw data
+                }
+            } else {
+                data // No filter, use raw data
+            };
+
+            // Create a stream from the (decoded) content data
+            let stream = Box::new(Stream::from_bytes(decoded_data)) as Box<dyn super::BaseStream>;
             let lexer = Lexer::new(stream)?;
             let parser = super::Parser::new(lexer)?;
             let mut evaluator = ContentStreamEvaluator::new(parser);
