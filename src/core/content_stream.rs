@@ -630,32 +630,51 @@ impl ContentStreamEvaluator {
             OpCode::ShowSpacedText => {
                 if op.args.len() >= 1 && self.text_state.in_text_object {
                     // TJ - array with text and spacing adjustments
+                    // This operator shows multiple text strings with individual glyph positioning
+                    // Format: [(string1) -100 (string2) 50 (string3)] where numbers are spacing adjustments
+
                     if let PDFObject::Array(items) = &op.args[0] {
+                        let mut accumulated_text = String::new();
+                        let start_position = Some((
+                            self.text_state.text_matrix[4],
+                            self.text_state.text_matrix[5],
+                        ));
+
                         for item in items {
                             match item {
                                 PDFObject::String(text_bytes) => {
                                     let text = String::from_utf8_lossy(text_bytes);
-                                    let position = Some((
-                                        self.text_state.text_matrix[4],
-                                        self.text_state.text_matrix[5],
-                                    ));
-
-                                    let text_item = TextItem {
-                                        text: text.to_string(),
-                                        font_name: self.text_state.current_font.clone(),
-                                        font_size: self.text_state.current_font_size,
-                                        position,
-                                        rendering_mode: self.text_state.text_rendering_mode,
-                                    };
-
-                                    self.text_state.extracted_text.push(text_item);
+                                    accumulated_text.push_str(&text);
                                 }
                                 PDFObject::Number(spacing) => {
-                                    // Adjust text position for spacing (simplified)
-                                    self.text_state.text_matrix[4] -= spacing * self.text_state.current_font_size.unwrap_or(12.0) * 0.001;
+                                    // Spacing adjustment in 1/1000ths of a text space unit
+                                    // Negative numbers move text closer together (like kerning)
+                                    // Large negative numbers (< -100) typically indicate word spaces
+
+                                    // Add a space if the adjustment is significant (word boundary)
+                                    if *spacing < -100.0 {
+                                        accumulated_text.push(' ');
+                                    }
+
+                                    // Adjust text position for spacing
+                                    let font_size = self.text_state.current_font_size.unwrap_or(12.0);
+                                    self.text_state.text_matrix[4] -= spacing * font_size * 0.001;
                                 }
                                 _ => {}
                             }
+                        }
+
+                        // Create a single text item for the entire TJ operation
+                        if !accumulated_text.is_empty() {
+                            let text_item = TextItem {
+                                text: accumulated_text,
+                                font_name: self.text_state.current_font.clone(),
+                                font_size: self.text_state.current_font_size,
+                                position: start_position,
+                                rendering_mode: self.text_state.text_rendering_mode,
+                            };
+
+                            self.text_state.extracted_text.push(text_item);
                         }
                     }
                 }

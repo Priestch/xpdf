@@ -187,6 +187,74 @@ impl Page {
 
         Ok(all_text_items)
     }
+
+    /// Extracts all text from the page as a single string.
+    ///
+    /// This is a convenience method that extracts text items and joins them
+    /// into a single string, sorted by position (top to bottom, left to right).
+    ///
+    /// # Returns
+    /// A single string containing all the text from the page
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// let mut doc = PDFDocument::open_file("document.pdf", None, None).unwrap();
+    /// let page = doc.get_page(0).unwrap();
+    ///
+    /// let text = page.extract_text_as_string(&mut doc.xref_mut()).unwrap();
+    /// println!("Page text:\n{}", text);
+    /// ```
+    pub fn extract_text_as_string(&self, xref: &mut super::xref::XRef) -> PDFResult<String> {
+        let mut text_items = self.extract_text(xref)?;
+
+        // Sort text items by position (top to bottom, left to right)
+        // Y-axis in PDF goes bottom to top, so we sort by descending Y, then ascending X
+        text_items.sort_by(|a, b| {
+            match (a.position, b.position) {
+                (Some((x1, y1)), Some((x2, y2))) => {
+                    // First sort by Y (descending - top to bottom)
+                    let y_cmp = y2.partial_cmp(&y1).unwrap_or(std::cmp::Ordering::Equal);
+                    if y_cmp != std::cmp::Ordering::Equal {
+                        y_cmp
+                    } else {
+                        // Then sort by X (ascending - left to right)
+                        x1.partial_cmp(&x2).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+
+        // Group text items into lines based on Y position
+        let mut result = String::new();
+        let mut last_y: Option<f64> = None;
+        let line_threshold = 2.0; // Y-distance threshold to consider same line
+
+        for item in text_items {
+            if let Some((_, y)) = item.position {
+                if let Some(prev_y) = last_y {
+                    // If Y position changed significantly, start a new line
+                    if (y - prev_y).abs() > line_threshold {
+                        result.push('\n');
+                    } else {
+                        // Same line, add a space between items
+                        if !result.is_empty() && !result.ends_with(' ') && !result.ends_with('\n') {
+                            result.push(' ');
+                        }
+                    }
+                }
+                last_y = Some(y);
+            }
+
+            result.push_str(&item.text);
+        }
+
+        Ok(result)
+    }
 }
 
 /// Page tree cache for efficient page lookups.
