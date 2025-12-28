@@ -17,6 +17,11 @@ ureq = { version = "2.12", default-features = false, features = ["tls"] }
 # Compression support for FlateDecode streams
 flate2 = "1.0"
 
+# Performance optimizations (WASM-compatible)
+rustc-hash = "2.0"        # Fast hashing for integer keys (30% faster than std HashMap)
+smallvec = "1.13"         # Inline small arrays to avoid heap allocations
+lru = "0.12"              # LRU cache for bounded memory usage
+
 # Image decoding - follow hayro's specialized approach
 # Use hayro's proven architecture with zune-jpeg for JPEG (DCTDecode)
 zune-jpeg = { version = "0.5", optional = true }  # For JPEG (DCTDecode) - fast and SIMD-optimized
@@ -35,3 +40,29 @@ advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
 
 [dev-dependencies]
 tempfile = "3.14"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "parsing"
+harness = false
+
+# Performance optimization profiles
+[profile.release]
+opt-level = 3              # Maximum optimizations
+lto = "thin"              # Link-time optimization (thin for faster builds)
+codegen-units = 1         # Single codegen unit for better optimization
+strip = true              # Strip symbols for smaller binaries
+panic = "abort"           # Smaller binary, faster panic handling
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"           # Optimize for size (critical for WASM)
+lto = true                # Full LTO for WASM
+panic = "abort"           # WASM doesn't support unwinding
+
+[profile.dev]
+opt-level = 0             # Fast compilation for development
+
+[profile.bench]
+inherits = "release"
+lto = false               # Faster benchmark compilation
