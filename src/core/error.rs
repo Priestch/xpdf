@@ -25,7 +25,12 @@ pub enum PDFError {
     InvalidObject { expected: String, found: String },
 
     /// Parse error with context
-    ParseError { message: String, context: Option<String> },
+    ParseError {
+        message: String,
+        context: Option<String>,
+        /// File position where error occurred (byte offset)
+        position: Option<usize>,
+    },
 
     /// XRef table errors
     XRefError { message: String },
@@ -79,10 +84,11 @@ impl fmt::Display for PDFError {
             PDFError::InvalidObject { expected, found } => {
                 write!(f, "Invalid object: expected {}, found {}", expected, found)
             }
-            PDFError::ParseError { message, context } => {
+            PDFError::ParseError { message, context, position } => {
+                let pos_str = position.map(|p| format!(" at byte {}", p)).unwrap_or_default();
                 match context {
-                    Some(ctx) => write!(f, "Parse error: {} (context: {})", message, ctx),
-                    None => write!(f, "Parse error: {}", message),
+                    Some(ctx) => write!(f, "Parse error{}: {} (context: {})", pos_str, message, ctx),
+                    None => write!(f, "Parse error{}: {}", pos_str, message),
                 }
             }
             PDFError::XRefError { message } => {
@@ -120,11 +126,21 @@ impl fmt::Display for PDFError {
 }
 
 impl PDFError {
-    /// Creates a parse error with context.
+    /// Creates a parse error with context and optional position.
     pub fn parse_error<S: Into<String>>(message: S, context: Option<S>) -> Self {
         PDFError::ParseError {
             message: message.into(),
             context: context.map(|s| s.into()),
+            position: None,
+        }
+    }
+
+    /// Creates a parse error with context and file position.
+    pub fn parse_error_at<S: Into<String>>(message: S, context: Option<S>, position: usize) -> Self {
+        PDFError::ParseError {
+            message: message.into(),
+            context: context.map(|s| s.into()),
+            position: Some(position),
         }
     }
 
@@ -229,9 +245,20 @@ mod tests {
     fn test_error_creation_methods() {
         let err = PDFError::parse_error("test", Some("context"));
         match err {
-            PDFError::ParseError { message, context } => {
+            PDFError::ParseError { message, context, position } => {
                 assert_eq!(message, "test");
                 assert_eq!(context, Some("context".to_string()));
+                assert_eq!(position, None);
+            }
+            _ => panic!("Expected ParseError"),
+        }
+
+        let err = PDFError::parse_error_at("test", Some("context"), 42);
+        match err {
+            PDFError::ParseError { message, context, position } => {
+                assert_eq!(message, "test");
+                assert_eq!(context, Some("context".to_string()));
+                assert_eq!(position, Some(42));
             }
             _ => panic!("Expected ParseError"),
         }

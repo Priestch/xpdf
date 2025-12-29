@@ -103,6 +103,9 @@ pub mod core;
 
 // Re-export main types for convenience
 pub use core::{
-    BaseStream, FileChunkedStream, HttpChunkedStream, LinearizedInfo, Lexer, PDFDocument, PDFError,
+    BaseStream, FileChunkedStream, LinearizedInfo, Lexer, PDFDocument, PDFError,
     PDFObject, Parser, Stream, TextItem, Token, XRef, XRefEntry,
 };
+
+#[cfg(feature = "async")]
+pub use core::{AsyncHttpChunkedStream, HttpChunkedStream, ProgressCallback};
