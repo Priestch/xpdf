@@ -523,7 +523,21 @@ impl XRef {
             };
 
             // Ensure we have enough space in the entries vector
-            let needed_size = (first + count) as usize;
+            // Use checked arithmetic to prevent overflow on corrupt PDFs
+            let needed_size = first.checked_add(count)
+                .ok_or_else(|| PDFError::corrupted_pdf(format!(
+                    "XRef table overflow: first={}, count={}",
+                    first, count
+                )))? as usize;
+
+            // Sanity check: prevent extremely large allocations
+            if needed_size > 10_000_000 {  // 10 million objects is unreasonable
+                return Err(PDFError::corrupted_pdf(format!(
+                    "XRef table size {} exceeds reasonable limit",
+                    needed_size
+                )));
+            }
+
             if self.entries.len() < needed_size {
                 self.entries.resize(needed_size, None);
             }
@@ -753,14 +767,32 @@ impl XRef {
 
                 // Now parse the object at the requested index
                 let obj_offset = first + offsets[index as usize];
+
+                // Validate offset is within bounds
+                if obj_offset >= decompressed_data.len() {
+                    return Err(PDFError::corrupted_pdf(format!(
+                        "ObjStm: object offset {} exceeds stream length {}",
+                        obj_offset, decompressed_data.len()
+                    )));
+                }
+
                 let obj_length = if (index as usize) < offsets.len() - 1 {
                     offsets[index as usize + 1]
                 } else {
                     decompressed_data.len() - obj_offset
                 };
 
+                // Validate the calculated range is within bounds
+                let obj_end = obj_offset + obj_length;
+                if obj_end > decompressed_data.len() {
+                    return Err(PDFError::corrupted_pdf(format!(
+                        "ObjStm: object range {}..{} exceeds stream length {}",
+                        obj_offset, obj_end, decompressed_data.len()
+                    )));
+                }
+
                 // Create a stream for just this object's data
-                let obj_data = decompressed_data[obj_offset..obj_offset + obj_length].to_vec();
+                let obj_data = decompressed_data[obj_offset..obj_end].to_vec();
                 let obj_stream = Stream::from_bytes(obj_data);
                 let obj_lexer = Lexer::new(Box::new(obj_stream) as Box<dyn BaseStream>)?;
                 let mut obj_parser = Parser::new(obj_lexer)?;
@@ -821,12 +853,21 @@ impl XRef {
 
                 // Clone the offset to avoid borrow checker issues
                 let offset_value = *offset;
+                let stream_length = self.stream.length();
+
+                // Validate offset is within stream bounds
+                if offset_value as usize >= stream_length {
+                    return Err(PDFError::corrupted_pdf(format!(
+                        "Object offset {} exceeds stream length {}",
+                        offset_value, stream_length
+                    )));
+                }
 
                 // Create a sub-stream starting at the object's position
                 // No need to manipulate parent stream position - sub-stream is independent
                 let sub_stream = self.stream.make_sub_stream(
                     offset_value as usize,
-                    self.stream.length() - offset_value as usize,
+                    stream_length - offset_value as usize,
                 )?;
 
                 // Parse the indirect object
