@@ -62,8 +62,11 @@ pub struct Lexer {
     /// Current character being examined
     current_char: i32,
 
-    /// Buffer for building strings
+    /// Reusable buffer for building byte strings (for String and HexString tokens)
     str_buf: Vec<u8>,
+
+    /// Reusable buffer for building command/name strings (for String tokens)
+    cmd_buf: String,
 }
 
 impl Lexer {
@@ -75,6 +78,7 @@ impl Lexer {
             stream,
             current_char,
             str_buf: Vec::new(),
+            cmd_buf: String::new(),
         })
     }
 
@@ -107,6 +111,7 @@ impl Lexer {
     /// Checks if a character is whitespace according to PDF spec.
     ///
     /// PDF whitespace: NUL, TAB, LF, FF, CR, SPACE
+    #[inline(always)]  // Hot function - called in tight loops
     fn is_whitespace(ch: i32) -> bool {
         matches!(ch, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
     }
@@ -114,6 +119,7 @@ impl Lexer {
     /// Checks if a character is a delimiter according to PDF spec.
     ///
     /// PDF delimiters: ( ) < > [ ] { } / %
+    #[inline(always)]  // Hot function - called in tight loops
     fn is_delimiter(ch: i32) -> bool {
         matches!(
             ch,
@@ -122,6 +128,7 @@ impl Lexer {
     }
 
     /// Checks if a character is special (whitespace or delimiter).
+    #[inline(always)]  // Hot function - called in tight loops
     fn is_special(ch: i32) -> bool {
         Self::is_whitespace(ch) || Self::is_delimiter(ch)
     }
@@ -216,21 +223,21 @@ impl Lexer {
                 } else {
                     // Single '>' could be part of malformed hex string or other construct
                     // Try to recover by treating it as a command
-                    let mut cmd_str = String::new();
-                    cmd_str.push('>');
+                    self.cmd_buf.clear();
+                    self.cmd_buf.push('>');
                     if next_ch > 0 && !Self::is_special(next_ch) {
-                        cmd_str.push(next_ch as u8 as char);
+                        self.cmd_buf.push(next_ch as u8 as char);
                         // Read additional non-special characters
                         while let Ok(peek_ch) = self.peek_char() {
                             if peek_ch > 0 && !Self::is_special(peek_ch) {
-                                cmd_str.push(peek_ch as u8 as char);
+                                self.cmd_buf.push(peek_ch as u8 as char);
                                 self.next_char()?;
                             } else {
                                 break;
                             }
                         }
                     }
-                    Ok(Token::Command(cmd_str))
+                    Ok(Token::Command(self.cmd_buf.clone()))
                 }
             }
 
@@ -602,35 +609,36 @@ impl Lexer {
     /// Handles special keywords: true, false, null
     /// Based on PDF.js Lexer.getObj() command handling
     fn get_command(&mut self) -> PDFResult<Token> {
-        let mut str_buf = String::new();
+        // Reuse the command buffer instead of allocating a new String
+        self.cmd_buf.clear();
         let mut ch = self.current_char;
 
         // Read characters until we hit a special character
         while ch >= 0 && !Self::is_special(ch) {
-            if str_buf.len() >= 128 {
+            if self.cmd_buf.len() >= 128 {
                 return Err(PDFError::Generic(format!(
                     "Command token too long: {}",
-                    str_buf.len()
+                    self.cmd_buf.len()
                 )));
             }
 
-            str_buf.push(ch as u8 as char);
+            self.cmd_buf.push(ch as u8 as char);
             ch = self.next_char()?;
         }
 
         // Check for boolean keywords
-        if str_buf == "true" {
+        if self.cmd_buf == "true" {
             return Ok(Token::Boolean(true));
         }
-        if str_buf == "false" {
+        if self.cmd_buf == "false" {
             return Ok(Token::Boolean(false));
         }
-        if str_buf == "null" {
+        if self.cmd_buf == "null" {
             return Ok(Token::Null);
         }
 
-        // Otherwise it's a command/operator
-        Ok(Token::Command(str_buf))
+        // Otherwise it's a command/operator - clone the buffer into token
+        Ok(Token::Command(self.cmd_buf.clone()))
     }
 
     /// Skips the end-of-line marker after the 'stream' keyword.
@@ -661,6 +669,7 @@ impl Lexer {
     /// 'stream' and 'endstream' keywords.
     ///
     /// IMPORTANT: This uses current_char if available, then reads from stream.
+    #[inline]  // Called frequently when reading stream data
     pub fn get_stream_byte(&mut self) -> PDFResult<u8> {
         let byte = if self.current_char >= 0 {
             self.current_char as u8
@@ -677,6 +686,7 @@ impl Lexer {
     /// Gets the current stream position, accounting for lookahead.
     ///
     /// The position is where the NEXT byte will be read from (current_char has already been read).
+    #[inline]
     pub fn get_position(&self) -> usize {
         self.stream.pos()
     }

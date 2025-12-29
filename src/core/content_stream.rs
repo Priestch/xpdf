@@ -6,7 +6,9 @@
 //! Based on PDF.js src/core/evaluator.js and src/shared/util.js (OPS constants).
 
 use super::error::{PDFError, PDFResult};
+use super::font::Font;
 use super::parser::{PDFObject, Parser};
+use rustc_hash::FxHashMap;
 use std::fmt;
 
 /// PDF content stream operator codes.
@@ -457,6 +459,9 @@ pub struct ContentStreamEvaluator {
 
     /// Text extraction state
     text_state: TextExtractionState,
+
+    /// Font cache (font name -> Font object)
+    fonts: FxHashMap<String, Font>,
 }
 
 /// State for text extraction from content streams.
@@ -468,8 +473,8 @@ struct TextExtractionState {
     /// Current text line matrix (Tlm)
     text_line_matrix: [f64; 6],
 
-    /// Current font
-    current_font: Option<String>,
+    /// Current font name
+    current_font_name: Option<String>,
 
     /// Current font size
     current_font_size: Option<f64>,
@@ -490,7 +495,7 @@ impl Default for TextExtractionState {
             // Identity matrix
             text_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             text_line_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            current_font: None,
+            current_font_name: None,
             current_font_size: None,
             text_rendering_mode: None,
             in_text_object: false,
@@ -508,7 +513,60 @@ impl ContentStreamEvaluator {
         ContentStreamEvaluator {
             parser,
             text_state: TextExtractionState::default(),
+            fonts: FxHashMap::default(),
         }
+    }
+
+    /// Loads fonts from a page's resources dictionary.
+    ///
+    /// This should be called before processing a page's content stream
+    /// to ensure fonts are available for text extraction.
+    ///
+    /// # Arguments
+    /// * `resources` - The page's /Resources dictionary
+    /// * `xref` - Cross-reference table for fetching font dictionaries
+    pub fn load_fonts(
+        &mut self,
+        resources: &PDFObject,
+        xref: &mut crate::core::xref::XRef,
+    ) -> PDFResult<()> {
+        // Get the Font dictionary from resources
+        let resources_dict = match resources {
+            PDFObject::Dictionary(d) => d,
+            _ => return Ok(()), // No resources, skip
+        };
+
+        let font_dict = match resources_dict.get("Font") {
+            Some(PDFObject::Dictionary(d)) => d.clone(),
+            Some(PDFObject::Ref { num, generation }) => {
+                // Dereference the font dictionary
+                let font_obj = xref.fetch(*num, *generation)?;
+                match &*font_obj {
+                    PDFObject::Dictionary(d) => d.clone(),
+                    _ => return Ok(()), // Not a dictionary
+                }
+            }
+            _ => return Ok(()), // No fonts
+        };
+
+        // Load each font
+        for (font_name, font_ref) in &font_dict {
+            // Fetch the font dictionary
+            let font_dict_obj = xref.fetch_if_ref(font_ref)?;
+
+            // Create Font object
+            match Font::new(font_dict_obj, xref) {
+                Ok(font) => {
+                    self.fonts.insert(font_name.clone(), font);
+                }
+                Err(e) => {
+                    // Log error but continue loading other fonts
+                    eprintln!("Warning: Failed to load font '{}': {:?}", font_name, e);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Extracts all text from the content stream.
@@ -560,9 +618,10 @@ impl ContentStreamEvaluator {
                 self.text_state.in_text_object = false;
             }
             OpCode::SetFont => {
+                // Tf - set font and size
                 if op.args.len() >= 2 {
                     if let PDFObject::Name(font_name) = &op.args[0] {
-                        self.text_state.current_font = Some(font_name.clone());
+                        self.text_state.current_font_name = Some(font_name.clone());
                     }
                     if let PDFObject::Number(font_size) = &op.args[1] {
                         self.text_state.current_font_size = Some(*font_size);
@@ -607,17 +666,18 @@ impl ContentStreamEvaluator {
                 }
             }
             OpCode::ShowText => {
+                // Tj - show text string
                 if op.args.len() >= 1 && self.text_state.in_text_object {
                     if let PDFObject::String(text_bytes) = &op.args[0] {
-                        let text = String::from_utf8_lossy(text_bytes);
+                        let text = self.decode_text(text_bytes);
                         let position = Some((
                             self.text_state.text_matrix[4],
                             self.text_state.text_matrix[5],
                         ));
 
                         let text_item = TextItem {
-                            text: text.to_string(),
-                            font_name: self.text_state.current_font.clone(),
+                            text,
+                            font_name: self.text_state.current_font_name.clone(),
                             font_size: self.text_state.current_font_size,
                             position,
                             rendering_mode: self.text_state.text_rendering_mode,
@@ -628,11 +688,10 @@ impl ContentStreamEvaluator {
                 }
             }
             OpCode::ShowSpacedText => {
+                // TJ - array with text and spacing adjustments
+                // This operator shows multiple text strings with individual glyph positioning
+                // Format: [(string1) -100 (string2) 50 (string3)] where numbers are spacing adjustments
                 if op.args.len() >= 1 && self.text_state.in_text_object {
-                    // TJ - array with text and spacing adjustments
-                    // This operator shows multiple text strings with individual glyph positioning
-                    // Format: [(string1) -100 (string2) 50 (string3)] where numbers are spacing adjustments
-
                     if let PDFObject::Array(items) = &op.args[0] {
                         let mut accumulated_text = String::new();
                         let start_position = Some((
@@ -641,9 +700,10 @@ impl ContentStreamEvaluator {
                         ));
 
                         for item in items {
-                            match item {
+                            match &**item {
                                 PDFObject::String(text_bytes) => {
-                                    let text = String::from_utf8_lossy(text_bytes);
+                                    // Decode text using font encoding (CMap)
+                                    let text = self.decode_text(text_bytes);
                                     accumulated_text.push_str(&text);
                                 }
                                 PDFObject::Number(spacing) => {
@@ -668,7 +728,7 @@ impl ContentStreamEvaluator {
                         if !accumulated_text.is_empty() {
                             let text_item = TextItem {
                                 text: accumulated_text,
-                                font_name: self.text_state.current_font.clone(),
+                                font_name: self.text_state.current_font_name.clone(),
                                 font_size: self.text_state.current_font_size,
                                 position: start_position,
                                 rendering_mode: self.text_state.text_rendering_mode,
@@ -684,6 +744,38 @@ impl ContentStreamEvaluator {
             }
         }
         Ok(())
+    }
+
+    /// Decodes text bytes using the current font's encoding (CMap).
+    ///
+    /// This method converts character codes (CIDs) to Unicode characters using
+    /// the font's ToUnicode CMap if available. Falls back to UTF-8/Latin-1 if no font is loaded.
+    ///
+    /// # Arguments
+    /// * `text_bytes` - Raw text bytes from the PDF content stream
+    ///
+    /// # Returns
+    /// Decoded Unicode string
+    #[inline]  // Hot path during text extraction
+    fn decode_text(&self, text_bytes: &[u8]) -> String {
+        // Try to use the current font's CMap
+        if let Some(ref font_name) = self.text_state.current_font_name {
+            if let Some(font) = self.fonts.get(font_name) {
+                // Decode using font's ToUnicode CMap
+                let mut decoded = String::new();
+
+                for &byte in text_bytes {
+                    let cid = byte as u16;
+                    let unicode_char = font.to_unicode(cid);
+                    decoded.push(unicode_char);
+                }
+
+                return decoded;
+            }
+        }
+
+        // Fallback: try UTF-8, then Latin-1
+        String::from_utf8_lossy(text_bytes).into_owned()
     }
 
     /// Reads the next operation from the content stream.
@@ -911,12 +1003,14 @@ mod tests {
 
         let text_items = eval.extract_text().unwrap();
 
-        // Should extract individual text strings from TJ array
-        assert_eq!(text_items.len(), 4);
-        assert_eq!(text_items[0].text, "He");
-        assert_eq!(text_items[1].text, "llo");
-        assert_eq!(text_items[2].text, " Wo");
-        assert_eq!(text_items[3].text, "rld");
+        // TJ operator now accumulates all text into a single item
+        // Only spacing < -100 adds a space (word boundary detection)
+        // -50 and -50 don't trigger space, 100 is positive so no space
+        // Note: " Wo" already has a leading space in the PDF
+        assert_eq!(text_items.len(), 1);
+        assert_eq!(text_items[0].text, "Hello World");  // Space from " Wo" string
+        assert_eq!(text_items[0].font_name, Some("F1".to_string()));
+        assert_eq!(text_items[0].font_size, Some(12.0));
     }
 
     #[test]

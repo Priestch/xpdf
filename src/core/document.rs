@@ -429,7 +429,7 @@ impl PDFDocument {
 
             // Add kids to stack in reverse order (to maintain order during DFS)
             for kid in kids_array.iter().rev() {
-                nodes_to_visit.push((kid.clone(), None));
+                nodes_to_visit.push(((**kid).clone(), None));
             }
         }
 
@@ -648,7 +648,7 @@ impl PDFDocument {
         let primary_hint_offset = dict.get("H")
             .and_then(|obj| match obj {
                 PDFObject::Array(arr) if arr.len() >= 2 => {
-                    match &arr[0] {
+                    match &*arr[0] {
                         PDFObject::Number(n) => Some(*n as u64),
                         _ => None,
                     }
@@ -660,7 +660,7 @@ impl PDFDocument {
         let primary_hint_length = dict.get("H")
             .and_then(|obj| match obj {
                 PDFObject::Array(arr) if arr.len() >= 2 => {
-                    match &arr[1] {
+                    match &*arr[1] {
                         PDFObject::Number(n) => Some(*n as u64),
                         _ => None,
                     }
@@ -1146,10 +1146,10 @@ startxref
         match media_box {
             PDFObject::Array(arr) => {
                 assert_eq!(arr.len(), 4);
-                assert_eq!(arr[0], PDFObject::Number(0.0));
-                assert_eq!(arr[1], PDFObject::Number(0.0));
-                assert_eq!(arr[2], PDFObject::Number(612.0));
-                assert_eq!(arr[3], PDFObject::Number(792.0));
+                assert_eq!(*arr[0], PDFObject::Number(0.0));
+                assert_eq!(*arr[1], PDFObject::Number(0.0));
+                assert_eq!(*arr[2], PDFObject::Number(612.0));
+                assert_eq!(*arr[3], PDFObject::Number(792.0));
             }
             _ => panic!("Expected MediaBox to be an array"),
         }
@@ -1226,8 +1226,8 @@ startxref
         let media_box = doc.get_media_box(&page).unwrap();
         match media_box {
             PDFObject::Array(arr) => {
-                assert_eq!(arr[2], PDFObject::Number(300.0));
-                assert_eq!(arr[3], PDFObject::Number(400.0));
+                assert_eq!(*arr[2], PDFObject::Number(300.0));
+                assert_eq!(*arr[3], PDFObject::Number(400.0));
             }
             _ => panic!("Expected MediaBox to be an array"),
         }
@@ -1274,8 +1274,8 @@ startxref
             let media_box = doc.get_media_box(&page).unwrap();
             match media_box {
                 PDFObject::Array(arr) => {
-                    assert_eq!(arr[2], PDFObject::Number(612.0));
-                    assert_eq!(arr[3], PDFObject::Number(792.0));
+                    assert_eq!(*arr[2], PDFObject::Number(612.0));
+                    assert_eq!(*arr[3], PDFObject::Number(792.0));
                 }
                 _ => panic!("Expected MediaBox to be an array"),
             }

@@ -1,6 +1,6 @@
 use super::error::{PDFResult, PDFError};
 use super::parser::PDFObject;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// A single page in a PDF document.
 ///
@@ -180,6 +180,12 @@ impl Page {
             let parser = super::Parser::new(lexer)?;
             let mut evaluator = ContentStreamEvaluator::new(parser);
 
+            // Load fonts from page resources (for proper character encoding)
+            if let Some(resources) = self.resources() {
+                // Ignore font loading errors - text extraction will still work with fallback encoding
+                let _ = evaluator.load_fonts(resources, xref);
+            }
+
             // Extract text from this stream
             let text_items = evaluator.extract_text()?;
             all_text_items.extend(text_items);
@@ -268,14 +274,14 @@ impl Page {
 #[derive(Debug)]
 pub struct PageTreeCache {
     /// Cache of page dictionaries by page index
-    pages: HashMap<usize, Page>,
+    pages: FxHashMap<usize, Page>,
 }
 
 impl PageTreeCache {
     /// Creates a new empty page tree cache.
     pub fn new() -> Self {
         PageTreeCache {
-            pages: HashMap::new(),
+            pages: FxHashMap::default(),
         }
     }
 

@@ -22,6 +22,9 @@ rustc-hash = "2.0"        # Fast hashing for integer keys (30% faster than std H
 smallvec = "1.13"         # Inline small arrays to avoid heap allocations
 lru = "0.12"              # LRU cache for bounded memory usage
 
+# Font parsing (from hayro project)
+hayro-font = { path = "./hayro/hayro-font" }  # CFF and Type1 font parser for text extraction
+
 # Image decoding - follow hayro's specialized approach
 # Use hayro's proven architecture with zune-jpeg for JPEG (DCTDecode)
 zune-jpeg = { version = "0.5", optional = true }  # For JPEG (DCTDecode) - fast and SIMD-optimized

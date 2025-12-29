@@ -239,16 +239,20 @@ impl ImageDecoder {
             // For arrays (CalRGB, CalGray, etc.) and other complex color spaces,
             // we need more sophisticated parsing. For now, default to RGB.
             PDFObject::Array(arr) => {
-                if let Some(PDFObject::Name(name)) = arr.get(0) {
-                    match name.as_str() {
-                        "CalGray" | "Separation" => ImageColorSpace::Gray,
-                        "CalRGB" | "Lab" => ImageColorSpace::RGB,
-                        "ICCBased" => {
-                            // ICCBased needs to look at the stream's /N parameter
-                            // For now, default to RGB
-                            ImageColorSpace::RGB
+                if let Some(box_obj) = arr.get(0) {
+                    if let PDFObject::Name(name) = &**box_obj {
+                        match name.as_str() {
+                            "CalGray" | "Separation" => ImageColorSpace::Gray,
+                            "CalRGB" | "Lab" => ImageColorSpace::RGB,
+                            "ICCBased" => {
+                                // ICCBased needs to look at the stream's /N parameter
+                                // For now, default to RGB
+                                ImageColorSpace::RGB
+                            }
+                            _ => ImageColorSpace::RGB,
                         }
-                        _ => ImageColorSpace::RGB,
+                    } else {
+                        ImageColorSpace::RGB
                     }
                 } else {
                     ImageColorSpace::RGB

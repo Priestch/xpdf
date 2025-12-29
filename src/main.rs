@@ -469,7 +469,7 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
                 // Handle multiple filters - check if any indicate the image format
                 let mut detected_format = ImageFormat::Unknown;
                 for filter_obj in filters {
-                    if let PDFObject::Name(filter_name) = filter_obj {
+                    if let PDFObject::Name(filter_name) = &**filter_obj {
                         match filter_name.as_str() {
                             "DCTDecode" => {
                                 detected_format = ImageFormat::JPEG;
@@ -561,7 +561,7 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
             PDFObject::Name(name) => name.clone(),
             PDFObject::Array(filters) => {
                 let names: Vec<String> = filters.iter()
-                    .filter_map(|f| if let PDFObject::Name(n) = f { Some(n.clone()) } else { None })
+                    .filter_map(|f| if let PDFObject::Name(n) = &**f { Some(n.clone()) } else { None })
                     .collect();
                 names.join(", ")
             }

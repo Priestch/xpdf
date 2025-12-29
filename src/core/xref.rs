@@ -4,7 +4,9 @@ use super::error::{PDFError, PDFResult};
 use super::lexer::Lexer;
 use super::parser::{PDFObject, Parser};
 use super::stream::Stream;
-use std::collections::HashMap;
+use lru::LruCache;
+use std::collections::HashMap;  // Still needed for String keys in dictionaries
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 
 /// Cross-reference table entry.
@@ -54,7 +56,9 @@ pub struct XRef {
 
     /// Cache of parsed objects (object number -> PDFObject)
     /// Uses Rc to avoid expensive cloning of large objects
-    cache: HashMap<u32, Rc<PDFObject>>,
+    /// Uses LRU cache with FxHashMap for bounded memory and fast access
+    /// Default capacity: 1000 objects (~10MB for typical PDFs)
+    cache: LruCache<u32, Rc<PDFObject>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
 
     /// The trailer dictionary
     trailer: Option<PDFObject>,
@@ -66,9 +70,17 @@ pub struct XRef {
 impl XRef {
     /// Creates a new XRef table.
     pub fn new(stream: Box<dyn BaseStream>) -> Self {
+        // Default cache capacity: 1000 objects
+        // This is enough for most PDFs while keeping memory bounded
+        let capacity = NonZeroUsize::new(1000).unwrap();
+        let cache = LruCache::with_hasher(
+            capacity,
+            std::hash::BuildHasherDefault::<rustc_hash::FxHasher>::default(),
+        );
+
         XRef {
             entries: Vec::new(),
-            cache: HashMap::new(),
+            cache,
             trailer: None,
             stream,
         }
@@ -274,15 +286,15 @@ impl XRef {
                         arr.len()
                     )));
                 }
-                let w1 = match &arr[0] {
+                let w1 = match &*arr[0] {
                     PDFObject::Number(n) => *n as usize,
                     _ => return Err(PDFError::Generic("/W[0] must be a number".to_string())),
                 };
-                let w2 = match &arr[1] {
+                let w2 = match &*arr[1] {
                     PDFObject::Number(n) => *n as usize,
                     _ => return Err(PDFError::Generic("/W[1] must be a number".to_string())),
                 };
-                let w3 = match &arr[2] {
+                let w3 = match &*arr[2] {
                     PDFObject::Number(n) => *n as usize,
                     _ => return Err(PDFError::Generic("/W[2] must be a number".to_string())),
                 };
@@ -303,7 +315,10 @@ impl XRef {
                 .get("Size")
                 .ok_or_else(|| PDFError::Generic("XRef stream missing /Size".to_string()))?;
             match size {
-                PDFObject::Number(n) => vec![PDFObject::Number(0.0), PDFObject::Number(*n)],
+                PDFObject::Number(n) => {
+                    use smallvec::smallvec;
+                    smallvec![Box::new(PDFObject::Number(0.0)), Box::new(PDFObject::Number(*n))]
+                }
                 _ => return Err(PDFError::Generic("/Size must be a number".to_string())),
             }
         };
@@ -376,7 +391,7 @@ impl XRef {
         // Process each range in the Index array
         let mut i = 0;
         while i < index_array.len() {
-            let first = match &index_array[i] {
+            let first = match &*index_array[i] {
                 PDFObject::Number(n) => *n as u32,
                 _ => {
                     return Err(PDFError::Generic(
@@ -385,7 +400,7 @@ impl XRef {
                 }
             };
 
-            let count = match &index_array[i + 1] {
+            let count = match &*index_array[i + 1] {
                 PDFObject::Number(n) => *n as usize,
                 _ => {
                     return Err(PDFError::Generic(
@@ -755,7 +770,7 @@ impl XRef {
 
                 // Cache it with the actual object number
                 let actual_obj_num = obj_nums[index as usize];
-                self.cache.insert(actual_obj_num, Rc::clone(&object));
+                self.cache.put(actual_obj_num, Rc::clone(&object));
 
                 Ok(object)
             }
@@ -898,7 +913,7 @@ impl XRef {
                 let object_rc = Rc::new(object);
 
                 // Cache the Rc - cheap clone
-                self.cache.insert(obj_num, Rc::clone(&object_rc));
+                self.cache.put(obj_num, Rc::clone(&object_rc));
 
                 Ok(object_rc)
             }

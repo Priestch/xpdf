@@ -1,10 +1,12 @@
 pub mod base_stream;
 pub mod chunk_manager;
+pub mod cmap;
 pub mod content_stream;
 pub mod decode;
 pub mod document;
 pub mod error;
 pub mod file_chunked_stream;
+pub mod font;
 pub mod http_chunked_stream;
 pub mod image;
 pub mod lexer;
@@ -17,10 +19,12 @@ pub mod xref;
 
 pub use base_stream::BaseStream;
 pub use chunk_manager::{ChunkLoader, ChunkManager};
+pub use cmap::CMap;
 pub use content_stream::{ContentStreamEvaluator, OpCode, Operation, TextItem};
 pub use document::{LinearizedInfo, PDFDocument};
 pub use error::PDFError;
 pub use file_chunked_stream::FileChunkedStream;
+pub use font::{Font, FontDict, FontType};
 pub use http_chunked_stream::HttpChunkedStream;
 pub use image::{DecodedImage, ImageColorSpace, ImageDecoder, ImageExtraction, ImageFormat, ImageMetadata};
 pub use lexer::{Lexer, Token};
