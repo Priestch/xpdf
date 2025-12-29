@@ -176,7 +176,7 @@ impl PDFDocument {
     /// Helper method to find startxref with a known offset adjustment.
     ///
     /// This is used by `open_file()` when we've read a slice from the end of the file.
-    fn find_startxref_in_bytes(data: &[u8], base_offset: usize) -> PDFResult<usize> {
+    fn find_startxref_in_bytes(data: &[u8], _base_offset: usize) -> PDFResult<usize> {
         // Find "startxref"
         let keyword = b"startxref";
         let pos = data

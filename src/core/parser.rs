@@ -400,7 +400,7 @@ impl Parser {
 
         // Now we're positioned right after the newline following "stream"
         // This is where the stream data starts
-        let stream_start_pos = self.lexer.get_position();
+        let _stream_start_pos = self.lexer.get_position();
 
         // Get the Length from the dictionary
         let length = dict

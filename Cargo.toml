@@ -11,8 +11,11 @@ name = "pdf-inspect"
 path = "src/main.rs"
 
 [dependencies]
-# HTTP client for range requests
-ureq = { version = "2.12", default-features = false, features = ["tls"] }
+# Async HTTP client for range requests
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
+
+# Async runtime (for async network loading)
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros"], optional = true }
 
 # Compression support for FlateDecode streams
 flate2 = "1.0"
@@ -40,6 +43,7 @@ default = ["jpeg-decoding"]
 jpeg-decoding = ["zune-jpeg"]
 png-decoding = ["image"]
 advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
+async = ["reqwest", "tokio"]  # Enable async network loading
 
 [dev-dependencies]
 tempfile = "3.14"
