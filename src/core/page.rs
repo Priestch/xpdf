@@ -312,41 +312,167 @@ impl Default for PageTreeCache {
     }
 }
 
-impl crate::core::image::ImageExtraction for Page {
+impl Page {
     /// Extract image metadata from the page without full decoding.
-    fn get_image_metadata(&self) -> PDFResult<Vec<crate::core::image::ImageMetadata>> {
+    ///
+    /// This method scans the page's Resources/XObject dictionary and extracts
+    /// metadata for all images (XObjects with Subtype /Image).
+    ///
+    /// # Arguments
+    /// * `xref` - Mutable reference to the XRef table for resolving object references
+    ///
+    /// # Returns
+    /// Vector of ImageMetadata structures containing image information
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    /// let page = doc.get_page(0).unwrap();
+    /// let images = page.get_image_metadata(&mut doc.xref_mut()).unwrap();
+    ///
+    /// for image in images {
+    ///     println!("Image: {} ({}x{}, {})",
+    ///              image.name, image.width, image.height, image.format);
+    /// }
+    /// ```
+    pub fn get_image_metadata(&self, xref: &mut super::xref::XRef) -> PDFResult<Vec<super::image::ImageMetadata>> {
+        use super::image::{ImageMetadata, ImageFormat, ImageDecoder};
+
         let mut images = Vec::new();
 
         // Get the Resources dictionary from the page
-        if let Some(resources) = self.resources() {
-            // Look for XObject dictionary
-            if let PDFObject::Dictionary(xobject_dict) = resources {
-                // Check if there's an XObject entry
-                if let Some(xobject_entry) = xobject_dict.get("XObject") {
-                    // Follow reference if needed
-                    let xobject_dict = match xobject_entry {
-                        PDFObject::Ref { .. } => {
-                            // For now, we can't resolve references without document context
-                            return Err(PDFError::Generic(
-                                "Resolving XObject references requires document context".to_string()
-                            ));
-                        }
-                        PDFObject::Dictionary(dict) => dict,
-                        _ => return Ok(images), // No XObject dictionary found
-                    };
+        let resources = match self.resources() {
+            Some(res) => self.fetch_if_ref(res, xref)?,
+            None => return Ok(images), // No resources
+        };
 
-                    for (name_key, _xobject_ref) in xobject_dict {
-                        // name_key is a String key, not a PDFObject
-                        println!("  🖼️  Found XObject: {} (reference resolution needs document context)", name_key);
+        let resources_dict = match resources {
+            PDFObject::Dictionary(dict) => dict,
+            _ => return Ok(images), // Resources is not a dictionary
+        };
 
-                        // Create placeholder metadata - in real implementation would resolve the reference
-                        let metadata = crate::core::image::ImageMetadata::new(
-                            name_key.clone(),
-                            crate::core::image::ImageFormat::Unknown
-                        );
-                        images.push(metadata);
-                    }
+        // Get XObject dictionary from Resources
+        let xobject_entry = match resources_dict.get("XObject") {
+            Some(entry) => entry,
+            None => return Ok(images), // No XObjects
+        };
+
+        let xobject_dict = match self.fetch_if_ref(xobject_entry, xref)? {
+            PDFObject::Dictionary(dict) => dict,
+            _ => return Ok(images), // XObject is not a dictionary
+        };
+
+        // Iterate through all XObjects
+        for (name, xobject_ref) in &xobject_dict {
+            // Resolve the XObject reference
+            let xobject = self.fetch_if_ref(xobject_ref, xref)?;
+
+            // Check if it's an image (Subtype == /Image)
+            if let PDFObject::Stream { dict, data } = xobject {
+                // Check Subtype
+                let is_image = dict.get("Subtype")
+                    .and_then(|subtype| match subtype {
+                        PDFObject::Name(n) => Some(n == "Image"),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+
+                if !is_image {
+                    continue; // Not an image XObject (could be Form)
                 }
+
+                // Extract metadata
+                let width = dict.get("Width")
+                    .or_else(|| dict.get("W"))
+                    .and_then(|w| match w {
+                        PDFObject::Number(n) => Some(*n as u32),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+
+                let height = dict.get("Height")
+                    .or_else(|| dict.get("H"))
+                    .and_then(|h| match h {
+                        PDFObject::Number(n) => Some(*n as u32),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+
+                let bits_per_component = dict.get("BitsPerComponent")
+                    .or_else(|| dict.get("BPC"))
+                    .and_then(|bpc| match bpc {
+                        PDFObject::Number(n) => Some(*n as u8),
+                        _ => None,
+                    })
+                    .unwrap_or(8);
+
+                // Get color space
+                let color_space = dict.get("ColorSpace")
+                    .or_else(|| dict.get("CS"))
+                    .map(|cs| match cs {
+                        PDFObject::Name(name) => name.clone(),
+                        PDFObject::Array(arr) => {
+                            arr.get(0)
+                                .and_then(|obj| match &**obj {
+                                    PDFObject::Name(n) => Some(n.clone()),
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| "Unknown".to_string())
+                        }
+                        _ => "Unknown".to_string(),
+                    })
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                // Detect image format from filter
+                let format = dict.get("Filter")
+                    .or_else(|| dict.get("F"))
+                    .map(|filter| match filter {
+                        PDFObject::Name(name) => match name.as_str() {
+                            "DCTDecode" => ImageFormat::JPEG,
+                            "JPXDecode" => ImageFormat::JPEG2000,
+                            "JBIG2Decode" => ImageFormat::JBIG2,
+                            "FlateDecode" => ImageFormat::Raw,
+                            _ => ImageFormat::Unknown,
+                        },
+                        PDFObject::Array(arr) => {
+                            // Multiple filters - check the first one
+                            arr.get(0)
+                                .and_then(|obj| match &**obj {
+                                    PDFObject::Name(n) => match n.as_str() {
+                                        "DCTDecode" => Some(ImageFormat::JPEG),
+                                        "JPXDecode" => Some(ImageFormat::JPEG2000),
+                                        "JBIG2Decode" => Some(ImageFormat::JBIG2),
+                                        "FlateDecode" => Some(ImageFormat::Raw),
+                                        _ => Some(ImageFormat::Unknown),
+                                    },
+                                    _ => None,
+                                })
+                                .unwrap_or(ImageFormat::Unknown)
+                        }
+                        _ => ImageFormat::Unknown,
+                    })
+                    .unwrap_or_else(|| {
+                        // No filter - try to detect from data
+                        ImageDecoder::detect_format(&data)
+                    });
+
+                // Check for SMask (soft mask / alpha channel)
+                let has_alpha = dict.get("SMask").is_some();
+
+                let metadata = ImageMetadata {
+                    name: name.clone(),
+                    format,
+                    width,
+                    height,
+                    bits_per_component,
+                    color_space,
+                    has_alpha,
+                    data_length: Some(data.len()),
+                };
+
+                images.push(metadata);
             }
         }
 
@@ -354,11 +480,205 @@ impl crate::core::image::ImageExtraction for Page {
     }
 
     /// Extract complete images with full decoding.
-    fn extract_images(&self) -> PDFResult<Vec<crate::core::image::DecodedImage>> {
-        // For now, return empty list since we need xref access to resolve references
-        // In a full implementation, this would require document context
-        println!("  ⚠️  Full image extraction requires document context to resolve XObject references");
-        Ok(Vec::new())
+    ///
+    /// This method extracts and decodes all images from the page, returning
+    /// complete pixel data ready for use.
+    ///
+    /// # Arguments
+    /// * `xref` - Mutable reference to the XRef table for resolving object references
+    ///
+    /// # Returns
+    /// Vector of DecodedImage structures containing pixel data
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    /// let page = doc.get_page(0).unwrap();
+    /// let images = page.extract_images(&mut doc.xref_mut()).unwrap();
+    ///
+    /// for (i, image) in images.iter().enumerate() {
+    ///     println!("Image {}: {}x{} pixels, {} bytes",
+    ///              i, image.width, image.height, image.data.len());
+    ///     // Save or process image.data...
+    /// }
+    /// ```
+    pub fn extract_images(&self, xref: &mut super::xref::XRef) -> PDFResult<Vec<super::image::DecodedImage>> {
+        use super::image::{ImageDecoder, ImageColorSpace};
+        use super::decode;
+
+        let mut decoded_images = Vec::new();
+
+        // Get the Resources dictionary from the page
+        let resources = match self.resources() {
+            Some(res) => self.fetch_if_ref(res, xref)?,
+            None => return Ok(decoded_images), // No resources
+        };
+
+        let resources_dict = match resources {
+            PDFObject::Dictionary(dict) => dict,
+            _ => return Ok(decoded_images), // Resources is not a dictionary
+        };
+
+        // Get XObject dictionary from Resources
+        let xobject_entry = match resources_dict.get("XObject") {
+            Some(entry) => entry,
+            None => return Ok(decoded_images), // No XObjects
+        };
+
+        let xobject_dict = match self.fetch_if_ref(xobject_entry, xref)? {
+            PDFObject::Dictionary(dict) => dict,
+            _ => return Ok(decoded_images), // XObject is not a dictionary
+        };
+
+        // Iterate through all XObjects
+        for (name, xobject_ref) in &xobject_dict {
+            // Resolve the XObject reference
+            let xobject = self.fetch_if_ref(xobject_ref, xref)?;
+
+            // Check if it's an image (Subtype == /Image)
+            if let PDFObject::Stream { dict, data } = xobject {
+                // Check Subtype
+                let is_image = dict.get("Subtype")
+                    .and_then(|subtype| match subtype {
+                        PDFObject::Name(n) => Some(n == "Image"),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+
+                if !is_image {
+                    continue; // Not an image XObject
+                }
+
+                // Get filter to determine decoding strategy
+                let filter = dict.get("Filter").or_else(|| dict.get("F"));
+
+                // Decode the image stream based on filter
+                match filter {
+                    Some(PDFObject::Name(filter_name)) => {
+                        match filter_name.as_str() {
+                            "DCTDecode" => {
+                                // JPEG - decode directly
+                                match ImageDecoder::decode_image(&data, super::image::ImageFormat::JPEG) {
+                                    Ok(img) => decoded_images.push(img),
+                                    Err(e) => {
+                                        eprintln!("Warning: Failed to decode JPEG image '{}': {}", name, e);
+                                    }
+                                }
+                            }
+                            "JPXDecode" => {
+                                // JPEG2000 - decode directly
+                                match ImageDecoder::decode_image(&data, super::image::ImageFormat::JPEG2000) {
+                                    Ok(img) => decoded_images.push(img),
+                                    Err(e) => {
+                                        eprintln!("Warning: Failed to decode JPEG2000 image '{}': {}", name, e);
+                                    }
+                                }
+                            }
+                            "JBIG2Decode" => {
+                                // JBIG2 - decode directly
+                                match ImageDecoder::decode_image(&data, super::image::ImageFormat::JBIG2) {
+                                    Ok(img) => decoded_images.push(img),
+                                    Err(e) => {
+                                        eprintln!("Warning: Failed to decode JBIG2 image '{}': {}", name, e);
+                                    }
+                                }
+                            }
+                            "FlateDecode" => {
+                                // Decompress first, then decode as raw image
+                                match decode::decode_flate(&data) {
+                                    Ok(decompressed) => {
+                                        // Get image parameters for raw decoding
+                                        let width = dict.get("Width").or_else(|| dict.get("W"))
+                                            .and_then(|w| match w {
+                                                PDFObject::Number(n) => Some(*n as u32),
+                                                _ => None,
+                                            })
+                                            .unwrap_or(0);
+
+                                        let height = dict.get("Height").or_else(|| dict.get("H"))
+                                            .and_then(|h| match h {
+                                                PDFObject::Number(n) => Some(*n as u32),
+                                                _ => None,
+                                            })
+                                            .unwrap_or(0);
+
+                                        let bpc = dict.get("BitsPerComponent").or_else(|| dict.get("BPC"))
+                                            .and_then(|bpc| match bpc {
+                                                PDFObject::Number(n) => Some(*n as u8),
+                                                _ => None,
+                                            })
+                                            .unwrap_or(8);
+
+                                        let color_space = dict.get("ColorSpace").or_else(|| dict.get("CS"))
+                                            .map(|cs| ImageDecoder::parse_color_space(cs))
+                                            .unwrap_or(ImageColorSpace::RGB);
+
+                                        // Decode as raw image
+                                        match ImageDecoder::decode_raw_image(&decompressed, width, height, bpc, color_space) {
+                                            Ok(img) => decoded_images.push(img),
+                                            Err(e) => {
+                                                eprintln!("Warning: Failed to decode raw image '{}': {}", name, e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Warning: Failed to decompress FlateDecode image '{}': {}", name, e);
+                                    }
+                                }
+                            }
+                            other => {
+                                eprintln!("Warning: Unsupported image filter '{}' for image '{}'", other, name);
+                            }
+                        }
+                    }
+                    Some(PDFObject::Array(_arr)) => {
+                        eprintln!("Warning: Multiple filters not yet supported for image '{}'", name);
+                    }
+                    None => {
+                        // No filter - raw uncompressed image data
+                        let width = dict.get("Width").or_else(|| dict.get("W"))
+                            .and_then(|w| match w {
+                                PDFObject::Number(n) => Some(*n as u32),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+
+                        let height = dict.get("Height").or_else(|| dict.get("H"))
+                            .and_then(|h| match h {
+                                PDFObject::Number(n) => Some(*n as u32),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+
+                        let bpc = dict.get("BitsPerComponent").or_else(|| dict.get("BPC"))
+                            .and_then(|bpc| match bpc {
+                                PDFObject::Number(n) => Some(*n as u8),
+                                _ => None,
+                            })
+                            .unwrap_or(8);
+
+                        let color_space = dict.get("ColorSpace").or_else(|| dict.get("CS"))
+                            .map(|cs| ImageDecoder::parse_color_space(cs))
+                            .unwrap_or(ImageColorSpace::RGB);
+
+                        // Decode as raw image
+                        match ImageDecoder::decode_raw_image(&data, width, height, bpc, color_space) {
+                            Ok(img) => decoded_images.push(img),
+                            Err(e) => {
+                                eprintln!("Warning: Failed to decode raw image '{}': {}", name, e);
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        eprintln!("Warning: Unexpected filter type for image '{}'", name);
+                    }
+                }
+            }
+        }
+
+        Ok(decoded_images)
     }
 }
 
