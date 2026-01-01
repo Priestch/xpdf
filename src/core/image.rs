@@ -395,7 +395,12 @@ impl ImageDecoder {
         let (width, height) = decoder.dimensions();
         let color_type = decoder.color_type();
 
-        let image_data = decoder.decode()
+        // Calculate total bytes needed
+        let total_bytes = decoder.total_bytes() as usize;
+        let mut image_data = vec![0u8; total_bytes];
+
+        // Read image data into buffer
+        decoder.read_image(&mut image_data)
             .map_err(|e| PDFError::Generic(format!("PNG decode error: {:?}", e)))?;
 
         let channels = color_type.channel_count() as u8;
@@ -411,7 +416,7 @@ impl ImageDecoder {
             data_length: Some(data.len()),
         };
 
-        Ok(DecodedImage::new(metadata, image_data.to_vec(), channels))
+        Ok(DecodedImage::new(metadata, image_data, channels))
     }
 
     /// Decode PNG image when JPEG decoding is not enabled
