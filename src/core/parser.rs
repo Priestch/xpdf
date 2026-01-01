@@ -1,6 +1,6 @@
 use super::error::{PDFError, PDFResult};
 use super::lexer::{Lexer, Token};
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 
 /// PDF object types as defined in the PDF specification.
