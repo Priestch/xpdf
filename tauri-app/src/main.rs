@@ -6,6 +6,7 @@ mod types;
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(state::AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::open_pdf_file,

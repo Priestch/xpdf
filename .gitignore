@@ -22,3 +22,16 @@ Cargo.lock
 #.idea/
 
 .claude
+
+# Node / UI
+node_modules/
+dist/
+*.log
+npm-debug.log*
+
+# Tauri
+tauri-app/target/
+tauri-app/gen/
+
+# OS
+.DS_Store
