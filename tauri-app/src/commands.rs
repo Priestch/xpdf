@@ -35,12 +35,9 @@ pub async fn open_pdf_file(
         (None, None, None, None, None, None)
     };
 
-    // Store document in state
+    // Store file path in state
     {
-        let mut doc_guard = state.document.lock().map_err(|e| e.to_string())?;
-        *doc_guard = Some(doc);
-
-        let mut path_guard = state.file_path.lock().map_err(|e| e.to_string())?;
+        let mut path_guard = state.inner().file_path.lock().unwrap();
         *path_guard = Some(path);
     }
 
@@ -63,12 +60,8 @@ pub async fn open_pdf_file(
 /// Close the current document
 #[tauri::command]
 pub fn close_document(state: State<'_, AppState>) -> Result<(), String> {
-    let mut doc_guard = state.document.lock().map_err(|e| e.to_string())?;
-    *doc_guard = None;
-
-    let mut path_guard = state.file_path.lock().map_err(|e| e.to_string())?;
+    let mut path_guard = state.inner().file_path.lock().unwrap();
     *path_guard = None;
-
     Ok(())
 }
 
@@ -77,11 +70,20 @@ pub fn close_document(state: State<'_, AppState>) -> Result<(), String> {
 pub async fn get_document_outline(
     state: State<'_, AppState>,
 ) -> Result<Vec<OutlineItem>, String> {
-    let doc_guard = state.document.lock().map_err(|e| e.to_string())?;
-    let doc = doc_guard.as_ref().ok_or("No document loaded")?;
+    // Get file path from state
+    let file_path = {
+        let path_guard = state.inner().file_path.lock().unwrap();
+        path_guard.as_ref().cloned()
+    };
+
+    let file_path = file_path.ok_or("No document loaded")?;
+
+    // Reload document
+    let mut doc = pdf_x_core::PDFDocument::open_file(&file_path, None, None)
+        .map_err(|e| e.to_string())?;
 
     match doc.document_outline().map_err(|e| e.to_string())? {
-        Some(outline) => {
+        Some(_outline) => {
             // For MVP, return empty list - will implement recursively later
             Ok(vec![])
         }
@@ -94,8 +96,17 @@ pub async fn get_document_outline(
 pub async fn get_page_sizes(
     state: State<'_, AppState>,
 ) -> Result<Vec<PageInfo>, String> {
-    let mut doc_guard = state.document.lock().map_err(|e| e.to_string())?;
-    let doc = doc_guard.as_mut().ok_or("No document loaded")?;
+    // Get file path from state
+    let file_path = {
+        let path_guard = state.inner().file_path.lock().unwrap();
+        path_guard.as_ref().cloned()
+    };
+
+    let file_path = file_path.ok_or("No document loaded")?;
+
+    // Reload document
+    let mut doc = pdf_x_core::PDFDocument::open_file(&file_path, None, None)
+        .map_err(|e| e.to_string())?;
 
     let page_count = doc.page_count().map_err(|e| e.to_string())?;
     let mut pages = Vec::new();
