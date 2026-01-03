@@ -1,0 +1,42 @@
+[package]
+name = "pdf-x-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "A Rust port of PDF.js with progressive loading support"
+
+[dependencies]
+# Workspace dependencies
+rustc-hash = { workspace = true }
+smallvec = { workspace = true }
+lru = { workspace = true }
+flate2 = { workspace = true }
+
+# Optional dependencies
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+# Hayro dependencies (direct paths - they have their own workspace)
+hayro-font = { path = "../hayro/hayro-font", default-features = false }
+
+# Optional image decoding
+zune-jpeg = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+hayro-jpeg2000 = { path = "../hayro/hayro-jpeg2000", optional = true, default-features = false }
+hayro-jbig2 = { path = "../hayro/hayro-jbig2", optional = true, default-features = false }
+
+[features]
+default = ["jpeg-decoding"]
+jpeg-decoding = ["zune-jpeg"]
+png-decoding = ["image"]
+advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
+async = ["reqwest", "tokio"]
+
+[dev-dependencies]
+tempfile = "3.14"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "parsing"
+harness = false

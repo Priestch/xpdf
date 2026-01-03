@@ -1,6 +1,6 @@
-use pdf_x::{PDFDocument, PDFObject, XRefEntry};
-use pdf_x::core::{ImageDecoder, ImageFormat, Page};
-use pdf_x::core::decode::{decode_flate, decode_png_predictor};
+use pdf_x_core::{PDFDocument, PDFObject, XRefEntry};
+use pdf_x_core::{ImageDecoder, ImageFormat, Page};
+use pdf_x_core::decode::{decode_flate, decode_png_predictor};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -362,7 +362,7 @@ fn print_object_inline(obj: &PDFObject) {
     }
 }
 
-fn print_xref_table(xref: &pdf_x::XRef) {
+fn print_xref_table(xref: &pdf_x_core::XRef) {
     println!("Total entries: {}\n", xref.len());
     println!("{:<8} {:<12} {:<12} {:<8}", "Object", "Type", "Offset/Ref", "Gen");
     println!("{}", "─".repeat(50));

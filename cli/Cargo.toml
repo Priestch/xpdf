@@ -1,0 +1,23 @@
+[package]
+name = "pdf-inspect"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CLI tool for inspecting PDF structure"
+
+[[bin]]
+name = "pdf-inspect"
+path = "src/main.rs"
+
+[dependencies]
+pdf-x-core = { path = "../pdf-x-core", features = ["jpeg-decoding"] }
+
+[features]
+default = ["jpeg-decoding"]
+jpeg-decoding = ["pdf-x-core/jpeg-decoding"]
+png-decoding = ["pdf-x-core/png-decoding"]
+advanced-image-formats = ["pdf-x-core/advanced-image-formats"]
+
+# Optional: enable async network loading
+# async = ["pdf-x-core/async"]

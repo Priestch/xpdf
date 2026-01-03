@@ -1,75 +1,80 @@
-[package]
-name = "pdf-x"
+[workspace]
+members = ["pdf-x-core", "cli"]
+exclude = ["hayro/*"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 authors = ["PDF-X Contributors"]
-description = "A Rust port of PDF.js with progressive loading support"
 license = "Apache-2.0"
+repository = "https://github.com/your-org/pdf-x"
 
-[[bin]]
-name = "pdf-inspect"
-path = "src/main.rs"
+[workspace.dependencies]
+# Shared dependencies for all workspace members
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
 
-[dependencies]
-# Async HTTP client for range requests
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
+# Performance optimizations
+rustc-hash = "2.0"
+smallvec = "1.13"
+lru = "0.12"
 
-# Async runtime (for async network loading)
-tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros"], optional = true }
-
-# Compression support for FlateDecode streams
+# Compression
 flate2 = "1.0"
 
-# Performance optimizations (WASM-compatible)
-rustc-hash = "2.0"        # Fast hashing for integer keys (30% faster than std HashMap)
-smallvec = "1.13"         # Inline small arrays to avoid heap allocations
-lru = "0.12"              # LRU cache for bounded memory usage
+# Async support
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros"] }
 
-# Font parsing (from hayro project)
-hayro-font = { path = "./hayro/hayro-font" }  # CFF and Type1 font parser for text extraction
+# Image decoding
+zune-jpeg = { version = "0.5" }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
-# Image decoding - follow hayro's specialized approach
-# Use hayro's proven architecture with zune-jpeg for JPEG (DCTDecode)
-zune-jpeg = { version = "0.5", optional = true }  # For JPEG (DCTDecode) - fast and SIMD-optimized
-image = { version = "0.25", default-features = false, features = ["png"], optional = true }  # For PNG support
+# Hayro workspace dependencies (for compatibility)
+log = "0.4"
+phf = { version = "0.13", features = ["macros"] }
+bitflags = "2.9"
+bytemuck = "1"
+kurbo = "0.12"
+resvg = "0.45.1"
+once_cell = "1"
+moxcms = "0.7.11"
+siphasher = "1"
+skrifa = "0.39.0"
+yoke = "0.8"
+pdf-writer = "0.14.0"
+sitro = { git = "https://github.com/LaurenzV/sitro", rev = "fb804b3" }
+xmlwriter = "0.1"
+base64 = "0.22"
+vello_cpu = { git = "https://github.com/linebender/vello", rev = "4ea47b4", default-features = false, features = ["std", "png", "u8_pipeline"] }
+fast_image_resize = { version = "5", default-features = false }
+fearless_simd = "0.3.0"
 
-# Optional advanced image decoders (feature-gated)
-# Use hayro's specialized decoders for complete format support
-hayro-jpeg2000 = { path = "./hayro/hayro-jpeg2000", optional = true, default-features = false }  # For JPEG2000 (JpxDecode) - complete spec support
-hayro-jbig2 = { path = "./hayro/hayro-jbig2", optional = true }      # For JBIG2 (Jbig2Decode) - document compression
+[workspace.lints]
+rust.keyword_idents_2024 = "forbid"
+rust.non_ascii_idents = "forbid"
+rust.unsafe_op_in_unsafe_fn = "forbid"
+rust.missing_docs = "warn"
+rust.unused_extern_crates = "warn"
 
-[features]
-default = ["jpeg-decoding"]
-jpeg-decoding = ["zune-jpeg"]
-png-decoding = ["image"]
-advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
-async = ["reqwest", "tokio"]  # Enable async network loading
-
-[dev-dependencies]
-tempfile = "3.14"
-criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "parsing"
-harness = false
-
-# Performance optimization profiles
 [profile.release]
-opt-level = 3              # Maximum optimizations
-lto = "thin"              # Link-time optimization (thin for faster builds)
-codegen-units = 1         # Single codegen unit for better optimization
-strip = true              # Strip symbols for smaller binaries
-panic = "abort"           # Smaller binary, faster panic handling
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
 
 [profile.release-wasm]
 inherits = "release"
-opt-level = "z"           # Optimize for size (critical for WASM)
-lto = true                # Full LTO for WASM
-panic = "abort"           # WASM doesn't support unwinding
+opt-level = "z"
+lto = true
+panic = "abort"
 
 [profile.dev]
-opt-level = 0             # Fast compilation for development
+opt-level = 0
 
 [profile.bench]
 inherits = "release"
-lto = false               # Faster benchmark compilation
+lto = false
