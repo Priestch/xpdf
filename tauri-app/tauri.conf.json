@@ -1,0 +1,29 @@
+{
+  "$schema": "https://schema.tauri.app/config/2.0",
+  "productName": "PDF-X Viewer",
+  "version": "0.1.0",
+  "identifier": "com.pdf-x.viewer",
+  "build": {
+    "beforeDevCommand": "cd ui && npm run dev",
+    "beforeBuildCommand": "cd ui && npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "PDF-X Viewer",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

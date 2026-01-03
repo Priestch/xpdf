@@ -1,5 +1,5 @@
 [workspace]
-members = ["pdf-x-core", "cli"]
+members = ["pdf-x-core", "cli", "tauri-app"]
 exclude = ["hayro/*"]
 resolver = "2"
 

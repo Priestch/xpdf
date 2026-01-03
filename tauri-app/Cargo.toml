@@ -1,0 +1,23 @@
+[package]
+name = "pdf-x-app"
+version = "0.1.0"
+edition = "2024"
+authors = ["PDF-X Contributors"]
+license = "Apache-2.0"
+description = "Tauri desktop app for PDF-X"
+
+[dependencies]
+pdf-x-core = { path = "../pdf-x-core" }
+tauri = { version = "2.0", features = [] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros"] }
+thiserror = "2.0"
+
+[features]
+# This feature is used for production builds or when `devPath` points to the filesystem
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
