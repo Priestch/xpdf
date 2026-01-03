@@ -2,6 +2,8 @@ use pdf_x::{PDFDocument, PDFObject, XRefEntry};
 use pdf_x::core::{ImageDecoder, ImageFormat, Page};
 use pdf_x::core::decode::{decode_flate, decode_png_predictor};
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::process;
 
 fn main() {
@@ -11,6 +13,7 @@ fn main() {
         eprintln!("PDF Structure Inspector");
         eprintln!("Usage: {} <pdf-file> [options]", args[0]);
         eprintln!("\nOptions:");
+        eprintln!("  --all            Show all information (default)");
         eprintln!("  --catalog        Show document catalog");
         eprintln!("  --xref           Show cross-reference table");
         eprintln!("  --trailer        Show trailer dictionary");
@@ -18,19 +21,37 @@ fn main() {
         eprintln!("  --images         Extract and show image information");
         eprintln!("  --object <num>   Show specific object by number");
         eprintln!("  --version        Show PDF version");
-        eprintln!("  --all            Show all information (default)");
+        eprintln!("  --info           Show document metadata (Title, Author, etc.)");
+        eprintln!("  --fonts          List fonts used in the document");
+        eprintln!("  --extract-text   Extract text from all pages");
+        eprintln!("  --outline        Show document outline (bookmarks)");
+        eprintln!("  --stats          Show summary statistics");
+        eprintln!("  --page-sizes     Show page dimensions");
         process::exit(1);
     }
 
     let pdf_path = &args[1];
 
-    // Parse options
-    let show_all = args.len() == 2 || args.contains(&"--all".to_string());
-    let show_catalog = show_all || args.contains(&"--catalog".to_string());
-    let show_xref = show_all || args.contains(&"--xref".to_string());
-    let show_trailer = show_all || args.contains(&"--trailer".to_string());
-    let show_pages = show_all || args.contains(&"--pages".to_string());
-    let show_images = args.contains(&"--images".to_string());
+    // Check if file exists before trying to parse
+    if !Path::new(pdf_path).exists() {
+        eprintln!("Error: File not found: {}", pdf_path);
+        process::exit(1);
+    }
+
+    // Parse options - use any() instead of contains() to avoid String allocations
+    let show_all = args.len() == 2 || args.iter().any(|x| x == "--all");
+    let show_catalog = show_all || args.iter().any(|x| x == "--catalog");
+    let show_xref = show_all || args.iter().any(|x| x == "--xref");
+    let show_trailer = show_all || args.iter().any(|x| x == "--trailer");
+    let show_pages = show_all || args.iter().any(|x| x == "--pages");
+    let show_images = args.iter().any(|x| x == "--images");
+    let show_version = args.iter().any(|x| x == "--version");
+    let show_info = args.iter().any(|x| x == "--info");
+    let show_fonts = args.iter().any(|x| x == "--fonts");
+    let extract_text = args.iter().any(|x| x == "--extract-text");
+    let show_outline = args.iter().any(|x| x == "--outline");
+    let show_stats = args.iter().any(|x| x == "--stats");
+    let show_page_sizes = args.iter().any(|x| x == "--page-sizes");
 
     // Check for --object option
     let object_num = if let Some(pos) = args.iter().position(|arg| arg == "--object") {
@@ -61,13 +82,92 @@ fn main() {
     println!("╚═══════════════════════════════════════════════════════════╝");
     println!("\nFile: {}\n", pdf_path);
 
+    // Get file size
+    let file_size = fs::metadata(pdf_path)
+        .map(|m| m.len())
+        .ok();
+
     // Show basic information
     println!("═══════════════ BASIC INFORMATION ═══════════════");
     if let Ok(page_count) = doc.page_count() {
         println!("Page Count: {}", page_count);
     }
     println!("XRef Entries: {}", doc.xref().len());
+
+    // Show file size
+    if let Some(size) = file_size {
+        if size < 1024 {
+            println!("File Size: {} B", size);
+        } else if size < 1024 * 1024 {
+            println!("File Size: {:.2} KB", size as f64 / 1024.0);
+        } else if size < 1024 * 1024 * 1024 {
+            println!("File Size: {:.2} MB", size as f64 / (1024.0 * 1024.0));
+        } else {
+            println!("File Size: {:.2} GB", size as f64 / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
+
+    // Show linearized status
+    if doc.is_linearized() {
+        println!("Linearized: Yes (optimized for web viewing)");
+    } else {
+        println!("Linearized: No");
+    }
+
+    // Show PDF version
+    if show_version {
+        match doc.pdf_version() {
+            Ok(version) => println!("PDF Version: {}", version),
+            Err(e) => println!("PDF Version: Unknown ({:?})", e),
+        }
+    }
     println!();
+
+    // Show document info
+    if show_info {
+        println!("═══════════════ DOCUMENT INFO ═══════════════");
+        match doc.document_info() {
+            Ok(Some(info)) => print_document_info(&info),
+            Ok(None) => println!("No document info dictionary found"),
+            Err(e) => println!("Error retrieving document info: {:?}", e),
+        }
+        println!();
+    }
+
+    // Show fonts
+    if show_fonts {
+        println!("═══════════════ FONT LIST ═══════════════");
+        extract_fonts(&mut doc);
+        println!();
+    }
+
+    // Extract text
+    if extract_text {
+        println!("═══════════════ TEXT EXTRACTION ═══════════════");
+        extract_all_text(&mut doc);
+        println!();
+    }
+
+    // Show outline
+    if show_outline {
+        println!("═══════════════ DOCUMENT OUTLINE ═══════════════");
+        extract_outline(&mut doc);
+        println!();
+    }
+
+    // Show stats
+    if show_stats {
+        println!("═══════════════ STATISTICS ═══════════════");
+        show_statistics(&mut doc, file_size);
+        println!();
+    }
+
+    // Show page sizes
+    if show_page_sizes {
+        println!("═══════════════ PAGE SIZES ═══════════════");
+        show_page_sizes_info(&mut doc);
+        println!();
+    }
 
     // Show catalog
     if show_catalog {
@@ -721,4 +821,369 @@ fn show_decoder_status() {
     println!("   --features png-decoding       # PNG support only");
     println!("   --features advanced-image-formats  # JPEG2000 + JBIG2 support");
     println!("   --features jpeg-decoding,advanced-image-formats  # All formats");
+}
+
+fn print_document_info(info: &PDFObject) {
+    if let PDFObject::Dictionary(dict) = info {
+        // Common PDF info keys with nice display names
+        let info_fields = [
+            ("Title", "Title"),
+            ("Author", "Author"),
+            ("Subject", "Subject"),
+            ("Keywords", "Keywords"),
+            ("Creator", "Creator"),
+            ("Producer", "Producer"),
+            ("CreationDate", "Creation Date"),
+            ("ModDate", "Modification Date"),
+            ("Trapped", "Trapped"),
+        ];
+
+        for (key, label) in info_fields.iter() {
+            if let Some(value) = dict.get(*key) {
+                let value_str = match value {
+                    PDFObject::String(s) => String::from_utf8_lossy(s).to_string(),
+                    PDFObject::Name(n) => format!("/{}", n),
+                    PDFObject::Number(n) => {
+                        if n.fract() == 0.0 {
+                            format!("{}", *n as i64)
+                        } else {
+                            format!("{}", n)
+                        }
+                    }
+                    PDFObject::Boolean(b) => format!("{}", b),
+                    _ => format!("{:?}", value),
+                };
+                println!("{}: {}", label, value_str);
+            }
+        }
+
+        // Show any other fields not in our list
+        for (key, value) in dict {
+            if !info_fields.iter().any(|(k, _)| *k == key) {
+                let value_str = match value {
+                    PDFObject::String(s) => String::from_utf8_lossy(s).to_string(),
+                    PDFObject::Name(n) => format!("/{}", n),
+                    _ => format!("{:?}", value),
+                };
+                println!("{}: {}", key, value_str);
+            }
+        }
+    } else {
+        println!("Info is not a dictionary: {:?}", info);
+    }
+}
+
+fn extract_fonts(doc: &mut PDFDocument) {
+    let page_count = match doc.page_count() {
+        Ok(count) => count,
+        Err(e) => {
+            println!("Error getting page count: {:?}", e);
+            return;
+        }
+    };
+
+    let mut font_set = std::collections::HashSet::new();
+
+    for page_num in 0..page_count {
+        if let Ok(page) = doc.get_page(page_num as usize) {
+            // Get page resources
+            if let Some(resources) = page.resources() {
+                if let PDFObject::Dictionary(res_dict) = resources {
+                    // Look for Font dictionary
+                    if let Some(font_obj) = res_dict.get("Font") {
+                        // Follow reference if needed
+                        let font_dict = match doc.xref_mut().fetch_if_ref(font_obj) {
+                            Ok(PDFObject::Dictionary(dict)) => dict,
+                            Ok(_) => {
+                                continue;
+                            }
+                            Err(_) => continue,
+                        };
+
+                        // Collect font names
+                        for (font_name, _font_ref) in font_dict {
+                            font_set.insert(font_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if font_set.is_empty() {
+        println!("No fonts found in document");
+    } else {
+        println!("Found {} unique font(s):", font_set.len());
+        let mut fonts: Vec<_> = font_set.into_iter().collect();
+        fonts.sort();
+        for font in fonts {
+            println!("  /{}", font);
+        }
+    }
+}
+
+fn extract_all_text(doc: &mut PDFDocument) {
+    let page_count = match doc.page_count() {
+        Ok(count) => count,
+        Err(e) => {
+            println!("Error getting page count: {:?}", e);
+            return;
+        }
+    };
+
+    let mut total_chars = 0;
+
+    for page_num in 0..page_count {
+        if let Ok(page) = doc.get_page(page_num as usize) {
+            println!("═══ Page {} ═══", page_num + 1);
+
+            match page.extract_text(doc.xref_mut()) {
+                Ok(text_items) => {
+                    if text_items.is_empty() {
+                        println!("  (No text on this page)");
+                    } else {
+                        // Group text by line (similar Y position)
+                        let mut lines: std::collections::BTreeMap<i32, Vec<String>> = std::collections::BTreeMap::new();
+
+                        for item in text_items {
+                            let y_key = if let Some(pos) = item.position {
+                                (pos.1 * 10.0) as i32
+                            } else {
+                                0
+                            };
+                            lines.entry(y_key).or_insert_with(Vec::new).push(item.text);
+                        }
+
+                        // Print lines
+                        for (_, texts) in lines.into_iter().rev() {
+                            let line = texts.join(" ");
+                            println!("  {}", line);
+                            total_chars += line.len();
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  Error extracting text: {:?}", e);
+                }
+            }
+            println!();
+        }
+    }
+
+    println!("Total characters extracted: {}", total_chars);
+}
+
+fn extract_outline(doc: &mut PDFDocument) {
+    match doc.document_outline() {
+        Ok(Some(outlines)) => {
+            print_outline_items(doc, &outlines, 0);
+        }
+        Ok(None) => {
+            println!("No document outline found");
+        }
+        Err(e) => {
+            println!("Error retrieving outline: {:?}", e);
+        }
+    }
+}
+
+fn print_outline_items(doc: &mut PDFDocument, outline_obj: &PDFObject, indent: usize) {
+    let indent_str = "  ".repeat(indent);
+
+    match outline_obj {
+        PDFObject::Dictionary(dict) => {
+            // Print title
+            if let Some(title_obj) = dict.get("Title") {
+                let title = match title_obj {
+                    PDFObject::String(s) => String::from_utf8_lossy(s).to_string(),
+                    PDFObject::HexString(s) => {
+                        let hex_str: String = s.iter().map(|b| format!("{:02x}", b)).collect();
+                        String::from_utf8_lossy(&hex_str.as_bytes()).to_string()
+                    }
+                    _ => format!("{:?}", title_obj),
+                };
+                println!("{}{}", indent_str, title);
+
+                // Show destination if available
+                if let Some(dest_obj) = dict.get("Dest") {
+                    match dest_obj {
+                        PDFObject::String(s) => {
+                            let dest = String::from_utf8_lossy(s);
+                            println!("{}  → Destination: {}", indent_str, dest);
+                        }
+                        PDFObject::Array(arr) => {
+                            if !arr.is_empty() {
+                                match &*arr[0] {
+                                    PDFObject::Ref { num, .. } => {
+                                        println!("{}  → Page: {}", indent_str, num);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        PDFObject::Ref { num, .. } => {
+                            println!("{}  → Page: {}", indent_str, num);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Recursively print child items (First)
+            if let Some(first_obj) = dict.get("First") {
+                let first = match doc.xref_mut().fetch_if_ref(first_obj) {
+                    Ok(obj) => obj,
+                    Err(_) => return,
+                };
+                print_outline_items(doc, &first, indent + 1);
+            }
+
+            // Print sibling items (Next)
+            if let Some(next_obj) = dict.get("Next") {
+                let next = match doc.xref_mut().fetch_if_ref(next_obj) {
+                    Ok(obj) => obj,
+                    Err(_) => return,
+                };
+                print_outline_items(doc, &next, indent);
+            }
+        }
+        _ => {
+            println!("{}Invalid outline item", indent_str);
+        }
+    }
+}
+
+fn show_statistics(doc: &mut PDFDocument, file_size: Option<u64>) {
+    let page_count = doc.page_count().unwrap_or(0);
+    let xref_len = doc.xref().len();
+    
+    println!("Page Count: {}", page_count);
+    println!("XRef Entries: {}", xref_len);
+    
+    if let Some(size) = file_size {
+        if size < 1024 * 1024 {
+            println!("File Size: {:.2} KB", size as f64 / 1024.0);
+        } else {
+            println!("File Size: {:.2} MB", size as f64 / (1024.0 * 1024.0));
+        }
+        
+        if page_count > 0 {
+            let avg_page_size = size as f64 / page_count as f64;
+            if avg_page_size < 1024.0 {
+                println!("Avg Page Size: {:.2} KB", avg_page_size / 1024.0);
+            } else {
+                println!("Avg Page Size: {:.2} MB", avg_page_size / (1024.0 * 1024.0));
+            }
+        }
+    }
+    
+    if doc.is_linearized() {
+        println!("Linearized: Yes (optimized for fast web view)");
+    } else {
+        println!("Linearized: No");
+    }
+    
+    match doc.pdf_version() {
+        Ok(version) => println!("PDF Version: {}", version),
+        Err(_) => println!("PDF Version: Unknown"),
+    }
+    
+    // Count fonts
+    let font_count = count_fonts(doc);
+    if font_count > 0 {
+        println!("Unique Fonts: {}", font_count);
+    }
+}
+
+fn show_page_sizes_info(doc: &mut PDFDocument) {
+    let page_count = match doc.page_count() {
+        Ok(count) => count,
+        Err(e) => {
+            println!("Error getting page count: {:?}", e);
+            return;
+        }
+    };
+    
+    for page_num in 0..page_count {
+        match doc.get_page(page_num as usize) {
+            Ok(page) => {
+                if let Some(media_box_obj) = page.media_box() {
+                    // MediaBox should be an array of 4 numbers [llx, lly, urx, ury]
+                    match media_box_obj {
+                        PDFObject::Array(arr) if arr.len() >= 4 => {
+                            let values: Vec<f64> = arr.iter()
+                                .filter_map(|obj| {
+                                    if let PDFObject::Number(n) = obj.as_ref() {
+                                        Some(*n)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            if values.len() >= 4 {
+                                let width = values[2] - values[0];
+                                let height = values[3] - values[1];
+                                println!("Page {}: {:.2} x {:.2} points ({:.2} x {:.2} inches)",
+                                    page_num + 1,
+                                    width, height,
+                                    width / 72.0, height / 72.0
+                                );
+                            } else {
+                                println!("Page {}: Invalid MediaBox format", page_num + 1);
+                            }
+                        }
+                        _ => {
+                            println!("Page {}: MediaBox is not an array", page_num + 1);
+                        }
+                    }
+                } else {
+                    println!("Page {}: Unable to determine page size", page_num + 1);
+                }
+            }
+            Err(e) => {
+                println!("Page {}: Error - {:?}", page_num + 1, e);
+            }
+        }
+
+        // Only show first 10 pages
+        if page_num >= 9 {
+            let remaining = page_count - 10;
+            if remaining > 0 {
+                println!("... and {} more page(s)", remaining);
+            }
+            break;
+        }
+    }
+}
+
+fn count_fonts(doc: &mut PDFDocument) -> usize {
+    use std::collections::HashSet;
+    
+    let page_count = match doc.page_count() {
+        Ok(count) => count,
+        Err(_) => return 0,
+    };
+    
+    let mut font_set = HashSet::new();
+    
+    for page_num in 0..page_count {
+        if let Ok(page) = doc.get_page(page_num as usize) {
+            if let Some(resources) = page.resources() {
+                if let PDFObject::Dictionary(res_dict) = resources {
+                    if let Some(font_obj) = res_dict.get("Font") {
+                        if let Ok(font_dict) = doc.xref_mut().fetch_if_ref(font_obj) {
+                            if let PDFObject::Dictionary(dict) = font_dict {
+                                for (font_name, _) in dict {
+                                    font_set.insert(font_name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    font_set.len()
 }

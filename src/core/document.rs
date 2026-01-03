@@ -746,6 +746,94 @@ impl PDFDocument {
             }
         }
     }
+
+    /// Gets the PDF version from the document header.
+    ///
+    /// PDF version is specified in the header as "%PDF-1.x" at the start of the file.
+    ///
+    /// # Returns
+    /// The PDF version as a string (e.g., "1.4", "1.7"), or an error if not found.
+    pub fn pdf_version(&mut self) -> PDFResult<String> {
+        // Save current position
+        let current_pos = self.xref.stream_pos();
+
+        // Move to start of file
+        self.xref.set_stream_pos(0)?;
+
+        // Read first 10 bytes to find header
+        let header_bytes = self.xref.get_bytes(0, 10)?;
+
+        // Restore position
+        self.xref.set_stream_pos(current_pos)?;
+
+        // Check for "%PDF-" header
+        let header_str = String::from_utf8_lossy(&header_bytes);
+        if let Some(version_pos) = header_str.find("%PDF-") {
+            let version_start = version_pos + 5; // Skip "%PDF-"
+            // Get up to 3 more characters for version (e.g., "1.4")
+            let version_end = (version_start + 3).min(header_str.len());
+            let version = header_str[version_start..version_end].trim();
+            return Ok(version.to_string());
+        }
+
+        Err(PDFError::Generic("PDF version not found in header".to_string()))
+    }
+
+    /// Gets the document info dictionary.
+    ///
+    /// The document info dictionary contains metadata like Title, Author, Creator, etc.
+    ///
+    /// # Returns
+    /// `Some(PDFObject)` with the info dictionary, or `None` if not present.
+    pub fn document_info(&mut self) -> PDFResult<Option<PDFObject>> {
+        let info_ref = {
+            let trailer = self.xref.trailer();
+
+            let trailer_dict = match trailer {
+                Some(PDFObject::Dictionary(dict)) => dict,
+                _ => return Ok(None),
+            };
+
+            // Get /Info entry from trailer (clone to avoid borrow issues)
+            match trailer_dict.get("Info") {
+                Some(info_ref) => info_ref.clone(),
+                None => return Ok(None),
+            }
+        };
+
+        // Fetch the info object
+        let info_obj = self.xref.fetch_if_ref(&info_ref)?;
+        Ok(Some(info_obj))
+    }
+
+    /// Gets the document outline (bookmarks) dictionary.
+    ///
+    /// The outline contains hierarchical bookmarks that point to destinations in the PDF.
+    ///
+    /// # Returns
+    /// `Some(PDFObject)` with the outlines dictionary, or `None` if not present.
+    pub fn document_outline(&mut self) -> PDFResult<Option<PDFObject>> {
+        let outlines_ref = {
+            let catalog = self.catalog();
+
+            let catalog = match catalog {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+
+            if let PDFObject::Dictionary(cat_dict) = catalog {
+                match cat_dict.get("Outlines") {
+                    Some(o) => o.clone(),
+                    None => return Ok(None),
+                }
+            } else {
+                return Ok(None);
+            }
+        };
+
+        let outlines = self.xref.fetch_if_ref(&outlines_ref)?;
+        Ok(Some(outlines))
+    }
 }
 
 #[cfg(test)]

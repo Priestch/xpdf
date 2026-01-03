@@ -1,6 +1,6 @@
 use super::error::{PDFError, PDFResult};
 use super::lexer::{Lexer, Token};
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 /// PDF object types as defined in the PDF specification.
@@ -504,6 +504,7 @@ impl Parser {
 mod tests {
     use super::*;
     use crate::core::Stream;
+    use smallvec::smallvec;
 
     fn parse_string(input: &str) -> PDFResult<PDFObject> {
         let data = input.as_bytes().to_vec();

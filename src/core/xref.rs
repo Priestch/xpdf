@@ -1030,6 +1030,31 @@ impl XRef {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Gets the current stream position.
+    pub fn stream_pos(&self) -> usize {
+        self.stream.pos()
+    }
+
+    /// Gets bytes from the stream at a specific position without changing current position.
+    pub fn get_bytes(&mut self, pos: usize, length: usize) -> PDFResult<Vec<u8>> {
+        // Save current position
+        let current_pos = self.stream.pos();
+
+        // Move to requested position
+        self.stream.set_pos(pos)?;
+
+        // Read bytes
+        let mut bytes = vec![0u8; length];
+        for i in 0..length {
+            bytes[i] = self.stream.get_byte()?;
+        }
+
+        // Restore position
+        self.stream.set_pos(current_pos)?;
+
+        Ok(bytes)
+    }
 }
 
 /// Helper function to read big-endian integer from bytes.
