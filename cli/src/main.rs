@@ -974,9 +974,15 @@ fn extract_all_text(doc: &mut PDFDocument) {
 }
 
 fn extract_outline(doc: &mut PDFDocument) {
-    match doc.document_outline() {
+    match doc.document_outline_items() {
         Ok(Some(outlines)) => {
-            print_outline_items(doc, &outlines, 0);
+            if outlines.is_empty() {
+                println!("No document outline found");
+            } else {
+                for item in &outlines {
+                    print_outline_item(item, 0);
+                }
+            }
         }
         Ok(None) => {
             println!("No document outline found");
@@ -987,69 +993,61 @@ fn extract_outline(doc: &mut PDFDocument) {
     }
 }
 
-fn print_outline_items(doc: &mut PDFDocument, outline_obj: &PDFObject, indent: usize) {
+fn print_outline_item(item: &pdf_x_core::OutlineItem, indent: usize) {
     let indent_str = "  ".repeat(indent);
 
-    match outline_obj {
-        PDFObject::Dictionary(dict) => {
-            // Print title
-            if let Some(title_obj) = dict.get("Title") {
-                let title = match title_obj {
-                    PDFObject::String(s) => String::from_utf8_lossy(s).to_string(),
-                    PDFObject::HexString(s) => {
-                        let hex_str: String = s.iter().map(|b| format!("{:02x}", b)).collect();
-                        String::from_utf8_lossy(&hex_str.as_bytes()).to_string()
-                    }
-                    _ => format!("{:?}", title_obj),
-                };
-                println!("{}{}", indent_str, title);
+    // Print title with style
+    let mut title = item.title.clone();
+    if item.bold {
+        title = format!("[B] {}", title);
+    }
+    if item.italic {
+        title = format!("[I] {}", title);
+    }
 
-                // Show destination if available
-                if let Some(dest_obj) = dict.get("Dest") {
-                    match dest_obj {
-                        PDFObject::String(s) => {
-                            let dest = String::from_utf8_lossy(s);
-                            println!("{}  → Destination: {}", indent_str, dest);
-                        }
-                        PDFObject::Array(arr) => {
-                            if !arr.is_empty() {
-                                match &*arr[0] {
-                                    PDFObject::Ref { num, .. } => {
-                                        println!("{}  → Page: {}", indent_str, num);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        PDFObject::Ref { num, .. } => {
-                            println!("{}  → Page: {}", indent_str, num);
-                        }
-                        _ => {}
-                    }
+    println!("{}{}", indent_str, title);
+
+    // Print destination
+    if let Some(dest) = &item.dest {
+        match dest {
+            pdf_x_core::OutlineDestination::Explicit { page_index, dest_type } => {
+                println!("{}  → Page {} ({:?})", indent_str, page_index, dest_type);
+            }
+            pdf_x_core::OutlineDestination::Named(name) => {
+                println!("{}  → Named: {}", indent_str, name);
+            }
+            pdf_x_core::OutlineDestination::URL(url) => {
+                println!("{}  → URL: {}", indent_str, url);
+            }
+            pdf_x_core::OutlineDestination::GoToRemote { url, dest, new_window } => {
+                println!("{}  → Remote PDF: {}", indent_str, url);
+                if let Some(d) = dest {
+                    println!("{}     Destination: {}", indent_str, d);
+                }
+                if *new_window {
+                    println!("{}     (New window)", indent_str);
                 }
             }
-
-            // Recursively print child items (First)
-            if let Some(first_obj) = dict.get("First") {
-                let first = match doc.xref_mut().fetch_if_ref(first_obj) {
-                    Ok(obj) => obj,
-                    Err(_) => return,
-                };
-                print_outline_items(doc, &first, indent + 1);
-            }
-
-            // Print sibling items (Next)
-            if let Some(next_obj) = dict.get("Next") {
-                let next = match doc.xref_mut().fetch_if_ref(next_obj) {
-                    Ok(obj) => obj,
-                    Err(_) => return,
-                };
-                print_outline_items(doc, &next, indent);
-            }
         }
-        _ => {
-            println!("{}Invalid outline item", indent_str);
+    }
+
+    // Print color if not default black
+    if let Some([r, g, b]) = item.color {
+        println!("{}  Color: #{:02x}{:02x}{:02x}", indent_str, r, g, b);
+    }
+
+    // Print count if present
+    if let Some(count) = item.count {
+        if count < 0 {
+            println!("{}  [{} descendants, closed]", indent_str, count.abs());
+        } else {
+            println!("{}  [{} descendants, open]", indent_str, count);
         }
+    }
+
+    // Print children
+    for child in &item.children {
+        print_outline_item(child, indent + 1);
     }
 }
 

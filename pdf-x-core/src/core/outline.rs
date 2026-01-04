@@ -538,17 +538,24 @@ fn parse_destination_type(
 
 /// Resolves a page reference to a zero-based page index.
 ///
-/// This is expensive as it requires traversing the page tree.
-/// For production use, this should cache the results.
-fn resolve_page_index(_page_ref: &PDFObject, _doc: &mut PDFDocument) -> PDFResult<usize> {
-    // MVP: For now, we'll return 0 (first page) as a placeholder
-    // In a full implementation, we'd:
-    // 1. Build a page_ref -> page_index cache
-    // 2. Look up the page in the page tree
-    // 3. Return the actual page index
-
-    // TODO: Implement proper page resolution
-    Ok(0)
+/// This uses the document's page reference cache to efficiently look up
+/// page indices from page object references.
+fn resolve_page_index(page_ref: &PDFObject, doc: &mut PDFDocument) -> PDFResult<usize> {
+    match page_ref {
+        PDFObject::Ref { num, generation } => {
+            // Use the document's resolve_page_index method
+            doc.resolve_page_index(*num, *generation)
+                .ok_or_else(|| {
+                    PDFError::Generic(format!(
+                        "Page reference {} {} not found in document",
+                        num, generation
+                    ))
+                })
+        }
+        _ => Err(PDFError::Generic(
+            "Page reference is not a Ref object".to_string(),
+        )),
+    }
 }
 
 /// Parses the /C entry (color) from an outline dictionary.
@@ -606,6 +613,7 @@ fn parse_flags(dict: &HashMap<String, PDFObject>) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::SmallVec;
 
     #[test]
     fn test_outline_item_new() {

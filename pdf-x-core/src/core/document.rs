@@ -6,6 +6,7 @@ use super::page::{Page, PageTreeCache};
 use super::parser::PDFObject;
 use super::stream::Stream;
 use super::xref::XRef;
+use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -50,6 +51,13 @@ pub struct PDFDocument {
 
     /// Linearized PDF information (if applicable)
     linearized: Option<LinearizedInfo>,
+
+    /// Cache mapping page object references to page indices
+    /// Used for resolving destinations in outlines and links
+    page_ref_cache: FxHashMap<(u32, u32), usize>,
+
+    /// Whether the page reference cache has been built
+    page_ref_cache_built: bool,
 }
 
 impl PDFDocument {
@@ -91,6 +99,8 @@ impl PDFDocument {
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
+            page_ref_cache: FxHashMap::default(),
+            page_ref_cache_built: false,
         })
     }
 
@@ -170,6 +180,8 @@ impl PDFDocument {
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
+            page_ref_cache: FxHashMap::default(),
+            page_ref_cache_built: false,
         })
     }
 
@@ -334,6 +346,129 @@ impl PDFDocument {
             PDFObject::Number(n) => Ok(*n as u32),
             _ => Err(PDFError::Generic("/Count is not a number".to_string())),
         }
+    }
+
+    /// Builds the page reference cache by traversing the entire page tree.
+    ///
+    /// This method walks all pages in the document and creates a mapping from
+    /// page object references (obj_num, generation) to page indices. This cache
+    /// is used by outlines and links to resolve page references to page indices.
+    ///
+    /// The cache is built lazily - only when first needed (e.g., when parsing outlines).
+    fn build_page_ref_cache(&mut self) -> PDFResult<()> {
+        if self.page_ref_cache_built {
+            return Ok(());
+        }
+
+        // Get the root Pages dictionary
+        let root_pages = self.pages_dict()?;
+
+        // Stack for depth-first traversal: (node, node_ref)
+        let mut nodes_to_visit: Vec<(PDFObject, Option<(u32, u32)>)> = vec![(root_pages, None)];
+        let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
+        let mut current_page_index = 0;
+
+        while let Some((current_node, node_ref)) = nodes_to_visit.pop() {
+            // Handle references
+            let (node_obj, obj_ref) = match &current_node {
+                PDFObject::Ref { num, generation } => {
+                    let ref_key = (*num, *generation);
+
+                    // Prevent circular references
+                    if visited_refs.contains(&ref_key) {
+                        return Err(PDFError::Generic(
+                            "Circular reference in page tree".to_string(),
+                        ));
+                    }
+                    visited_refs.insert(ref_key);
+
+                    // Fetch the object
+                    let fetched = self.xref.fetch(*num, *generation)?;
+                    let obj = (*fetched).clone();
+                    (obj, Some(ref_key))
+                }
+                _ => (current_node.clone(), node_ref),
+            };
+
+            // Check if this is a dictionary
+            let dict = match &node_obj {
+                PDFObject::Dictionary(d) => d,
+                _ => continue,
+            };
+
+            // Check the Type field
+            let type_obj = dict.get("Type");
+            let is_page = match type_obj {
+                Some(PDFObject::Name(name)) => name == "Page",
+                _ => !dict.contains_key("Kids"), // If no Type, check for Kids (leaf node)
+            };
+
+            if is_page {
+                // This is a page node - cache its reference
+                if let Some(ref_key) = obj_ref {
+                    self.page_ref_cache.insert(ref_key, current_page_index);
+                }
+                current_page_index += 1;
+                continue;
+            }
+
+            // This is an intermediate Pages node - traverse its Kids
+            let kids = dict.get("Kids").ok_or_else(|| {
+                PDFError::Generic("Pages node missing Kids array".to_string())
+            })?;
+
+            // Get the kids array (either directly or by resolving a reference)
+            let kids_array = match kids {
+                PDFObject::Array(arr) => arr.clone(),
+                PDFObject::Ref { num, generation } => {
+                    // Kids is a reference, fetch it
+                    let fetched = self.xref.fetch(*num, *generation)?;
+                    match &*fetched {
+                        PDFObject::Array(arr) => arr.clone(),
+                        _ => {
+                            return Err(PDFError::Generic(
+                                "Kids reference doesn't point to array".to_string(),
+                            ))
+                        }
+                    }
+                }
+                _ => {
+                    return Err(PDFError::Generic(
+                        "Kids is not an array or reference".to_string(),
+                    ))
+                }
+            };
+
+            // Add kids to stack in reverse order (to maintain order during DFS)
+            for kid in kids_array.iter().rev() {
+                nodes_to_visit.push(((**kid).clone(), None));
+            }
+        }
+
+        self.page_ref_cache_built = true;
+        Ok(())
+    }
+
+    /// Resolves a page reference to a page index.
+    ///
+    /// This method looks up a page's object reference in the page reference cache
+    /// and returns the corresponding page index. Returns None if the reference
+    /// is not found in the cache.
+    ///
+    /// # Arguments
+    /// * `ref_num` - The object number of the page reference
+    /// * `ref_gen` - The generation number of the page reference
+    ///
+    /// # Returns
+    /// * `Some(page_index)` - The page index if found
+    /// * `None` - If the reference is not in the cache
+    pub fn resolve_page_index(&mut self, ref_num: u32, ref_gen: u32) -> Option<usize> {
+        // Ensure cache is built
+        if !self.page_ref_cache_built {
+            let _ = self.build_page_ref_cache();
+        }
+
+        self.page_ref_cache.get(&(ref_num, ref_gen)).copied()
     }
 
     /// Traverses the page tree to find a specific page by index.
