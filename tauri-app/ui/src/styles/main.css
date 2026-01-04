@@ -132,3 +132,532 @@ body {
 .welcome-screen p {
   font-size: 1.2rem;
 }
+
+/* Three-panel layout */
+.app-main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.sidebar {
+  flex: 0 0 300px;
+  border-right: 1px solid #ddd;
+  overflow-y: auto;
+  background: #fafafa;
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #fff;
+}
+
+/* Header styles */
+.app-header h1 {
+  font-size: 1.5rem;
+  color: #333;
+}
+
+.header-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.close-button {
+  padding: 0.4rem 1rem;
+  font-size: 0.9rem;
+  background: #6c757d;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.close-button:hover {
+  background: #5a6268;
+}
+
+/* Outline Viewer Styles */
+.outline-viewer {
+  padding: 1rem;
+  font-size: 14px;
+}
+
+.outline-viewer h3 {
+  margin: 0 0 1rem 0;
+  font-size: 16px;
+  color: #333;
+  font-weight: 600;
+  padding-bottom: 0.5rem;
+  border-bottom: 2px solid #007bff;
+}
+
+.outline-loading,
+.outline-empty,
+.outline-error {
+  padding: 1rem;
+  color: #666;
+  font-style: italic;
+  text-align: center;
+}
+
+.outline-error {
+  color: #c00;
+  background: #fff5f5;
+  border-radius: 4px;
+}
+
+.outline-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.outline-item {
+  user-select: none;
+}
+
+.outline-item-header {
+  display: flex;
+  align-items: center;
+  padding: 6px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background-color 0.15s;
+  gap: 6px;
+}
+
+.outline-item-header:hover {
+  background-color: #e8f4ff;
+}
+
+.outline-toggle,
+.outline-toggle-spacer {
+  width: 16px;
+  text-align: center;
+  color: #666;
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.outline-title {
+  flex: 1;
+  color: #000;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 400;
+}
+
+.outline-title.bold {
+  font-weight: 600;
+}
+
+.outline-title.italic {
+  font-style: italic;
+}
+
+.outline-page {
+  font-size: 11px;
+  color: #666;
+  margin-left: 8px;
+  white-space: nowrap;
+}
+
+.outline-dest-type {
+  font-size: 9px;
+  color: #999;
+  margin-left: 4px;
+  white-space: nowrap;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.outline-children {
+  margin-left: 0;
+}
+
+/* Main Panel Styles */
+.main-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid #ddd;
+  background: #f8f9fa;
+}
+
+.panel-toolbar h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  color: #333;
+}
+
+.page-info {
+  font-size: 0.9rem;
+  color: #666;
+  font-weight: 500;
+}
+
+.page-controls {
+  display: flex;
+  gap: 8px;
+}
+
+.page-controls button {
+  padding: 0.4rem 1rem;
+  font-size: 0.9rem;
+  background: #007bff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.page-controls button:hover:not(:disabled) {
+  background: #0056b3;
+}
+
+.page-controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.panel-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.5rem;
+}
+
+.page-viewer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.page-placeholder {
+  text-align: center;
+  padding: 3rem;
+  background: #f8f9fa;
+  border-radius: 8px;
+  border: 2px dashed #ddd;
+}
+
+.placeholder-content h3 {
+  font-size: 1.5rem;
+  color: #333;
+  margin-bottom: 1rem;
+}
+
+.placeholder-content p {
+  color: #666;
+  margin-bottom: 1rem;
+}
+
+.placeholder-content .hint {
+  font-size: 0.9rem;
+  color: #888;
+  margin-top: 1.5rem;
+}
+
+.placeholder-content ul {
+  list-style: none;
+  padding: 0;
+  margin-top: 1rem;
+}
+
+.placeholder-content li {
+  padding: 0.5rem 0;
+  color: #666;
+}
+
+/* Welcome Screen in Main Panel */
+.welcome-screen {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+.welcome-content {
+  text-align: center;
+  padding: 3rem;
+  max-width: 600px;
+}
+
+.welcome-content h2 {
+  font-size: 2.5rem;
+  margin-bottom: 1rem;
+}
+
+.welcome-content > p {
+  font-size: 1.2rem;
+  margin-bottom: 2rem;
+  opacity: 0.9;
+}
+
+.features-list {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 2rem;
+  margin-top: 2rem;
+}
+
+.features-list h3 {
+  margin-bottom: 1rem;
+  font-size: 1.3rem;
+}
+
+.features-list ul {
+  list-style: none;
+  padding: 0;
+  text-align: left;
+  display: inline-block;
+}
+
+.features-list li {
+  padding: 0.5rem 0;
+  font-size: 1rem;
+}
+
+/* Inspector Panel Styles */
+.inspector-panel {
+  flex: 0 0 320px;
+  border-right: 1px solid #ddd;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  overflow: hidden;
+}
+
+.inspector-tabs {
+  display: flex;
+  border-bottom: 2px solid #ddd;
+  background: #f8f9fa;
+}
+
+.inspector-tabs button {
+  flex: 1;
+  padding: 0.8rem 0.5rem;
+  font-size: 0.85rem;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: #666;
+  font-weight: 500;
+  margin-bottom: -2px;
+}
+
+.inspector-tabs button:hover {
+  background: rgba(0, 123, 255, 0.1);
+  color: #007bff;
+}
+
+.inspector-tabs button.active {
+  color: #007bff;
+  border-bottom-color: #007bff;
+  background: white;
+}
+
+.inspector-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+}
+
+.tab-content h3 {
+  margin: 0 0 1rem 0;
+  font-size: 1.1rem;
+  color: #333;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #eee;
+}
+
+.tab-content .extract-button {
+  width: 100%;
+  padding: 0.6rem 1rem;
+  font-size: 0.9rem;
+  background: #007bff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-bottom: 1rem;
+  transition: background 0.2s;
+}
+
+.tab-content .extract-button:hover:not(:disabled) {
+  background: #0056b3;
+}
+
+.tab-content .extract-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.extracted-content {
+  background: #f8f9fa;
+  border-radius: 4px;
+  padding: 1rem;
+  margin-top: 1rem;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.extracted-content pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+/* Metadata list in inspector */
+.metadata-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.metadata-list .metadata-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.5rem;
+  background: #f8f9fa;
+  border-radius: 4px;
+}
+
+.metadata-list .label {
+  font-size: 0.8rem;
+  color: #666;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.metadata-list .value {
+  font-size: 0.95rem;
+  color: #333;
+  word-break: break-word;
+}
+
+/* Page sizes list */
+.page-sizes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.page-size-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0.6rem;
+  background: #f8f9fa;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.page-number {
+  font-weight: 600;
+  color: #333;
+  min-width: 80px;
+}
+
+.page-dimensions {
+  color: #666;
+  font-family: 'Monaco', 'Menlo', monospace;
+}
+
+.page-rotation {
+  color: #999;
+  font-size: 0.8rem;
+  font-style: italic;
+}
+
+.empty-message {
+  color: #999;
+  font-style: italic;
+  text-align: center;
+  padding: 2rem;
+}
+
+.error-message {
+  color: #c00;
+  background: #fff5f5;
+  border: 1px solid #fed7d7;
+  border-radius: 4px;
+  padding: 0.75rem;
+  margin: 1rem 0;
+  font-size: 0.9rem;
+}
+
+/* View Mode Toggle Styles */
+.header-center {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+}
+
+.view-mode-toggle {
+  display: inline-flex;
+  background: white;
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.view-mode-toggle button {
+  padding: 0.5rem 1rem;
+  font-size: 0.9rem;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: #666;
+  font-weight: 500;
+}
+
+.view-mode-toggle button:hover {
+  background: rgba(0, 123, 255, 0.1);
+  color: #007bff;
+}
+
+.view-mode-toggle button.active {
+  background: #007bff;
+  color: white;
+}
+
+/* Mode-specific layouts */
+.main-content.inspector-mode {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.main-content.viewer-mode {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}

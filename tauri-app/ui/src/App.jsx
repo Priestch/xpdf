@@ -1,11 +1,15 @@
 import React, { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import OutlineViewer from './components/OutlineViewer';
+import MainPanel from './components/MainPanel';
+import InspectorPanel from './components/InspectorPanel';
 
 function App() {
   const [metadata, setMetadata] = useState(null);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [viewMode, setViewMode] = useState('inspector'); // 'inspector' or 'viewer'
 
   const handleOpenFile = async () => {
     try {
@@ -29,6 +33,9 @@ function App() {
       const meta = await invoke('open_pdf_file', { filePath: selected });
       console.log('Metadata:', meta);
       setMetadata(meta);
+
+      // Reset to inspector mode when opening new file
+      setViewMode('inspector');
     } catch (err) {
       console.error('Error:', err);
       setError(err.toString());
@@ -37,20 +44,54 @@ function App() {
     }
   };
 
-  const formatFileSize = (bytes) => {
-    if (!bytes) return 'Unknown';
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  const handleClose = async () => {
+    try {
+      await invoke('close_document');
+      setMetadata(null);
+      setError(null);
+      setViewMode('inspector');
+    } catch (err) {
+      console.error('Error:', err);
+      setError(err.toString());
+    }
+  };
+
+  const toggleViewMode = () => {
+    setViewMode(viewMode === 'inspector' ? 'viewer' : 'inspector');
   };
 
   return (
     <div className="app">
       <header className="app-header">
-        <h1>📄 PDF-X Viewer</h1>
-        <button onClick={handleOpenFile} disabled={isLoading}>
-          {isLoading ? 'Loading...' : 'Open PDF'}
-        </button>
+        <h1>📄 PDF-X Inspector</h1>
+        <div className="header-center">
+          {metadata && (
+            <div className="view-mode-toggle">
+              <button
+                className={viewMode === 'inspector' ? 'active' : ''}
+                onClick={() => setViewMode('inspector')}
+              >
+                🔍 Inspector
+              </button>
+              <button
+                className={viewMode === 'viewer' ? 'active' : ''}
+                onClick={() => setViewMode('viewer')}
+              >
+                📄 Page Viewer
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="header-actions">
+          {metadata && (
+            <button onClick={handleClose} className="close-button">
+              Close
+            </button>
+          )}
+          <button onClick={handleOpenFile} disabled={isLoading}>
+            {isLoading ? 'Loading...' : metadata ? 'Open New PDF' : 'Open PDF'}
+          </button>
+        </div>
       </header>
 
       {error && (
@@ -59,67 +100,47 @@ function App() {
         </div>
       )}
 
-      {metadata && (
-        <main className="app-main">
-          <section className="metadata-section">
-            <h2>Document Properties</h2>
-            <div className="metadata-grid">
-              {metadata.title && (
-                <div className="metadata-item">
-                  <span className="label">Title:</span>
-                  <span className="value">{metadata.title}</span>
+      <main className="app-main">
+        {/* Show bookmarks sidebar in both modes if document is loaded */}
+        {metadata && viewMode === 'viewer' && (
+          <aside className="sidebar bookmarks-panel">
+            <OutlineViewer documentLoaded={!!metadata} />
+          </aside>
+        )}
+
+        {/* Main content area */}
+        {metadata ? (
+          <>
+            {viewMode === 'inspector' ? (
+              <>
+                {/* Inspector Mode: Show inspector panel in center */}
+                <div className="main-content inspector-mode">
+                  <InspectorPanel documentLoaded={!!metadata} metadata={metadata} />
                 </div>
-              )}
-              {metadata.author && (
-                <div className="metadata-item">
-                  <span className="label">Author:</span>
-                  <span className="value">{metadata.author}</span>
+
+                {/* Optional bookmarks in inspector mode */}
+                <aside className="sidebar bookmarks-panel">
+                  <OutlineViewer documentLoaded={!!metadata} />
+                </aside>
+              </>
+            ) : (
+              <>
+                {/* Viewer Mode: Show page viewer in center */}
+                <div className="main-content viewer-mode">
+                  <MainPanel documentLoaded={!!metadata} metadata={metadata} />
                 </div>
-              )}
-              <div className="metadata-item">
-                <span className="label">Pages:</span>
-                <span className="value">{metadata.page_count}</span>
-              </div>
-              <div className="metadata-item">
-                <span className="label">File Size:</span>
-                <span className="value">{formatFileSize(metadata.file_size)}</span>
-              </div>
-              <div className="metadata-item">
-                <span className="label">PDF Version:</span>
-                <span className="value">{metadata.pdf_version}</span>
-              </div>
-              <div className="metadata-item">
-                <span className="label">Linearized:</span>
-                <span className="value">{metadata.is_linearized ? 'Yes' : 'No'}</span>
-              </div>
-              {metadata.creator && (
-                <div className="metadata-item">
-                  <span className="label">Creator:</span>
-                  <span className="value">{metadata.creator}</span>
-                </div>
-              )}
-              {metadata.producer && (
-                <div className="metadata-item">
-                  <span className="label">Producer:</span>
-                  <span className="value">{metadata.producer}</span>
-                </div>
-              )}
+              </>
+            )}
+          </>
+        ) : (
+          <>
+            {/* No document loaded - show welcome in center */}
+            <div className="main-content">
+              <MainPanel documentLoaded={false} metadata={null} />
             </div>
-          </section>
-
-          <section className="viewer-section">
-            <h2>Page Viewer</h2>
-            <p>Page viewer coming soon...</p>
-          </section>
-        </main>
-      )}
-
-      {!metadata && !isLoading && (
-        <main className="welcome-screen">
-          <h2>Welcome to PDF-X Viewer</h2>
-          <p>Click "Open PDF" to inspect a PDF file</p>
-        </main>
-      )}
+          </>
+        )}
+      </main>
     </div>
   );
 }

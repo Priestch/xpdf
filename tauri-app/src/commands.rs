@@ -82,13 +82,63 @@ pub async fn get_document_outline(
     let mut doc = pdf_x_core::PDFDocument::open_file(&file_path, None, None)
         .map_err(|e| e.to_string())?;
 
-    match doc.document_outline().map_err(|e| e.to_string())? {
-        Some(_outline) => {
-            // For MVP, return empty list - will implement recursively later
-            Ok(vec![])
+    match doc.document_outline_items().map_err(|e| e.to_string())? {
+        Some(core_items) => {
+            // Convert core library OutlineItem to Tauri OutlineItem
+            let items = core_items
+                .into_iter()
+                .map(|item| convert_outline_item(item, &mut doc))
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(items)
         }
         None => Ok(vec![]),
     }
+}
+
+/// Converts a core library OutlineItem to a Tauri OutlineItem
+fn convert_outline_item(
+    core_item: pdf_x_core::OutlineItem,
+    doc: &mut pdf_x_core::PDFDocument,
+) -> Result<OutlineItem, String> {
+    // Resolve destination to page number and other info
+    let (page, dest_type, url) = match &core_item.dest {
+        Some(pdf_x_core::OutlineDestination::Explicit { page_index, dest_type }) => {
+            let page = Some(*page_index as u32);
+            let dest_type = Some(format!("{:?}", dest_type));
+            (page, dest_type, None)
+        }
+        Some(pdf_x_core::OutlineDestination::Named(_name)) => {
+            // Named destinations not implemented in MVP
+            (None, None, None)
+        }
+        Some(pdf_x_core::OutlineDestination::URL(uri)) => {
+            (None, None, Some(uri.clone()))
+        }
+        Some(pdf_x_core::OutlineDestination::GoToRemote { url, dest, new_window: _ }) => {
+            let dest_type = dest.clone().map(|_| "GoToR".to_string());
+            (None, dest_type, Some(url.clone()))
+        }
+        None => (None, None, None),
+    };
+
+    // Recursively convert children
+    let children = core_item
+        .children
+        .into_iter()
+        .map(|child| convert_outline_item(child, doc))
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(OutlineItem {
+        title: core_item.title,
+        page,
+        dest_type,
+        url,
+        color: core_item.color,
+        bold: core_item.bold,
+        italic: core_item.italic,
+        count: core_item.count,
+        children,
+    })
 }
 
 /// Get page sizes

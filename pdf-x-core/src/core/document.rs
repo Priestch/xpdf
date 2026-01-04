@@ -834,6 +834,17 @@ impl PDFDocument {
         let outlines = self.xref.fetch_if_ref(&outlines_ref)?;
         Ok(Some(outlines))
     }
+
+    /// Gets the document outline items (bookmarks) as a structured tree.
+    ///
+    /// This is a convenience method that returns parsed outline items
+    /// instead of just the raw outline dictionary.
+    ///
+    /// # Returns
+    /// `Some(Vec<OutlineItem>)` with hierarchical bookmark structure, or `None` if not present.
+    pub fn document_outline_items(&mut self) -> PDFResult<Option<Vec<crate::core::outline::OutlineItem>>> {
+        crate::core::outline::parse_document_outline(self)
+    }
 }
 
 #[cfg(test)]

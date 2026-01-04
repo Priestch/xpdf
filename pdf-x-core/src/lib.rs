@@ -103,8 +103,9 @@ pub mod core;
 
 // Re-export main types for convenience
 pub use core::{
-    BaseStream, FileChunkedStream, ImageDecoder, ImageFormat, LinearizedInfo, Lexer, Page,
-    PDFDocument, PDFError, PDFObject, Parser, Stream, TextItem, Token, XRef, XRefEntry,
+    BaseStream, DestinationType, FileChunkedStream, ImageDecoder, ImageFormat, LinearizedInfo,
+    Lexer, OutlineDestination, OutlineItem, Page, PDFDocument, PDFError, PDFObject, Parser,
+    Stream, TextItem, Token, XRef, XRefEntry,
 };
 
 // Re-export decode module

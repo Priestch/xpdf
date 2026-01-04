@@ -22,6 +22,12 @@ pub struct DocumentMetadata {
 pub struct OutlineItem {
     pub title: String,
     pub page: Option<u32>,
+    pub dest_type: Option<String>,
+    pub url: Option<String>,
+    pub color: Option<[u8; 3]>,
+    pub bold: bool,
+    pub italic: bool,
+    pub count: Option<i32>,
     pub children: Vec<OutlineItem>,
 }
 

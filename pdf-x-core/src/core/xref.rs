@@ -777,8 +777,10 @@ impl XRef {
                 }
 
                 let obj_length = if (index as usize) < offsets.len() - 1 {
-                    offsets[index as usize + 1]
+                    // Length is the difference between consecutive offsets
+                    offsets[index as usize + 1] - offsets[index as usize]
                 } else {
+                    // Last object extends to end of data
                     decompressed_data.len() - obj_offset
                 };
 
