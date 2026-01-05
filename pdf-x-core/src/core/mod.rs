@@ -3,8 +3,10 @@ pub mod base_stream;
 pub mod chunk_manager;
 pub mod cmap;
 pub mod content_stream;
+pub mod crypto;
 pub mod decode;
 pub mod document;
+pub mod encryption;
 pub mod error;
 pub mod file_chunked_stream;
 pub mod font;
@@ -32,7 +34,14 @@ pub use base_stream::BaseStream;
 pub use chunk_manager::{ChunkLoader, ChunkManager};
 pub use cmap::CMap;
 pub use content_stream::{ContentStreamEvaluator, OpCode, Operation, TextItem};
+pub use crypto::{
+    calculate_md5, calculate_sha256, calculate_sha384, calculate_sha512, ARC4Cipher, AES128Cipher,
+    AES256Cipher, PDF17, PDF20, PDFPasswordAlgorithm,
+};
 pub use document::{LinearizedInfo, PDFDocument};
+pub use encryption::{
+    EncryptDict, EncryptionAlgorithm, EncryptionVersion, PDFPermissions,
+};
 pub use error::PDFError;
 pub use file_chunked_stream::FileChunkedStream;
 pub use font::{Font, FontDict, FontType};

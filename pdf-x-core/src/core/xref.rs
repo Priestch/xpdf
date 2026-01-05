@@ -1023,6 +1023,73 @@ impl XRef {
         Ok((*rc_catalog).clone())
     }
 
+    /// Gets the file ID from the trailer dictionary.
+    ///
+    /// The file ID is used in encryption key derivation for PDF versions V=1,2,4.
+    ///
+    /// # Returns
+    /// The file ID as a byte array, or an error if not found
+    pub fn file_id(&self) -> PDFResult<Vec<u8>> {
+        let trailer = self
+            .trailer
+            .as_ref()
+            .ok_or_else(|| PDFError::Generic("No trailer dictionary".to_string()))?;
+
+        let trailer_dict = match trailer {
+            PDFObject::Dictionary(dict) => dict,
+            _ => {
+                return Err(PDFError::Generic(
+                    "Trailer is not a dictionary".to_string(),
+                ))
+            }
+        };
+
+        // Get the ID entry - it's an array of two byte strings
+        let id_obj = trailer_dict
+            .get("ID")
+            .ok_or_else(|| PDFError::Generic("No ID entry in trailer".to_string()))?;
+
+        match id_obj {
+            PDFObject::Array(arr) if !arr.is_empty() => {
+                // The first element of the ID array is the file ID
+                match &*arr[0] {
+                    PDFObject::String(bytes) => Ok(bytes.to_vec()),
+                    PDFObject::HexString(hex) => {
+                        // Convert hex string to bytes
+                        let hex_str = String::from_utf8_lossy(hex);
+                        let mut bytes = Vec::new();
+                        for i in (0..hex_str.len()).step_by(2) {
+                            if i + 1 < hex_str.len() {
+                                let byte_str = &hex_str[i..i+2];
+                                if let Ok(byte) = u8::from_str_radix(byte_str, 16) {
+                                    bytes.push(byte);
+                                }
+                            }
+                        }
+                        Ok(bytes)
+                    }
+                    _ => Err(PDFError::Generic("ID array element is not a string".to_string())),
+                }
+            }
+            _ => Err(PDFError::Generic("ID is not an array".to_string())),
+        }
+    }
+
+    /// Gets the /Encrypt dictionary from the trailer (if PDF is encrypted).
+    ///
+    /// # Returns
+    /// The Encrypt dictionary as an indirect reference, or None if not encrypted
+    pub fn get_encrypt_dict_ref(&self) -> Option<PDFObject> {
+        let trailer = self.trailer.as_ref()?;
+
+        let trailer_dict = match trailer {
+            PDFObject::Dictionary(dict) => dict,
+            _ => return None,
+        };
+
+        trailer_dict.get("Encrypt").cloned()
+    }
+
     /// Returns the number of entries in the xref table.
     pub fn len(&self) -> usize {
         self.entries.len()

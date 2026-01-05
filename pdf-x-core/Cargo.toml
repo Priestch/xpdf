@@ -17,6 +17,9 @@ flate2 = { workspace = true }
 reqwest = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
+# Crypto dependencies (SHA-2 is optional, AES is now built-in)
+sha2 = { version = "0.10", optional = true }
+
 # Hayro dependencies (direct paths - they have their own workspace)
 hayro-font = { path = "../hayro/hayro-font", default-features = false }
 
@@ -32,6 +35,7 @@ jpeg-decoding = ["zune-jpeg"]
 png-decoding = ["image"]
 advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
 async = ["reqwest", "tokio"]
+crypto = ["sha2"]  # AES implementation is now built-in, only SHA-2 is external
 
 [dev-dependencies]
 tempfile = "3.14"

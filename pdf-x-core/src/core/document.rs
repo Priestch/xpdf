@@ -1,5 +1,6 @@
 use super::base_stream::BaseStream;
 use super::chunk_manager::ChunkLoader;
+use super::encryption::{EncryptDict, EncryptionVersion};
 use super::error::{PDFError, PDFResult};
 use super::file_chunked_stream::FileChunkedStream;
 use super::page::{Page, PageTreeCache};
@@ -52,6 +53,9 @@ pub struct PDFDocument {
     /// Linearized PDF information (if applicable)
     linearized: Option<LinearizedInfo>,
 
+    /// Encryption dictionary (if PDF is encrypted)
+    encrypt_dict: Option<EncryptDict>,
+
     /// Cache mapping page object references to page indices
     /// Used for resolving destinations in outlines and links
     page_ref_cache: FxHashMap<(u32, u32), usize>,
@@ -99,6 +103,7 @@ impl PDFDocument {
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
+            encrypt_dict: None, // Will be set later if encrypted
             page_ref_cache: FxHashMap::default(),
             page_ref_cache_built: false,
         })
@@ -180,6 +185,7 @@ impl PDFDocument {
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
+            encrypt_dict: None, // Will be set later if encrypted
             page_ref_cache: FxHashMap::default(),
             page_ref_cache_built: false,
         })
@@ -846,6 +852,95 @@ impl PDFDocument {
     /// Returns true if this PDF is linearized (optimized for web view).
     pub fn is_linearized(&self) -> bool {
         self.linearized.is_some()
+    }
+
+    /// Returns true if this PDF is encrypted and requires a password.
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypt_dict.is_some()
+    }
+
+    /// Gets the encryption dictionary for this PDF (if encrypted).
+    pub fn encrypt_dict(&self) -> Option<&EncryptDict> {
+        self.encrypt_dict.as_ref()
+    }
+
+    /// Checks if a user password is correct and derives the encryption key.
+    ///
+    /// This method should only be called for PDF 2.0 (V=5) encrypted PDFs.
+    /// For earlier versions, use `authenticate_with_password` instead.
+    ///
+    /// # Arguments
+    /// * `password` - The password to check (as UTF-8 bytes)
+    ///
+    /// # Returns
+    /// `true` if the password is correct and the encryption key was derived
+    pub fn check_user_password(&mut self, password: &[u8]) -> bool {
+        if let Some(ref mut encrypt_dict) = self.encrypt_dict {
+            encrypt_dict.check_user_password(password)
+        } else {
+            false // Not encrypted
+        }
+    }
+
+    /// Checks if an owner password is correct and derives the encryption key.
+    ///
+    /// This method should only be called for PDF 2.0 (V=5) encrypted PDFs.
+    /// For earlier versions, use `authenticate_with_password` instead.
+    ///
+    /// # Arguments
+    /// * `password` - The password to check (as UTF-8 bytes)
+    ///
+    /// # Returns
+    /// `true` if the password is correct and the encryption key was derived
+    pub fn check_owner_password(&mut self, password: &[u8]) -> bool {
+        if let Some(ref mut encrypt_dict) = self.encrypt_dict {
+            encrypt_dict.check_owner_password(password)
+        } else {
+            false // Not encrypted
+        }
+    }
+
+    /// Authenticates with a password and derives the encryption key.
+    ///
+    /// This works for all PDF versions. For V=1,2,4 it requires the file ID,
+    /// which is obtained from the trailer.
+    ///
+    /// # Arguments
+    /// * `password` - The password to check (as UTF-8 bytes)
+    ///
+    /// # Returns
+    /// `true` if the password is correct and the encryption key was derived
+    ///
+    /// # Note
+    /// For PDF 2.0 (V=5), the file ID is not required. For earlier versions,
+    /// the file ID must have been stored in the trailer during parsing.
+    pub fn authenticate_with_password(&mut self, password: &[u8]) -> PDFResult<bool> {
+        if let Some(ref mut encrypt_dict) = self.encrypt_dict {
+            // Try to get file ID from trailer for V=1,2,4
+            let file_id = self.xref.file_id()?;
+
+            if matches!(encrypt_dict.encryption_version(),
+                EncryptionVersion::V5R5 | EncryptionVersion::V5R6) {
+                // PDF 2.0 doesn't need file ID
+                Ok(encrypt_dict.check_user_password(password))
+            } else {
+                // Earlier versions need file ID
+                Ok(encrypt_dict.derive_encryption_key_with_file_id(password, &file_id))
+            }
+        } else {
+            Ok(false) // Not encrypted
+        }
+    }
+
+    /// Gets the file encryption key (if password has been authenticated).
+    ///
+    /// # Returns
+    /// The encryption key, or an error if no password has been authenticated
+    pub fn get_encryption_key(&self) -> PDFResult<&[u8]> {
+        self.encrypt_dict
+            .as_ref()
+            .and_then(|e| e.encryption_key.as_deref())
+            .ok_or_else(|| PDFError::parse_error("No encryption key - authenticate first", None))
     }
 
     /// Gets the first page of a linearized PDF with progressive loading optimization.

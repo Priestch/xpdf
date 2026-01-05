@@ -80,6 +80,63 @@ impl PDFObject {
     pub fn is_command_like(&self) -> bool {
         matches!(self, PDFObject::Command(_))
     }
+
+    /// Returns the name value if this is a Name object.
+    pub fn as_name(&self) -> Option<&str> {
+        match self {
+            PDFObject::Name(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Returns the string value if this is a String object.
+    pub fn as_string(&self) -> Option<&[u8]> {
+        match self {
+            PDFObject::String(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Returns the hex string value if this is a HexString object.
+    pub fn as_hex_string(&self) -> Option<&[u8]> {
+        match self {
+            PDFObject::HexString(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Returns the boolean value if this is a Boolean object.
+    pub fn as_boolean(&self) -> Option<bool> {
+        match self {
+            PDFObject::Boolean(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Returns the number value if this is a Number object.
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            PDFObject::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the dictionary if this is a Dictionary object.
+    pub fn as_dictionary(&self) -> Option<&HashMap<String, PDFObject>> {
+        match self {
+            PDFObject::Dictionary(dict) => Some(dict),
+            PDFObject::Stream { dict, .. } => Some(dict),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the array if this is an Array object.
+    pub fn as_array(&self) -> Option<&[Box<PDFObject>]> {
+        match self {
+            PDFObject::Array(arr) => Some(arr),
+            _ => None,
+        }
+    }
 }
 
 /// PDF Parser for building PDF objects from tokens.
