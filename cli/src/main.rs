@@ -25,6 +25,7 @@ fn main() {
         eprintln!("  --fonts          List fonts used in the document");
         eprintln!("  --extract-text   Extract text from all pages");
         eprintln!("  --outline        Show document outline (bookmarks)");
+        eprintln!("  --annotations    Show document annotations (links, notes, etc.)");
         eprintln!("  --stats          Show summary statistics");
         eprintln!("  --page-sizes     Show page dimensions");
         process::exit(1);
@@ -50,6 +51,7 @@ fn main() {
     let show_fonts = args.iter().any(|x| x == "--fonts");
     let extract_text = args.iter().any(|x| x == "--extract-text");
     let show_outline = args.iter().any(|x| x == "--outline");
+    let show_annotations = args.iter().any(|x| x == "--annotations");
     let show_stats = args.iter().any(|x| x == "--stats");
     let show_page_sizes = args.iter().any(|x| x == "--page-sizes");
 
@@ -152,6 +154,13 @@ fn main() {
     if show_outline {
         println!("═══════════════ DOCUMENT OUTLINE ═══════════════");
         extract_outline(&mut doc);
+        println!();
+    }
+
+    // Show annotations
+    if show_annotations {
+        println!("═══════════════ ANNOTATIONS ═══════════════");
+        extract_annotations(&mut doc);
         println!();
     }
 
@@ -1152,6 +1161,127 @@ fn show_page_sizes_info(doc: &mut PDFDocument) {
             }
             break;
         }
+    }
+}
+
+fn extract_annotations(doc: &mut PDFDocument) {
+    use pdf_x_core::Annotation;
+
+    let page_count = match doc.page_count() {
+        Ok(count) => count,
+        Err(e) => {
+            println!("Error getting page count: {:?}", e);
+            return;
+        }
+    };
+
+    if page_count == 0 {
+        println!("No pages found in document");
+        return;
+    }
+
+    let mut total_annotations = 0;
+
+    for page_idx in 0..page_count.min(10) {
+        match doc.get_page(page_idx as usize) {
+            Ok(page) => {
+                let annotations = match page.extract_annotations(doc.xref_mut()) {
+                    Ok(annots) => annots,
+                    Err(e) => {
+                        println!("Page {}: Error extracting annotations - {:?}", page_idx + 1, e);
+                        continue;
+                    }
+                };
+
+                if annotations.is_empty() {
+                    continue;
+                }
+
+                println!("Page {} ({} annotation(s)):", page_idx + 1, annotations.len());
+                total_annotations += annotations.len();
+
+                for (i, annot) in annotations.iter().enumerate() {
+                    println!("  [{}] {:?}", i + 1, annot.annotation_type);
+
+                    // Show location
+                    println!("      Location: [{}, {}, {}, {}]",
+                             annot.rect[0], annot.rect[1], annot.rect[2], annot.rect[3]);
+
+                    // Show contents if present
+                    if let Some(ref contents) = annot.contents {
+                        if !contents.is_empty() {
+                            let preview = if contents.len() > 50 {
+                                format!("{}...", &contents[..50])
+                            } else {
+                                contents.clone()
+                            };
+                            println!("      Contents: {}", preview);
+                        }
+                    }
+
+                    // Show type-specific data
+                    match &annot.data {
+                        pdf_x_core::AnnotationData::Link(link) => {
+                            match &link.action {
+                                pdf_x_core::LinkAction::URI { url, .. } => {
+                                    println!("      → URL: {}", url);
+                                }
+                                pdf_x_core::LinkAction::GoTo { page_index, dest } => {
+                                    println!("      → Page {} ({:?})", page_index, dest);
+                                }
+                                pdf_x_core::LinkAction::GoToNamed { name } => {
+                                    println!("      → Named destination: {}", name);
+                                }
+                                _ => {}
+                            }
+                        }
+                        pdf_x_core::AnnotationData::Text(text) => {
+                            println!("      Open: {}", text.open);
+                            if let Some(ref icon) = text.icon {
+                                println!("      Icon: {}", icon);
+                            }
+                        }
+                        pdf_x_core::AnnotationData::Widget(widget) => {
+                            println!("      Field type: {:?}", widget.field_type);
+                            if let Some(ref name) = widget.field_name {
+                                println!("      Field name: {}", name);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // Show color if present
+                    if let Some(ref color) = annot.color {
+                        if color.len() >= 3 {
+                            println!("      Color: RGB({:.0}, {:.0}, {:.0})",
+                                     color[0] * 255.0,
+                                     color[1] * 255.0,
+                                     color[2] * 255.0);
+                        }
+                    }
+                }
+
+                println!();
+            }
+            Err(e) => {
+                println!("Page {}: Error - {:?}", page_idx + 1, e);
+            }
+        }
+
+        // Only show first 10 pages
+        if page_idx >= 9 {
+            let remaining = page_count - 10;
+            if remaining > 0 {
+                println!("... and {} more page(s) with potential annotations", remaining);
+            }
+            break;
+        }
+    }
+
+    if total_annotations == 0 {
+        println!("No annotations found in the first 10 pages");
+    } else {
+        println!("Total annotations shown: {}", total_annotations);
     }
 }
 

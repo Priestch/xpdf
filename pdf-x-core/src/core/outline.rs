@@ -434,14 +434,44 @@ fn parse_dest_entry(dest_obj: &PDFObject, doc: &mut PDFDocument) -> PDFResult<Ou
             })
         }
         PDFObject::String(bytes) | PDFObject::HexString(bytes) => {
-            // Named destination
-            Ok(OutlineDestination::Named(
-                String::from_utf8_lossy(bytes).to_string(),
-            ))
+            // Named destination - try to resolve it
+            let name = String::from_utf8_lossy(bytes).to_string();
+
+            // Try to resolve the named destination
+            match doc.resolve_named_destination(&name) {
+                Ok(Some((page_index, dest_type))) => {
+                    Ok(OutlineDestination::Explicit {
+                        page_index,
+                        dest_type,
+                    })
+                }
+                _ => {
+                    // Could not resolve, keep as named destination
+                    Ok(OutlineDestination::Named(name))
+                }
+            }
         }
         PDFObject::Name(name) => {
-            // Named destination (as a name object)
-            Ok(OutlineDestination::Named(name.clone()))
+            // Named destination (as a name object) - try to resolve it
+            // Remove leading '/' if present
+            let clean_name = if name.starts_with('/') {
+                &name[1..]
+            } else {
+                name
+            };
+
+            match doc.resolve_named_destination(clean_name) {
+                Ok(Some((page_index, dest_type))) => {
+                    Ok(OutlineDestination::Explicit {
+                        page_index,
+                        dest_type,
+                    })
+                }
+                _ => {
+                    // Could not resolve, keep as named destination
+                    Ok(OutlineDestination::Named(name.clone()))
+                }
+            }
         }
         _ => Ok(OutlineDestination::Named(String::new())),
     }
@@ -507,7 +537,7 @@ fn parse_action_destination(
 }
 
 /// Parses the destination type and parameters from an explicit destination array.
-fn parse_destination_type(
+pub fn parse_destination_type(
     type_name: &str,
     params: &[Box<PDFObject>],
 ) -> PDFResult<DestinationType> {

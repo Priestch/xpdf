@@ -103,9 +103,12 @@ pub mod core;
 
 // Re-export main types for convenience
 pub use core::{
-    BaseStream, DestinationType, FileChunkedStream, ImageDecoder, ImageFormat, LinearizedInfo,
-    Lexer, OutlineDestination, OutlineItem, Page, PDFDocument, PDFError, PDFObject, Parser,
-    Stream, TextItem, Token, XRef, XRefEntry,
+    Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags,
+    AnnotationRect, AnnotationType, BaseStream, DestinationType, FileAttachmentAnnotation,
+    FileChunkedStream, FormFieldType, ImageDecoder, ImageFormat, LinearizedInfo, Lexer,
+    LinkAction, LinkAnnotation, OutlineDestination, OutlineItem, Page, PDFDocument, PDFError,
+    PDFObject, Parser, PopupAnnotation, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation,
+    XRef, XRefEntry,
 };
 
 // Re-export decode module

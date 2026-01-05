@@ -1,3 +1,4 @@
+pub mod annotation;
 pub mod base_stream;
 pub mod chunk_manager;
 pub mod cmap;
@@ -22,6 +23,11 @@ pub mod async_http_chunked_stream;
 #[cfg(feature = "async")]
 pub mod http_chunked_stream;
 
+pub use annotation::{
+    Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags, AnnotationRect,
+    AnnotationType, FileAttachmentAnnotation, FormFieldType, LinkAction, LinkAnnotation,
+    PopupAnnotation, TextAnnotation, WidgetAnnotation,
+};
 pub use base_stream::BaseStream;
 pub use chunk_manager::{ChunkLoader, ChunkManager};
 pub use cmap::CMap;

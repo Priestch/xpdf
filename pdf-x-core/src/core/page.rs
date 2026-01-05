@@ -84,6 +84,13 @@ impl Page {
         self.get("Resources")
     }
 
+    /// Gets the Annotations for this page.
+    ///
+    /// Annotations can be either a single annotation or an array of annotations.
+    pub fn annotations(&self) -> Option<&PDFObject> {
+        self.get("Annots")
+    }
+
     /// Gets the Contents for this page.
     ///
     /// Contents can be either a single stream or an array of streams.
@@ -748,5 +755,42 @@ impl Page {
                 "No resources dictionary found in page".to_string()
             ))
         }
+    }
+
+    /// Extracts annotations from this page.
+    ///
+    /// This method parses all annotations associated with the page, including
+    /// links, text notes, highlights, form fields, etc.
+    ///
+    /// # Arguments
+    /// * `xref` - Mutable reference to the XRef table for resolving object references
+    ///
+    /// # Returns
+    /// Vector of Annotation structures containing annotation information
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    /// let page = doc.get_page(0).unwrap();
+    /// let annotations = page.extract_annotations(&mut doc.xref_mut()).unwrap();
+    ///
+    /// for annot in annotations {
+    ///     println!("Annotation type: {:?}", annot.annotation_type);
+    ///     if let Some(ref contents) = annot.contents {
+    ///         println!("  Contents: {}", contents);
+    ///     }
+    /// }
+    /// ```
+    pub fn extract_annotations(&self, xref: &mut super::xref::XRef) -> PDFResult<Vec<super::annotation::Annotation>> {
+        use super::annotation::parse_annotations;
+
+        let annots = match self.annotations() {
+            Some(a) => a,
+            None => return Ok(Vec::new()),
+        };
+
+        parse_annotations(annots, xref)
     }
 }

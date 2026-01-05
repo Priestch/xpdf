@@ -980,6 +980,367 @@ impl PDFDocument {
     pub fn document_outline_items(&mut self) -> PDFResult<Option<Vec<crate::core::outline::OutlineItem>>> {
         crate::core::outline::parse_document_outline(self)
     }
+
+    /// Gets the named destinations dictionary from the document catalog.
+    ///
+    /// Named destinations are bookmarks that can be referenced by name from
+    /// outlines, links, and other actions.
+    ///
+    /// # Returns
+    /// `Some(PDFObject)` with the destinations dictionary, or `None` if not present.
+    pub fn document_dests(&mut self) -> PDFResult<Option<PDFObject>> {
+        let catalog = match self.catalog().cloned() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        if let PDFObject::Dictionary(cat_dict) = catalog {
+            match cat_dict.get("Dests") {
+                Some(dests_ref) => {
+                    let dests = self.xref.fetch_if_ref(dests_ref)?;
+                    Ok(Some(dests))
+                }
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Resolves a named destination to a page index and destination type.
+    ///
+    /// This method looks up a named destination in the /Dests dictionary and
+    /// resolves it to a page index with optional destination parameters.
+    ///
+    /// # Arguments
+    /// * `name` - The destination name (as a string)
+    ///
+    /// # Returns
+    /// * `Some((page_index, dest_type))` - The page index and destination type
+    /// * `None` - If the named destination is not found
+    pub fn resolve_named_destination(
+        &mut self,
+        name: &str,
+    ) -> PDFResult<Option<(usize, crate::core::outline::DestinationType)>> {
+        let dests = match self.document_dests()? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        // /Dests can be a dictionary or a Name tree
+        // For now, we only support the dictionary format
+        if let PDFObject::Dictionary(dests_dict) = dests {
+            // Look up the destination by name
+            // Names in /Dests are stored as Name objects or strings
+            let dest_obj = dests_dict.get(name).or_else(|| {
+                // Try as a Name object (with / prefix)
+                dests_dict.get(&format!("/{}", name))
+            });
+
+            match dest_obj {
+                Some(dest) => {
+                    // Resolve the destination
+                    let dest = self.xref.fetch_if_ref(dest)?;
+
+                    // Destinations can be:
+                    // 1. An array: [page_ref, /Type, params...]
+                    // 2. A string: name of another destination (not supported yet)
+                    // 3. A reference to another destination
+
+                    match dest {
+                        PDFObject::Array(arr) => {
+                            if arr.is_empty() {
+                                return Ok(None);
+                            }
+
+                            // First element is the page reference
+                            let page_ref = &arr[0];
+
+                            // Resolve page reference to page index
+                            let page_index = match &**page_ref {
+                                PDFObject::Ref { num, generation } => {
+                                    match self.resolve_page_index(*num, *generation) {
+                                        Some(idx) => idx,
+                                        None => return Ok(None),
+                                    }
+                                }
+                                _ => return Ok(None),
+                            };
+
+                            // Second element is the destination type name
+                            let dest_type = if arr.len() > 1 {
+                                match &*arr[1] {
+                                    PDFObject::Name(type_name) => {
+                                        crate::core::outline::parse_destination_type(
+                                            type_name,
+                                            &arr[2..],
+                                        )?
+                                    }
+                                    _ => crate::core::outline::DestinationType::Fit,
+                                }
+                            } else {
+                                crate::core::outline::DestinationType::Fit
+                            };
+
+                            Ok(Some((page_index, dest_type)))
+                        }
+                        PDFObject::Ref { num, generation } => {
+                            // Fetch the referenced destination
+                            let resolved_dest = self.xref.fetch(num, generation)?;
+                            match &*resolved_dest {
+                                PDFObject::Array(arr) => {
+                                    if arr.is_empty() {
+                                        return Ok(None);
+                                    }
+
+                                    let page_ref = &arr[0];
+                                    let page_index = match &**page_ref {
+                                        PDFObject::Ref { num, generation } => {
+                                            match self.resolve_page_index(*num, *generation) {
+                                                Some(idx) => idx,
+                                                None => return Ok(None),
+                                            }
+                                        }
+                                        _ => return Ok(None),
+                                    };
+
+                                    let dest_type = if arr.len() > 1 {
+                                        match &*arr[1] {
+                                            PDFObject::Name(type_name) => {
+                                                crate::core::outline::parse_destination_type(
+                                                    type_name,
+                                                    &arr[2..],
+                                                )?
+                                            }
+                                            _ => crate::core::outline::DestinationType::Fit,
+                                        }
+                                    } else {
+                                        crate::core::outline::DestinationType::Fit
+                                    };
+
+                                    Ok(Some((page_index, dest_type)))
+                                }
+                                _ => Ok(None),
+                            }
+                        }
+                        _ => Ok(None),
+                    }
+                }
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Gets the page labels dictionary from the document catalog.
+    ///
+    /// Page labels allow custom page numbering (e.g., Roman numerals for front matter).
+    ///
+    /// # Returns
+    /// `Some(PDFObject)` with the page labels number tree, or `None` if not present.
+    pub fn page_labels(&mut self) -> PDFResult<Option<PDFObject>> {
+        let catalog = match self.catalog().cloned() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        if let PDFObject::Dictionary(cat_dict) = catalog {
+            match cat_dict.get("PageLabels") {
+                Some(labels_ref) => {
+                    let labels = self.xref.fetch_if_ref(labels_ref)?;
+                    Ok(Some(labels))
+                }
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Gets the page label for a specific page index.
+    ///
+    /// Page labels allow custom page numbering like "i", "ii", "iii" for front matter,
+    /// or "A-1", "A-2" for appendix pages.
+    ///
+    /// # Arguments
+    /// * `page_index` - The zero-based page index
+    ///
+    /// # Returns
+    /// The page label as a string, or the default page number (1-indexed) if no custom label
+    pub fn get_page_label(&mut self, page_index: usize) -> PDFResult<String> {
+        // Default to 1-indexed page number
+        let default_label = (page_index + 1).to_string();
+
+        let labels_obj = match self.page_labels()? {
+            Some(l) => l,
+            None => return Ok(default_label),
+        };
+
+        // PageLabels can be a number tree (dictionary with /Kids or /Nums)
+        // For now, we'll handle the simple dictionary case with /Nums array
+        if let PDFObject::Dictionary(labels_dict) = labels_obj {
+            if let Some(nums_obj) = labels_dict.get("Nums") {
+                let nums = match self.xref.fetch_if_ref(nums_obj)? {
+                    PDFObject::Array(arr) => arr,
+                    _ => return Ok(default_label),
+                };
+
+                // /Nums is an array of [start_page_1, label_dict_1, start_page_2, label_dict_2, ...]
+                // Find the label range that contains our page_index
+                let mut current_label = None;
+
+                let mut i = 0;
+                while i < nums.len() {
+                    if i + 1 >= nums.len() {
+                        break;
+                    }
+
+                    let start_page = match &*nums[i] {
+                        PDFObject::Number(n) => *n as usize,
+                        _ => {
+                            i += 2;
+                            continue;
+                        }
+                    };
+
+                    if start_page > page_index {
+                        // We've passed our page index, use the previous label
+                        break;
+                    }
+
+                    let label_dict = match &*nums[i + 1] {
+                        PDFObject::Dictionary(dict) => {
+                            // Use a reference to the dictionary
+                            dict
+                        }
+                        PDFObject::Ref { num, generation } => {
+                            match self.xref.fetch(*num, *generation) {
+                                Ok(obj) => match &*obj {
+                                    PDFObject::Dictionary(_) => {
+                                        // We need to convert from &HashMap<_, _, RandomState> to use
+                                        // For now, skip this complex case
+                                        i += 2;
+                                        continue;
+                                    }
+                                    _ => {
+                                        i += 2;
+                                        continue;
+                                    }
+                                },
+                                Err(_) => {
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {
+                            i += 2;
+                            continue;
+                        }
+                    };
+
+                    // Parse the label
+                    let prefix = match label_dict.get("P") {
+                        Some(PDFObject::String(bytes)) => {
+                            String::from_utf8_lossy(bytes).to_string()
+                        }
+                        Some(PDFObject::HexString(bytes)) => {
+                            String::from_utf8_lossy(bytes).to_string()
+                        }
+                        _ => String::new(),
+                    };
+
+                    let start_from = match label_dict.get("St") {
+                        Some(PDFObject::Number(n)) => *n as usize,
+                        _ => 1,
+                    };
+
+                    let numbering_style = match label_dict.get("S") {
+                        Some(PDFObject::Name(name)) => name.as_str(),
+                        _ => "D",
+                    };
+
+                    let page_number = start_from + (page_index - start_page);
+                    let number_label = match numbering_style {
+                        "D" => page_number.to_string(),
+                        "R" => to_roman_numeral(page_number),
+                        "r" => to_roman_numeral(page_number).to_lowercase(),
+                        "A" => to_alpha_label(page_number - 1),
+                        "a" => to_alpha_label(page_number - 1).to_lowercase(),
+                        _ => page_number.to_string(),
+                    };
+
+                    current_label = Some(format!("{}{}", prefix, number_label));
+                    i += 2;
+                }
+
+                if let Some(label) = current_label {
+                    return Ok(label);
+                }
+            }
+        }
+
+        Ok(default_label)
+    }
+}
+
+/// Converts a number to a Roman numeral.
+fn to_roman_numeral(mut num: usize) -> String {
+    if num == 0 {
+        return String::new();
+    }
+    if num > 3999 {
+        return num.to_string(); // Too large for Roman numerals
+    }
+
+    let values = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+
+    let mut result = String::new();
+
+    for (value, name) in values.iter() {
+        while num >= *value {
+            result.push_str(name);
+            num -= *value;
+        }
+        if num == 0 {
+            break;
+        }
+    }
+
+    result
+}
+
+/// Converts a number to an alphabetic label (A, B, ..., Z, AA, AB, ...).
+fn to_alpha_label(mut num: usize) -> String {
+    if num == 0 {
+        return "A".to_string();
+    }
+
+    let mut result = Vec::new();
+
+    while num > 0 {
+        num -= 1; // Convert to 0-indexed
+        result.push(((b'A' as usize) + (num % 26)) as u8 as char);
+        num /= 26;
+    }
+
+    result.reverse();
+    result.into_iter().collect()
 }
 
 #[cfg(test)]
