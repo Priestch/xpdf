@@ -15,6 +15,8 @@ pub struct DocumentMetadata {
     pub file_size: u64,
     pub pdf_version: String,
     pub is_linearized: bool,
+    pub is_encrypted: bool,
+    pub requires_password: bool,
 }
 
 /// Outline item (bookmark)

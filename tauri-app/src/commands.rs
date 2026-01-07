@@ -28,6 +28,10 @@ pub async fn open_pdf_file(
     let pdf_version = doc.pdf_version().unwrap_or_else(|_| "Unknown".to_string());
     let is_linearized = doc.is_linearized();
 
+    // Check encryption status
+    let is_encrypted = doc.is_encrypted();
+    let requires_password = is_encrypted; // If encrypted, password is required
+
     // Extract document info
     let (title, author, subject, keywords, creator, producer) = if let Ok(Some(info)) = doc.document_info() {
         extract_info_fields(&info)
@@ -54,6 +58,8 @@ pub async fn open_pdf_file(
         file_size,
         pdf_version,
         is_linearized,
+        is_encrypted,
+        requires_password,
     })
 }
 
@@ -63,6 +69,45 @@ pub fn close_document(state: State<'_, AppState>) -> Result<(), String> {
     let mut path_guard = state.inner().file_path.lock().unwrap();
     *path_guard = None;
     Ok(())
+}
+
+/// Extract text from a specific page
+#[tauri::command]
+pub async fn extract_text_from_page(
+    page_index: usize,
+    state: State<'_, AppState>,
+) -> Result<TextExtractionResult, String> {
+    // Get file path from state
+    let file_path = {
+        let path_guard = state.inner().file_path.lock().unwrap();
+        path_guard.as_ref().cloned()
+    };
+
+    let file_path = file_path.ok_or("No document loaded")?;
+
+    // Reload document
+    let mut doc = pdf_x_core::PDFDocument::open_file(&file_path, None, None)
+        .map_err(|e| e.to_string())?;
+
+    // Extract text items
+    let text_items = doc.extract_text_from_page(page_index)
+        .map_err(|e| e.to_string())?;
+
+    // Convert core TextItem to Tauri TextItem
+    let tauri_items = text_items.into_iter().map(|item| {
+        TextItem {
+            text: item.text,
+            font_name: item.font_name,
+            font_size: item.font_size,
+            x: item.position.map(|p| p.0).unwrap_or(0.0),
+            y: item.position.map(|p| p.1).unwrap_or(0.0),
+        }
+    }).collect();
+
+    Ok(TextExtractionResult {
+        page: page_index,
+        text_items: tauri_items,
+    })
 }
 
 /// Get document outline (bookmarks)

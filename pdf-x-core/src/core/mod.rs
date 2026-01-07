@@ -4,6 +4,7 @@ pub mod chunk_manager;
 pub mod cmap;
 pub mod content_stream;
 pub mod crypto;
+pub mod delta;
 pub mod decode;
 pub mod document;
 pub mod encryption;
@@ -38,6 +39,7 @@ pub use crypto::{
     calculate_md5, calculate_sha256, calculate_sha384, calculate_sha512, ARC4Cipher, AES128Cipher,
     AES256Cipher, PDF17, PDF20, PDFPasswordAlgorithm,
 };
+pub use delta::{Command, DeltaLayer, DeltaObject};
 pub use document::{LinearizedInfo, PDFDocument};
 pub use encryption::{
     EncryptDict, EncryptionAlgorithm, EncryptionVersion, PDFPermissions,
@@ -49,7 +51,7 @@ pub use image::{DecodedImage, ImageColorSpace, ImageDecoder, ImageExtraction, Im
 pub use lexer::{Lexer, Token};
 pub use outline::{DestinationType, OutlineDestination, OutlineItem};
 pub use page::{Page, PageTreeCache};
-pub use parser::{PDFObject, Parser};
+pub use parser::{PDFObject, Parser, Ref};
 pub use stream::Stream;
 pub use sub_stream::SubStream;
 pub use xref::{XRef, XRefEntry};

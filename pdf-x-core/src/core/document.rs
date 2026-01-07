@@ -377,8 +377,8 @@ impl PDFDocument {
         while let Some((current_node, node_ref)) = nodes_to_visit.pop() {
             // Handle references
             let (node_obj, obj_ref) = match &current_node {
-                PDFObject::Ref { num, generation } => {
-                    let ref_key = (*num, *generation);
+                PDFObject::Ref(ref_obj) => {
+                    let ref_key = (ref_obj.num, ref_obj.generation);
 
                     // Prevent circular references
                     if visited_refs.contains(&ref_key) {
@@ -389,7 +389,7 @@ impl PDFDocument {
                     visited_refs.insert(ref_key);
 
                     // Fetch the object
-                    let fetched = self.xref.fetch(*num, *generation)?;
+                    let fetched = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
                     let obj = (*fetched).clone();
                     (obj, Some(ref_key))
                 }
@@ -426,9 +426,9 @@ impl PDFDocument {
             // Get the kids array (either directly or by resolving a reference)
             let kids_array = match kids {
                 PDFObject::Array(arr) => arr.clone(),
-                PDFObject::Ref { num, generation } => {
+                PDFObject::Ref(ref_obj) => {
                     // Kids is a reference, fetch it
-                    let fetched = self.xref.fetch(*num, *generation)?;
+                    let fetched = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
                     match &*fetched {
                         PDFObject::Array(arr) => arr.clone(),
                         _ => {
@@ -500,8 +500,8 @@ impl PDFDocument {
         while let Some((current_node, node_ref)) = nodes_to_visit.pop() {
             // Handle references
             let (node_obj, obj_ref) = match &current_node {
-                PDFObject::Ref { num, generation } => {
-                    let ref_key = (*num, *generation);
+                PDFObject::Ref(ref_obj) => {
+                    let ref_key = (ref_obj.num, ref_obj.generation);
 
                     // Prevent circular references
                     if visited_refs.contains(&ref_key) {
@@ -512,7 +512,7 @@ impl PDFDocument {
                     visited_refs.insert(ref_key);
 
                     // Fetch the object
-                    let fetched = self.xref.fetch(*num, *generation)?;
+                    let fetched = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
                     let obj = (*fetched).clone();
                     (obj, Some(ref_key))
                 }
@@ -549,9 +549,9 @@ impl PDFDocument {
             // Get the kids array (either directly or by resolving a reference)
             let kids_array = match kids {
                 PDFObject::Array(arr) => arr.clone(),
-                PDFObject::Ref { num, generation } => {
+                PDFObject::Ref(ref_obj) => {
                     // Kids is a reference, fetch it
-                    let fetched = self.xref.fetch(*num, *generation)?;
+                    let fetched = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
                     match &*fetched {
                         PDFObject::Array(arr) => arr.clone(),
                         _ => {
@@ -617,6 +617,44 @@ impl PDFDocument {
         Ok(page)
     }
 
+    /// Extracts text from a specific page.
+    ///
+    /// # Arguments
+    /// * `page_index` - Zero-based page index
+    ///
+    /// # Returns
+    /// A vector of TextItem objects containing text content with position and font info
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x::core::PDFDocument;
+    ///
+    /// # let pdf_data = vec![];
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    /// let text_items = doc.extract_text_from_page(0).unwrap();
+    /// for item in text_items {
+    ///     println!("Text: {} at {:?}", item.text, item.position);
+    /// }
+    /// ```
+    pub fn extract_text_from_page(&mut self, page_index: usize) -> PDFResult<Vec<crate::core::content_stream::TextItem>> {
+        let page = self.get_page(page_index)?;
+        page.extract_text(&mut self.xref)
+    }
+
+    /// Extracts text from a page as a single string.
+    ///
+    /// This is a convenience method that joins all text items together.
+    ///
+    /// # Arguments
+    /// * `page_index` - Zero-based page index
+    ///
+    /// # Returns
+    /// The extracted text as a single string
+    pub fn extract_text_from_page_as_string(&mut self, page_index: usize) -> PDFResult<String> {
+        let page = self.get_page(page_index)?;
+        page.extract_text_as_string(&mut self.xref)
+    }
+
     /// Gets an inheritable property from a page dictionary.
     ///
     /// PDF pages can inherit certain properties from parent Pages nodes in the
@@ -668,8 +706,8 @@ impl PDFDocument {
 
             // Resolve parent if it's a reference
             match parent {
-                PDFObject::Ref { num, generation } => {
-                    let ref_key = (*num, *generation);
+                PDFObject::Ref(ref_obj) => {
+                    let ref_key = (ref_obj.num, ref_obj.generation);
 
                     // Prevent circular references
                     if visited_refs.contains(&ref_key) {
@@ -680,7 +718,7 @@ impl PDFDocument {
                     visited_refs.insert(ref_key);
 
                     // Fetch the parent dictionary
-                    let parent_obj = self.xref.fetch(*num, *generation)?;
+                    let parent_obj = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
                     current_dict = (*parent_obj).clone();
                 }
                 _ => {
@@ -1153,8 +1191,8 @@ impl PDFDocument {
 
                             // Resolve page reference to page index
                             let page_index = match &**page_ref {
-                                PDFObject::Ref { num, generation } => {
-                                    match self.resolve_page_index(*num, *generation) {
+                                PDFObject::Ref(ref_obj) => {
+                                    match self.resolve_page_index(ref_obj.num, ref_obj.generation) {
                                         Some(idx) => idx,
                                         None => return Ok(None),
                                     }
@@ -1179,9 +1217,9 @@ impl PDFDocument {
 
                             Ok(Some((page_index, dest_type)))
                         }
-                        PDFObject::Ref { num, generation } => {
+                        PDFObject::Ref(ref_obj) => {
                             // Fetch the referenced destination
-                            let resolved_dest = self.xref.fetch(num, generation)?;
+                            let resolved_dest = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
                             match &*resolved_dest {
                                 PDFObject::Array(arr) => {
                                     if arr.is_empty() {
@@ -1190,8 +1228,8 @@ impl PDFDocument {
 
                                     let page_ref = &arr[0];
                                     let page_index = match &**page_ref {
-                                        PDFObject::Ref { num, generation } => {
-                                            match self.resolve_page_index(*num, *generation) {
+                                        PDFObject::Ref(ref_obj) => {
+                                            match self.resolve_page_index(ref_obj.num, ref_obj.generation) {
                                                 Some(idx) => idx,
                                                 None => return Ok(None),
                                             }
@@ -1291,7 +1329,7 @@ impl PDFDocument {
                         break;
                     }
 
-                    let start_page = match &*nums[i] {
+                    let start_page = match nums[i].as_ref() {
                         PDFObject::Number(n) => *n as usize,
                         _ => {
                             i += 2;
@@ -1304,13 +1342,13 @@ impl PDFDocument {
                         break;
                     }
 
-                    let label_dict = match &*nums[i + 1] {
+                    let label_dict = match nums[i + 1].as_ref() {
                         PDFObject::Dictionary(dict) => {
                             // Use a reference to the dictionary
                             dict
                         }
-                        PDFObject::Ref { num, generation } => {
-                            match self.xref.fetch(*num, *generation) {
+                        PDFObject::Ref(ref_obj) => {
+                            match self.xref.fetch(ref_obj.num, ref_obj.generation) {
                                 Ok(obj) => match &*obj {
                                     PDFObject::Dictionary(_) => {
                                         // We need to convert from &HashMap<_, _, RandomState> to use

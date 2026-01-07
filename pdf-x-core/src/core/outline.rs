@@ -6,7 +6,7 @@
 //! Outlines provide a hierarchical table of contents for navigating PDF documents.
 
 use crate::core::error::{PDFError, PDFResult};
-use crate::core::parser::PDFObject;
+use crate::core::parser::{PDFObject, Ref};
 use crate::core::PDFDocument;
 use std::collections::{HashMap, HashSet};
 
@@ -274,7 +274,7 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
     // Get /First reference (first top-level outline item)
     let first_ref = match &outlines_obj {
         PDFObject::Dictionary(dict) => match dict.get("First") {
-            Some(PDFObject::Ref { num, generation }) => Some((*num, *generation)),
+            Some(PDFObject::Ref(ref_obj)) => Some((ref_obj.num, ref_obj.generation)),
             _ => None,
         },
         _ => None,
@@ -298,7 +298,7 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
         let (num, generation) = ref_num_gen;
 
         // Fetch the outline dictionary
-        let outline_dict = match doc.xref_mut().fetch_if_ref(&PDFObject::Ref { num, generation }) {
+        let outline_dict = match doc.xref_mut().fetch_if_ref(&PDFObject::Ref(Ref::new(num, generation))) {
             Ok(PDFObject::Dictionary(dict)) => dict,
             Ok(_) => continue, // Not a dictionary, skip
             Err(PDFError::DataMissing { .. }) => return Err(PDFError::DataMissing {
@@ -354,8 +354,8 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
         items[parent_idx].children.push(item_clone);
 
         // Add /First (children) to queue
-        if let Some(PDFObject::Ref { num, generation }) = outline_dict.get("First") {
-            let ref_tuple = (*num, *generation);
+        if let Some(PDFObject::Ref(ref_obj)) = outline_dict.get("First") {
+            let ref_tuple = (ref_obj.num, ref_obj.generation);
             if !visited.contains(&ref_tuple) {
                 visited.insert(ref_tuple);
                 queue.push((ref_tuple, item_idx));
@@ -363,8 +363,8 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
         }
 
         // Add /Next (siblings) to queue
-        if let Some(PDFObject::Ref { num, generation }) = outline_dict.get("Next") {
-            let ref_tuple = (*num, *generation);
+        if let Some(PDFObject::Ref(ref_obj)) = outline_dict.get("Next") {
+            let ref_tuple = (ref_obj.num, ref_obj.generation);
             if !visited.contains(&ref_tuple) {
                 visited.insert(ref_tuple);
                 queue.push((ref_tuple, parent_idx));
@@ -572,13 +572,13 @@ pub fn parse_destination_type(
 /// page indices from page object references.
 fn resolve_page_index(page_ref: &PDFObject, doc: &mut PDFDocument) -> PDFResult<usize> {
     match page_ref {
-        PDFObject::Ref { num, generation } => {
+        PDFObject::Ref(ref_obj) => {
             // Use the document's resolve_page_index method
-            doc.resolve_page_index(*num, *generation)
+            doc.resolve_page_index(ref_obj.num, ref_obj.generation)
                 .ok_or_else(|| {
                     PDFError::Generic(format!(
                         "Page reference {} {} not found in document",
-                        num, generation
+                        ref_obj.num, ref_obj.generation
                     ))
                 })
         }

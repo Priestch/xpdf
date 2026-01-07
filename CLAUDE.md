@@ -4,9 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PDF-X is a Rust port of Mozilla's PDF.js library. The goal is to replicate PDF.js's proven architecture and progressive/lazy loading features while leveraging Rust's performance and memory safety.
+PDF-X is a Rust port of Mozilla's PDF.js library with a hybrid viewer-editor architecture. The goal is to replicate PDF.js's proven architecture and progressive/lazy loading features while leveraging Rust's performance and memory safety, plus add editing capabilities through a delta-based modification layer.
 
-**Key Design Principle**: Maintain architectural fidelity to PDF.js while implementing idiomatic Rust.
+**Key Design Principles**:
+- Maintain architectural fidelity to PDF.js while implementing idiomatic Rust
+- **Hybrid Architecture**: Immutable progressive viewer + mutable delta layer for editing
+- Preserve the viewer's performance (lazy loading, low memory) while enabling document modifications
 
 ## PDF.js Reference Submodule
 
@@ -28,7 +31,9 @@ The `pdf.js/` directory contains the original PDF.js codebase as a git submodule
 
 ## Architecture Layers
 
-The implementation follows a four-layer architecture:
+The implementation follows a **five-layer hybrid architecture** that combines an efficient viewer with a lightweight editing layer:
+
+### Viewer Core (Immutable, Progressive)
 
 1. **Data Source Layer**: Abstract chunked data loading from multiple sources
    - Provides uniform chunk-based interface regardless of source
@@ -42,16 +47,41 @@ The implementation follows a four-layer architecture:
    - Cross-reference (xref) table processing
    - Handle linearized PDFs for fast first-page display
    - Source-agnostic: works with any data source loader
+   - **Immutable by design**: Never modifies the base PDF
 
 3. **Document Structure Layer**: Page tree and metadata management
    - Build page tree without loading all pages
    - Catalog and metadata extraction
    - Resource dictionaries
+   - Lazy page object resolution
 
 4. **Rendering Layer**: Content stream interpretation
    - On-demand page rendering
    - Graphics state management
    - Text and image extraction
+
+### Editor Layer (Mutable, Delta-Based)
+
+5. **Delta Layer**: Document modification tracking
+   - **Modified objects**: Overrides for specific PDF objects (by object number)
+   - **New objects**: Annotations, added pages, form field values
+   - **Deletion markers**: Pages or objects marked for removal
+   - **Command history**: Stack of reversible operations for undo/redo
+   - **Incremental serialization**: Writes changes as PDF incremental updates
+
+**Key Insight**: The viewer layers (1-4) remain completely unchanged and read-only. The delta layer (5) sits on top, intercepting object requests and applying modifications before rendering.
+
+```
+User/Editor Interface
+        ↓
+   Delta Layer (modifications, command history)
+        ↓ merges with
+   Rendering Engine (applies delta to base objects)
+        ↓
+   Document/Parser Layers (immutable base PDF)
+        ↓
+   Data Source Layer (progressive, chunked loading)
+```
 
 ## Development Commands
 
@@ -194,27 +224,255 @@ This rule exists to enable:
 
 If a feature cannot be implemented with progressive loading, it should be redesigned or deferred. **External crates are valuable for learning algorithms and patterns, but the core parsing infrastructure must support progressive loading.**
 
+## Delta Layer Architecture
+
+The **Delta Layer** is PDF-X's innovation that enables editing capabilities without sacrificing the viewer's performance. It implements a **command pattern** with **incremental updates** to track and persist document changes.
+
+### Core Design Principles
+
+1. **Immutable Base, Mutable Delta**: The base PDF loaded by the viewer is never modified. All changes are tracked in a separate delta structure.
+2. **Override Resolution**: When requesting an object, check delta first (modifications override base), then fall back to viewer.
+3. **Command Pattern**: All edits are executed as reversible commands, enabling natural undo/redo.
+4. **Incremental Persistence**: Changes are saved as PDF incremental updates (appended to original file, per PDF specification).
+
+### Delta Layer Structure
+
+```rust
+pub struct DeltaLayer {
+    // Object modifications: object_number -> replacement object
+    modified_objects: HashMap<ObjectId, PDFObject>,
+
+    // New objects added to the document (annotations, pages, etc.)
+    new_objects: Vec<PDFObject>,
+
+    // Objects/pages marked for deletion
+    deleted_objects: HashSet<ObjectId>,
+
+    // Command history for undo/redo
+    command_history: Vec<Box<dyn Command>>,
+    undo_stack: Vec<Box<dyn Command>>,
+}
+
+// All edits are reversible commands
+pub trait Command {
+    fn execute(&mut self, delta: &mut DeltaLayer) -> Result<(), PDFError>;
+    fn undo(&mut self, delta: &mut DeltaLayer) -> Result<(), PDFError>;
+    fn redo(&mut self, delta: &mut DeltaLayer) -> Result<(), PDFError>;
+}
+```
+
+### Object Resolution with Deltas
+
+The rendering engine queries objects through a resolution function that merges base and delta:
+
+```rust
+fn resolve_object(object_number: ObjectId) -> Result<PDFObject, PDFError> {
+    // 1. Check delta layer first (modifications override base)
+    if let Some(obj) = delta_layer.get_modified(object_number) {
+        return Ok(obj.clone());
+    }
+
+    // 2. Check if deleted
+    if delta_layer.is_deleted(object_number) {
+        return Err(PDFError::ObjectDeleted(object_number));
+    }
+
+    // 3. Fall back to base PDF (progressive loading)
+    viewer.get_object(object_number)  // Existing viewer code
+}
+```
+
+### Supported Edit Operations
+
+The delta layer enables these common PDF operations:
+
+**Easy (Low-Hanging Fruit)**:
+- ✅ **Annotations**: Highlight, text markup, sticky notes, freehand drawing
+- ✅ **Page operations**: Rotation, deletion, reordering (small delta)
+- ✅ **Form filling**: Store field values, checkboxes, signatures
+- ✅ **Document merging**: Copy page objects + update catalog
+- ✅ **Metadata editing**: Modify document info, properties
+
+**Moderate Complexity**:
+- ⚠️ **Text overlay**: Add new text on top of existing content (easy)
+- ⚠️ **Image replacement**: Swap content object references
+- ⚠️ **Redaction**: Overlay black rectangles + delete underlying text objects
+- ⚠️ **Content stream modification**: Edit page graphics operations
+
+**Hard (Significant Challenge)**:
+- ❌ **True text editing**: Reposition characters, reflow paragraphs
+  - PDF stores character positions absolutely, not as flowing text
+  - Requires implementing a text layout engine
+  - Many commercial PDF editors avoid this or use crude workarounds
+
+### Saving Changes
+
+The delta layer supports two save strategies:
+
+**1. Incremental Update (Recommended)**
+```rust
+fn save_incremental() -> Result<(), PDFError> {
+    // Append changes to end of original PDF
+    // - New xref table
+    // - Modified/new objects
+    // - Original data untouched
+    pdf_writer.append_incremental_update(&delta_layer)?;
+}
+```
+- ✅ Fast (only writes delta)
+- ✅ Preserves original file
+- ✅ PDF specification compliant
+- ❌ File grows with each save
+
+**2. Full Rewrite (Compact)**
+```rust
+fn save_compact() -> Result<(), PDFError> {
+    // Rewrite entire PDF with changes applied
+    // - Removes deleted objects
+    // - Compacts file size
+    // - Single xref table
+    pdf_writer.rewrite_pdf(&viewer, &delta_layer)?;
+}
+```
+- ✅ Produces clean, compact file
+- ❌ Slower (rewrites everything)
+- ❌ Loses incremental history
+
+### Example: Adding an Annotation
+
+```rust
+// User adds a highlight annotation on page 5
+let command = AddAnnotationCommand {
+    page_number: 5,
+    annotation: Annotation::highlight(100, 200, 300, 50, Color::Yellow),
+};
+
+// Execute command
+command.execute(&mut delta_layer)?;
+
+// Delta layer now contains:
+// 1. New annotation object (e.g., 123 0 obj)
+// 2. Modified page object: /Annots [ ... 123 0 R ]
+// 3. Command in history for undo
+
+// When rendering page 5:
+let base_page = viewer.load_page(5)?;  // Progressive load
+let modified_page = delta_layer.apply_to_page(base_page)?;
+renderer.render(modified_page);
+
+// User can undo
+command.undo(&mut delta_layer)?;
+```
+
+### Advantages Over Traditional Editor
+
+| Aspect | Traditional Editor | PDF-X Hybrid |
+|--------|-------------------|--------------|
+| **Startup time** | Slow (parse all) | Fast (progressive) |
+| **Memory usage** | High (all objects) | Low (viewed pages + delta) |
+| **Save time** | Slow (serialize all) | Fast (append delta) |
+| **Undo/redo** | Complex object tracking | Natural command pattern |
+| **Progressive loading** | ❌ Not possible | ✅ Maintained |
+| **Network efficiency** | ❌ Full download | ✅ Range requests |
+
+### Collaboration Potential
+
+The delta layer architecture naturally supports collaborative editing:
+
+- Deltas can be serialized independently from base PDF
+- Multiple users' changes can be merged (like Git branches)
+- Conflict resolution for overlapping edits
+- Operational transformation or CRDT patterns applicable
+
+### Implementation Roadmap
+
+**Phase 1: Delta Foundation**
+- Core `DeltaLayer` struct with modification tracking
+- Object resolution with override logic
+- Basic serialization to incremental PDF format
+
+**Phase 2: Command Infrastructure**
+- Command trait and common commands
+- Undo/redo stacks
+- Command history serialization
+
+**Phase 3: Editing Operations**
+- Annotation commands (highlight, note, drawing)
+- Page manipulation (rotate, delete, reorder)
+- Form field value storage
+
+**Phase 4: Advanced Operations**
+- Content stream modification
+- Image replacement
+- Redaction tools
+
+**Phase 5: Collaboration** (Future)
+- Delta serialization format
+- Merge algorithms
+- Conflict resolution
+
+
+
 ## Current Project Status
 
-This is an **early-stage project**. No Rust implementation exists yet. When developing:
+The project has **core viewer infrastructure** implemented with progressive loading support. Current capabilities include:
 
-- Start with core parser infrastructure (streams, lexer, object parser)
-- Design the Data Source abstraction layer first (trait for chunk-based loading)
-- Implement filesystem loader before network loader (simpler, easier to test)
-- Implement progressive loading from the beginning, not as an afterthought
+**Implemented**:
+- ✅ Core PDF parsing (document structure, xref, objects)
+- ✅ Encryption/decryption support
+- ✅ Basic annotation parsing
+- ✅ Outline (bookmark) extraction with page indices
+- ✅ Inspector GUI for document exploration
+- ✅ Tauri-based desktop application framework
+
+**In Development**:
+- 🔄 Complete progressive/lazy loading (exception-driven data fetching)
+- 🔄 Content stream parsing and rendering
+- 🔄 Text extraction and search
+- 🔄 Delta layer foundation (next major milestone)
+
+**Priorities**:
+
+1. **Complete Viewer Core**: Finish progressive rendering pipeline
+   - Content stream interpretation (graphics operators)
+   - Font and image handling
+   - Text extraction for search
+
+2. **Delta Layer Foundation**: Begin hybrid architecture implementation
+   - Core `DeltaLayer` struct with modification tracking
+   - Object resolution with override logic
+   - Basic incremental PDF writer
+   - Command pattern infrastructure
+
+3. **Initial Editing Features**: Low-hanging fruit for delta layer
+   - Annotation rendering and creation
+   - Page rotation
+   - Form field display and filling
+
+**Development Guidelines**:
 - Reference PDF.js implementations before writing new components
 - Follow Rust idioms (no direct translation of JavaScript patterns)
+- Maintain strict separation: viewer core remains immutable, all mutations through delta layer
+- Test progressive loading with network resources (not just local files)
+- Incremental updates should be the default save mechanism
 
 ## Key PDF Concepts
 
 - **Cross-reference (xref) table**: Index mapping object numbers to byte offsets in file
 - **Incremental updates**: PDFs can have multiple xref sections (append-only updates)
+  - **Critical for delta layer**: Changes can be appended to original file without rewriting it
+  - New xref table points to modified objects and original unchanged objects
+  - Enables fast saves and preserves original document data
 - **Page tree**: Hierarchical structure storing pages (not always flat array)
 - **Content streams**: Compressed instruction streams defining page graphics
 - **Linearized PDF**: Reorganized PDF with hint tables for progressive display
+- **Object graph**: PDF objects can reference each other (direct and indirect references)
+  - Delta layer must track and update these references when objects are modified
 
 ## Reference Documentation
 
 - PDF 1.7 Specification (ISO 32000-1): Official PDF format specification
+  - **Section 7.5.6**: Incremental Updates (crucial for delta layer persistence)
 - PDF.js source code in `pdf.js/` submodule: Working reference implementation
 - [pdf-rs](https://github.com/pdf-rs/pdf): Existing Rust PDF library for patterns
+

@@ -1026,4 +1026,65 @@ mod tests {
         let wrong_result = encrypt_dict2.derive_encryption_key_with_file_id(b"wrongpassword", &file_id);
         assert!(!wrong_result, "Wrong password should fail for R=2");
     }
+
+    /// Test R=3 (RC4-128 with 50 MD5 iterations, 19 XOR iterations) password verification
+    #[test]
+    fn test_r3_password_verification() {
+        use crate::core::crypto::calculate_md5;
+
+        // For R=3, key length is 16 bytes (128-bit RC4) with 50 MD5 iterations
+        let password = b""; // Empty password for simplicity
+        let o = [0u8; 32];
+        let p: u32 = 0xFFFFFFFC;
+        let file_id = [0u8; 16];
+        let r = 3;
+        let key_length = 16;
+
+        // Compute encryption key with 50 MD5 iterations
+        let padded = pad_password(password);
+        let mut hash_data = Vec::new();
+        hash_data.extend_from_slice(&padded);
+        hash_data.extend_from_slice(&o);
+        hash_data.extend_from_slice(&p.to_le_bytes());
+        hash_data.extend_from_slice(&file_id);
+
+        // MD5 hash
+        let mut hash = calculate_md5(&hash_data).to_vec();
+
+        // 50 iterations for R=3
+        for _ in 0..50 {
+            hash = calculate_md5(&hash).to_vec();
+        }
+
+        let key = &hash[..key_length];
+
+        // Now compute U with 19 XOR iterations
+        let mut check_data = DEFAULT_PASSWORD_PAD.to_vec();
+        for i in (0..=19).rev() {
+            let mut derived_key = key.to_vec();
+            for byte in derived_key.iter_mut() {
+                *byte ^= i as u8;
+            }
+            let mut cipher = ARC4Cipher::new(&derived_key);
+            check_data = cipher.encrypt_block(&check_data);
+        }
+
+        // Test with our implementation
+        let mut encrypt_dict = EncryptDict {
+            filter: "Standard".to_string(),
+            version: 2,
+            revision: r,
+            o: o.to_vec(),
+            u: check_data.clone(),
+            oe: None,
+            ue: None,
+            permissions: PDFPermissions::from_p_value(p),
+            encrypt_metadata: true,
+            encryption_key: None,
+        };
+
+        let result = encrypt_dict.derive_encryption_key_with_file_id(password, &file_id);
+        assert!(result, "Empty password should work for R=3");
+        assert!(encrypt_dict.encryption_key.is_some());
+    }
 }

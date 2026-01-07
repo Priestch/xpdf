@@ -538,9 +538,9 @@ impl ContentStreamEvaluator {
 
         let font_dict = match resources_dict.get("Font") {
             Some(PDFObject::Dictionary(d)) => d.clone(),
-            Some(PDFObject::Ref { num, generation }) => {
+            Some(PDFObject::Ref(ref_obj)) => {
                 // Dereference the font dictionary
-                let font_obj = xref.fetch(*num, *generation)?;
+                let font_obj = xref.fetch(ref_obj.num, ref_obj.generation)?;
                 match &*font_obj {
                     PDFObject::Dictionary(d) => d.clone(),
                     _ => return Ok(()), // Not a dictionary

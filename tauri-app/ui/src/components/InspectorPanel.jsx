@@ -55,8 +55,18 @@ function InspectorPanel({ documentLoaded, metadata: externalMetadata }) {
     try {
       setIsLoading(true);
       setError(null);
-      // TODO: Implement text extraction command
-      setText('Text extraction not yet implemented');
+
+      // Extract text from page 0 (first page)
+      const result = await invoke('extract_text_from_page', { pageIndex: 0 });
+
+      // Format text items for display
+      const formattedText = result.text_items.map(item => {
+        const posInfo = item.x !== 0 || item.y !== 0 ? ` [${item.x.toFixed(1)}, ${item.y.toFixed(1)}]` : '';
+        const fontInfo = item.font_size ? ` (${item.font_size.toFixed(1)}pt)` : '';
+        return item.text + posInfo + fontInfo;
+      }).join('\n');
+
+      setText(formattedText || 'No text found on this page');
     } catch (err) {
       console.error('Failed to extract text:', err);
       setError(err.toString());
@@ -148,6 +158,14 @@ function InspectorPanel({ documentLoaded, metadata: externalMetadata }) {
                 <div className="metadata-item">
                   <span className="label">Linearized:</span>
                   <span className="value">{metadata.is_linearized ? 'Yes' : 'No'}</span>
+                </div>
+                <div className="metadata-item">
+                  <span className="label">Encrypted:</span>
+                  <span className="value">
+                    {metadata.is_encrypted ?
+                      (metadata.requires_password ? '🔒 Yes (Password Required)' : '🔒 Yes') :
+                      'No'}
+                  </span>
                 </div>
                 {metadata.creator && (
                   <div className="metadata-item">

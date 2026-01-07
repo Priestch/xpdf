@@ -695,8 +695,8 @@ impl Page {
     /// Note: This is a simplified implementation that requires document context.
     pub fn fetch_if_ref(&self, obj: &PDFObject, xref: &mut super::xref::XRef) -> PDFResult<PDFObject> {
         match obj {
-            PDFObject::Ref { num, generation } => {
-                match xref.fetch(*num, *generation)? {
+            PDFObject::Ref(ref_obj) => {
+                match xref.fetch(ref_obj.num, ref_obj.generation)? {
                     rc_obj => Ok((*rc_obj).clone()),
                 }
             }

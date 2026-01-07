@@ -414,8 +414,8 @@ pub fn parse_annotations(
     // Resolve the Annots array
     let annots_array = match annots_obj {
         PDFObject::Array(arr) => arr.clone(),
-        PDFObject::Ref { num, generation } => {
-            let fetched = xref.fetch(*num, *generation)?;
+        PDFObject::Ref(ref_obj) => {
+            let fetched = xref.fetch(ref_obj.num, ref_obj.generation)?;
             match &*fetched {
                 PDFObject::Array(arr) => arr.clone(),
                 _ => return Ok(Vec::new()),
@@ -429,8 +429,8 @@ pub fn parse_annotations(
 
     for annot_ref in annots_array.iter() {
         let annot_dict = match &**annot_ref {
-            PDFObject::Ref { num, generation } => {
-                let ref_key = (*num, *generation);
+            PDFObject::Ref(ref_obj) => {
+                let ref_key = (ref_obj.num, ref_obj.generation);
 
                 // Prevent circular references
                 if visited_refs.contains(&ref_key) {
@@ -438,7 +438,7 @@ pub fn parse_annotations(
                 }
                 visited_refs.insert(ref_key);
 
-                let fetched = xref.fetch(*num, *generation)?;
+                let fetched = xref.fetch(ref_obj.num, ref_obj.generation)?;
                 match &*fetched {
                     PDFObject::Dictionary(dict) => dict.clone(),
                     _ => continue,
@@ -670,7 +670,7 @@ fn parse_annotation_data(
             };
 
             let parent_ref = match dict.get("Parent") {
-                Some(PDFObject::Ref { num, generation }) => Some((*num, *generation)),
+                Some(PDFObject::Ref(ref_obj)) => Some((ref_obj.num, ref_obj.generation)),
                 _ => None,
             };
 

@@ -3,6 +3,45 @@ use super::lexer::{Lexer, Token};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
+/// Indirect object reference in a PDF document.
+///
+/// PDF objects can be referenced indirectly using object and generation numbers.
+/// This is represented in PDF files as "N G R" (e.g., "5 0 R").
+///
+/// # Example
+/// ```
+/// use pdf_x_core::core::parser::Ref;
+///
+/// let ref1 = Ref { num: 5, generation: 0 };
+/// let ref2 = Ref::new(10, 0);  // Object 10, generation 0
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ref {
+    /// Object number
+    pub num: u32,
+
+    /// Generation number (0 for new objects, incremented for updates)
+    pub generation: u32,
+}
+
+impl Ref {
+    /// Create a new object reference.
+    ///
+    /// # Arguments
+    /// * `num` - Object number
+    /// * `generation` - Generation number
+    #[inline]
+    pub const fn new(num: u32, generation: u32) -> Self {
+        Self { num, generation }
+    }
+
+    /// Get the object ID as a tuple (for HashMap keys).
+    #[inline]
+    pub const fn as_id(self) -> (u32, u32) {
+        (self.num, self.generation)
+    }
+}
+
 /// PDF object types as defined in the PDF specification.
 ///
 /// This represents the complete set of PDF primitive objects that can appear
@@ -43,7 +82,7 @@ pub enum PDFObject {
     },
 
     /// Indirect object reference (like "5 0 R")
-    Ref { num: u32, generation: u32 },
+    Ref(Ref),
 
     /// End of file marker
     EOF,
@@ -238,7 +277,7 @@ impl Parser {
                             self.shift()?; // Consume generation number
                             self.shift()?; // Consume 'R'
 
-                            return Ok(PDFObject::Ref { num, generation });
+                            return Ok(PDFObject::Ref(Ref { num, generation }));
                         }
                     }
                 }
@@ -464,10 +503,10 @@ impl Parser {
             .get("Length")
             .and_then(|obj| match obj {
                 PDFObject::Number(n) => Some(*n as usize),
-                PDFObject::Ref { num, generation } => {
+                PDFObject::Ref(ref_obj) => {
                     // Length is an indirect reference - try to resolve it if we have a resolver
                     if let Some(ref resolver) = self.ref_resolver {
-                        match resolver(*num, *generation) {
+                        match resolver(ref_obj.num, ref_obj.generation) {
                             Ok(resolved) => match resolved {
                                 PDFObject::Number(n) => Some(n as usize),
                                 _ => {
@@ -476,7 +515,7 @@ impl Parser {
                                 }
                             },
                             Err(e) => {
-                                eprintln!("Warning: Failed to resolve /Length reference {} {} R: {:?}, scanning for endstream", num, generation, e);
+                                eprintln!("Warning: Failed to resolve /Length reference {} {} R: {:?}, scanning for endstream", ref_obj.num, ref_obj.generation, e);
                                 None
                             }
                         }
@@ -720,13 +759,13 @@ mod tests {
     #[test]
     fn test_parse_indirect_reference() {
         let obj = parse_string("5 0 R").unwrap();
-        assert_eq!(obj, PDFObject::Ref { num: 5, generation: 0 });
+        assert_eq!(obj, PDFObject::Ref(Ref { num: 5, generation: 0 }));
     }
 
     #[test]
     fn test_parse_indirect_reference_with_generation() {
         let obj = parse_string("10 2 R").unwrap();
-        assert_eq!(obj, PDFObject::Ref { num: 10, generation: 2 });
+        assert_eq!(obj, PDFObject::Ref(Ref { num: 10, generation: 2 }));
     }
 
     #[test]
@@ -735,8 +774,8 @@ mod tests {
         assert_eq!(
             obj,
             PDFObject::Array(smallvec![
-                Box::new(PDFObject::Ref { num: 5, generation: 0 }),
-                Box::new(PDFObject::Ref { num: 10, generation: 2 }),
+                Box::new(PDFObject::Ref(Ref { num: 5, generation: 0 })),
+                Box::new(PDFObject::Ref(Ref { num: 10, generation: 2 })),
             ])
         );
     }
@@ -751,7 +790,7 @@ mod tests {
 
         assert_eq!(
             dict.get("Parent"),
-            Some(&PDFObject::Ref { num: 5, generation: 0 })
+            Some(&PDFObject::Ref(Ref { num: 5, generation: 0 }))
         );
     }
 
@@ -785,7 +824,7 @@ mod tests {
         };
         assert_eq!(
             resources.get("Font"),
-            Some(&PDFObject::Ref { num: 7, generation: 0 })
+            Some(&PDFObject::Ref(Ref { num: 7, generation: 0 }))
         );
     }
 

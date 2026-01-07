@@ -2,7 +2,7 @@ use super::base_stream::BaseStream;
 use super::decode;
 use super::error::{PDFError, PDFResult};
 use super::lexer::Lexer;
-use super::parser::{PDFObject, Parser};
+use super::parser::{PDFObject, Parser, Ref};
 use super::stream::Stream;
 use lru::LruCache;
 use std::collections::HashMap;  // Still needed for String keys in dictionaries
@@ -233,12 +233,12 @@ impl XRef {
                             let prev_pos = *n as usize;
                             xref_queue.push(prev_pos);
                         }
-                        PDFObject::Ref { num, .. } => {
+                        PDFObject::Ref(ref_obj) => {
                             // Non-compliant PDFs might use a reference for /Prev
                             // The spec says it should be a direct number
                             // We'll try to handle it anyway by using the object number as position
                             // This is a heuristic and may not always work
-                            xref_queue.push(*num as usize);
+                            xref_queue.push(ref_obj.num as usize);
                         }
                         _ => {
                             // Invalid /Prev entry, ignore it
@@ -977,8 +977,8 @@ impl XRef {
     /// Use `fetch()` directly if you want an Rc to avoid the clone.
     pub fn fetch_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
         match obj {
-            PDFObject::Ref { num, generation } => {
-                let rc_obj = self.fetch(*num, *generation)?;
+            PDFObject::Ref(ref_obj) => {
+                let rc_obj = self.fetch(ref_obj.num, ref_obj.generation)?;
                 Ok((*rc_obj).clone())
             }
             _ => Ok(obj.clone()),
@@ -1016,7 +1016,7 @@ impl XRef {
 
         // Fetch and dereference the Rc
         let rc_catalog = match &root_ref {
-            PDFObject::Ref { num, generation } => self.fetch(*num, *generation)?,
+            PDFObject::Ref(ref_obj) => self.fetch(ref_obj.num, ref_obj.generation)?,
             _ => return Ok(root_ref),
         };
 
@@ -1282,10 +1282,7 @@ mod tests {
         xref.parse().unwrap();
 
         // Test with a reference
-        let ref_obj = PDFObject::Ref {
-            num: 1,
-            generation: 0,
-        };
+        let ref_obj = PDFObject::Ref(Ref::new(1, 0));
         let result = xref.fetch_if_ref(&ref_obj).unwrap();
         assert_eq!(result, PDFObject::Number(42.0));
 
