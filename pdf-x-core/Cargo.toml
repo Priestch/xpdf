@@ -29,6 +29,9 @@ image = { workspace = true, optional = true }
 hayro-jpeg2000 = { path = "../hayro/hayro-jpeg2000", optional = true, default-features = false }
 hayro-jbig2 = { path = "../hayro/hayro-jbig2", optional = true, default-features = false }
 
+# Rendering (optional for now, will become default later)
+tiny-skia = { version = "0.11", optional = true }
+
 [features]
 default = ["jpeg-decoding"]
 jpeg-decoding = ["zune-jpeg"]
@@ -36,6 +39,7 @@ png-decoding = ["image"]
 advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
 async = ["reqwest", "tokio"]
 crypto = ["sha2"]  # AES implementation is now built-in, only SHA-2 is external
+rendering = ["tiny-skia"]  # Canvas rendering support
 
 [dev-dependencies]
 tempfile = "3.14"

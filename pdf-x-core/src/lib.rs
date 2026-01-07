@@ -100,6 +100,7 @@
 //! For more detailed examples and advanced usage, see the examples directory.
 
 pub mod core;
+pub mod rendering;
 
 // Re-export main types for convenience
 pub use core::{
@@ -110,6 +111,9 @@ pub use core::{
     PDFObject, Parser, PopupAnnotation, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation,
     XRef, XRefEntry,
 };
+
+// Re-export rendering types
+pub use rendering::{Device, GraphicsState, Paint, Path, PathBuilder, PathDrawMode, RenderingContext};
 
 // Re-export decode module
 pub use core::decode;
