@@ -31,6 +31,8 @@ hayro-jbig2 = { path = "../hayro/hayro-jbig2", optional = true, default-features
 
 # Rendering (optional for now, will become default later)
 tiny-skia = { version = "0.11", optional = true }
+rustybuzz = { version = "0.20", optional = true }
+ttf-parser = { version = "0.25", optional = true }
 
 [features]
 default = ["jpeg-decoding"]
@@ -39,7 +41,7 @@ png-decoding = ["image"]
 advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
 async = ["reqwest", "tokio"]
 crypto = ["sha2"]  # AES implementation is now built-in, only SHA-2 is external
-rendering = ["tiny-skia"]  # Canvas rendering support
+rendering = ["tiny-skia", "rustybuzz", "ttf-parser"]  # Canvas rendering support
 
 [dev-dependencies]
 tempfile = "3.14"
@@ -48,3 +50,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "parsing"
 harness = false
+
+[[test]]
+name = "rendering_tests"
+path = "tests/rendering_tests.rs"
+required-features = ["rendering"]

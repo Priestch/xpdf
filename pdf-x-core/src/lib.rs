@@ -115,6 +115,9 @@ pub use core::{
 // Re-export rendering types
 pub use rendering::{Device, GraphicsState, Paint, Path, PathBuilder, PathDrawMode, RenderingContext};
 
+#[cfg(feature = "rendering")]
+pub use rendering::SkiaDevice;
+
 // Re-export decode module
 pub use core::decode;
 

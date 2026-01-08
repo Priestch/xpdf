@@ -111,6 +111,70 @@ impl Color {
     pub fn blue() -> Self {
         Color::RGB(0.0, 0.0, 1.0)
     }
+
+    /// Create an RGB color from u8 values (0-255).
+    ///
+    /// This is a convenience method for creating colors with byte values
+    /// instead of normalized floats.
+    pub fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Color::RGB(
+            r as f64 / 255.0,
+            g as f64 / 255.0,
+            b as f64 / 255.0,
+        )
+    }
+
+    /// Get RGBA components as u8 values.
+    ///
+    /// Returns (r, g, b, a) where each component is 0-255.
+    pub fn rgba(&self) -> (u8, u8, u8, u8) {
+        match self {
+            Color::Gray(g) => {
+                let v = (g.clamp(0.0, 1.0) * 255.0) as u8;
+                (v, v, v, 255)
+            }
+            Color::RGB(r, g, b) => (
+                (r.clamp(0.0, 1.0) * 255.0) as u8,
+                (g.clamp(0.0, 1.0) * 255.0) as u8,
+                (b.clamp(0.0, 1.0) * 255.0) as u8,
+                255,
+            ),
+            Color::CMYK(c, m, y, k) => {
+                // Convert CMYK to RGB
+                let c = 1.0 - c.clamp(0.0, 1.0);
+                let m = 1.0 - m.clamp(0.0, 1.0);
+                let y = 1.0 - y.clamp(0.0, 1.0);
+                let k = 1.0 - k.clamp(0.0, 1.0);
+
+                (
+                    (c * k * 255.0) as u8,
+                    (m * k * 255.0) as u8,
+                    (y * k * 255.0) as u8,
+                    255,
+                )
+            }
+        }
+    }
+
+    /// Get the red component as u8 (0-255).
+    pub fn r(&self) -> u8 {
+        self.rgba().0
+    }
+
+    /// Get the green component as u8 (0-255).
+    pub fn g(&self) -> u8 {
+        self.rgba().1
+    }
+
+    /// Get the blue component as u8 (0-255).
+    pub fn b(&self) -> u8 {
+        self.rgba().2
+    }
+
+    /// Get the alpha component as u8 (always 255 for now).
+    pub fn a(&self) -> u8 {
+        self.rgba().3
+    }
 }
 
 impl Default for Color {

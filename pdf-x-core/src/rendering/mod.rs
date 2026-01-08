@@ -19,3 +19,15 @@ pub use graphics_state::{
 };
 pub use context::RenderingContext;
 pub use path::{Path, PathBuilder, PathElement};
+
+#[cfg(feature = "rendering")]
+pub mod skia_device;
+
+#[cfg(feature = "rendering")]
+pub mod font;
+
+#[cfg(feature = "rendering")]
+pub use skia_device::SkiaDevice;
+
+#[cfg(feature = "rendering")]
+pub use font::Font;
