@@ -170,9 +170,11 @@ impl PDFDocument {
         let boxed_stream = Box::new(stream) as Box<dyn BaseStream>;
         let mut xref = XRef::new(boxed_stream);
 
-        // Position at xref table and parse
+        // Position at xref table and parse with progressive loading retry loop
         xref.set_stream_pos(startxref)?;
-        xref.parse()?;
+        crate::retry_on_data_missing!(xref.stream_mut(), {
+            xref.parse()
+        })?;
 
         // Load the catalog
         let catalog = Some(xref.catalog()?);

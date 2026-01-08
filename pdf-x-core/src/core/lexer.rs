@@ -85,10 +85,16 @@ impl Lexer {
     /// Reads the next character from the stream.
     ///
     /// Returns -1 on EOF.
+    /// For progressive loading, propagates DataMissing errors when chunks aren't loaded.
     fn read_char(stream: &mut Box<dyn BaseStream>) -> PDFResult<i32> {
         match stream.get_byte() {
             Ok(byte) => Ok(byte as i32),
             Err(PDFError::UnexpectedEndOfStream) => Ok(-1),
+            Err(e @ PDFError::DataMissing { .. }) => {
+                // DataMissing errors should propagate for progressive loading retry loops
+                // The caller (typically through Parser) will be wrapped in retry_on_data_missing!
+                Err(e)
+            }
             Err(e) => Err(e),
         }
     }
@@ -104,6 +110,10 @@ impl Lexer {
         match self.stream.peek_byte() {
             Ok(byte) => Ok(byte as i32),
             Err(PDFError::UnexpectedEndOfStream) => Ok(-1),
+            Err(e @ PDFError::DataMissing { .. }) => {
+                // DataMissing errors should propagate for progressive loading retry loops
+                Err(e)
+            }
             Err(e) => Err(e),
         }
     }

@@ -499,34 +499,41 @@ impl Parser {
         let _stream_start_pos = self.lexer.get_position();
 
         // Get the Length from the dictionary
-        let length = dict
-            .get("Length")
-            .and_then(|obj| match obj {
-                PDFObject::Number(n) => Some(*n as usize),
-                PDFObject::Ref(ref_obj) => {
-                    // Length is an indirect reference - try to resolve it if we have a resolver
-                    if let Some(ref resolver) = self.ref_resolver {
-                        match resolver(ref_obj.num, ref_obj.generation) {
-                            Ok(resolved) => match resolved {
-                                PDFObject::Number(n) => Some(n as usize),
-                                _ => {
-                                    eprintln!("Warning: Resolved /Length is not a number, scanning for endstream");
-                                    None
-                                }
-                            },
-                            Err(e) => {
-                                eprintln!("Warning: Failed to resolve /Length reference {} {} R: {:?}, scanning for endstream", ref_obj.num, ref_obj.generation, e);
+        // For progressive loading, we need to check for DataMissing errors separately
+        // before we can use and_then which only returns Option
+        let length_obj = dict.get("Length");
+
+        let length: Option<usize> = match length_obj {
+            Some(PDFObject::Number(n)) => Some(*n as usize),
+            Some(PDFObject::Ref(ref_obj)) => {
+                // Length is an indirect reference - try to resolve it if we have a resolver
+                if let Some(ref resolver) = self.ref_resolver {
+                    match resolver(ref_obj.num, ref_obj.generation) {
+                        Ok(resolved) => match resolved {
+                            PDFObject::Number(n) => Some(n as usize),
+                            _ => {
+                                eprintln!("Warning: Resolved /Length is not a number, scanning for endstream");
                                 None
                             }
+                        },
+                        Err(e @ PDFError::DataMissing { .. }) => {
+                            // For progressive loading, propagate DataMissing errors
+                            // The retry loop will load the missing object and retry
+                            return Err(e);
                         }
-                    } else {
-                        // No resolver available, fall back to scanning
-                        eprintln!("Warning: /Length is an indirect reference but no resolver available, scanning for endstream");
-                        None
+                        Err(e) => {
+                            eprintln!("Warning: Failed to resolve /Length reference {} {} R: {:?}, scanning for endstream", ref_obj.num, ref_obj.generation, e);
+                            None
+                        }
                     }
+                } else {
+                    // No resolver available, fall back to scanning
+                    eprintln!("Warning: /Length is an indirect reference but no resolver available, scanning for endstream");
+                    None
                 }
-                _ => None,
-            });
+            }
+            _ => None,
+        };
 
         // Read the stream data
         // We're already positioned at stream_start_pos (right after the newline)

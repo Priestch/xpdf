@@ -91,6 +91,15 @@ impl XRef {
         self.stream.set_pos(pos)
     }
 
+    /// Get mutable access to the underlying stream for progressive loading.
+    ///
+    /// This is used with the retry_on_data_missing! macro to implement
+    /// exception-driven progressive loading where missing data is loaded
+    /// on-demand and operations are retried.
+    pub fn stream_mut(&mut self) -> &mut Box<dyn BaseStream> {
+        &mut self.stream
+    }
+
     /// Parses the cross-reference table starting at the current stream position.
     ///
     /// This reads either a traditional xref table or an XRef stream (PDF 1.5+).

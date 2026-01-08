@@ -302,7 +302,16 @@ impl BaseStream for FileChunkedStream {
         for chunk_num in begin_chunk..=end_chunk {
             let chunk = manager
                 .get_chunk(chunk_num)
-                .ok_or(PDFError::DataNotLoaded { chunk: chunk_num })?;
+                .ok_or_else(|| {
+                    // This shouldn't happen after the check above, but handle it
+                    let chunk_size = manager.chunk_size();
+                    let chunk_start = chunk_num * chunk_size;
+                    let chunk_end = std::cmp::min(chunk_start + chunk_size, self.length());
+                    PDFError::DataMissing {
+                        position: chunk_start,
+                        length: chunk_end - chunk_start,
+                    }
+                })?;
 
             // Calculate the start offset within this chunk
             let chunk_start_pos = chunk_num * chunk_size;
@@ -344,9 +353,19 @@ impl BaseStream for FileChunkedStream {
         let end_chunk = manager.get_chunk_number(end - 1);
 
         // Check if all required chunks are loaded
+        // For progressive loading, return DataMissing with specific byte range
         for chunk in begin_chunk..=end_chunk {
             if !manager.has_chunk(chunk) {
-                return Err(PDFError::DataNotLoaded { chunk });
+                // Calculate the byte range for this missing chunk
+                let chunk_size = manager.chunk_size();
+                let chunk_start = chunk * chunk_size;
+                let chunk_end = std::cmp::min(chunk_start + chunk_size, self.length());
+
+                // For progressive loading, return the exact byte range needed
+                return Err(PDFError::DataMissing {
+                    position: chunk_start,
+                    length: chunk_end - chunk_start,
+                });
             }
         }
 
@@ -357,7 +376,16 @@ impl BaseStream for FileChunkedStream {
         for chunk_num in begin_chunk..=end_chunk {
             let chunk = manager
                 .get_chunk(chunk_num)
-                .ok_or(PDFError::DataNotLoaded { chunk: chunk_num })?;
+                .ok_or_else(|| {
+                    // This shouldn't happen after the check above, but handle it
+                    let chunk_size = manager.chunk_size();
+                    let chunk_start = chunk_num * chunk_size;
+                    let chunk_end = std::cmp::min(chunk_start + chunk_size, self.length());
+                    PDFError::DataMissing {
+                        position: chunk_start,
+                        length: chunk_end - chunk_start,
+                    }
+                })?;
 
             // Calculate the start offset within this chunk
             let chunk_start_pos = chunk_num * chunk_size;
