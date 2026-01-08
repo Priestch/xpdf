@@ -20,9 +20,9 @@ use crate::core::error::{PDFError, PDFResult};
 /// to the device.
 ///
 /// This follows the same pattern as PDF.js's CanvasGraphics and hayro's Context.
-pub struct RenderingContext<D: Device> {
+pub struct RenderingContext<'a, D: Device> {
     /// The device for rendering
-    device: D,
+    device: &'a mut D,
 
     /// Graphics state stack
     state_stack: Vec<GraphicsState>,
@@ -37,12 +37,12 @@ pub struct RenderingContext<D: Device> {
     in_text_object: bool,
 }
 
-impl<D: Device> RenderingContext<D> {
+impl<'a, D: Device> RenderingContext<'a, D> {
     /// Create a new rendering context.
     ///
     /// # Arguments
     /// * `device` - The rendering device to use
-    pub fn new(device: D) -> Self {
+    pub fn new(device: &'a mut D) -> Self {
         RenderingContext {
             device,
             state_stack: vec![GraphicsState::default()],
@@ -64,7 +64,7 @@ impl<D: Device> RenderingContext<D> {
 
     /// Get the device.
     pub fn device(&mut self) -> &mut D {
-        &mut self.device
+        &mut *self.device
     }
 
     /// Process a content stream operation.
@@ -793,28 +793,26 @@ fn extract_number(args: &[crate::core::parser::PDFObject], index: usize) -> PDFR
 mod tests {
     use super::*;
     use crate::core::parser::PDFObject;
-
-    fn create_context() -> RenderingContext<TestDevice> {
-        let device = TestDevice::new(612.0, 792.0);
-        RenderingContext::new(device)
-    }
+    use crate::rendering::device::TestDevice;
 
     #[test]
     fn test_context_creation() {
-        let ctx = create_context();
+        let mut device = TestDevice::new(612.0, 792.0);
+        let ctx = RenderingContext::new(&mut device);
         assert_eq!(ctx.state_stack.len(), 1);
         assert!(ctx.current_path.is_empty());
     }
 
     #[test]
     fn test_save_restore() {
-        let mut ctx = create_context();
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
 
         ctx.current_state_mut().stroke_color = Color::red();
         ctx.save().unwrap();
 
         ctx.current_state_mut().stroke_color = Color::blue();
-        assert_eq!(ctx.current_state().stroke_color, Color::RGB(1.0, 0.0, 0.0));
+        assert_eq!(ctx.current_state().stroke_color, Color::RGB(0.0, 0.0, 1.0));
 
         ctx.restore().unwrap();
         assert_eq!(ctx.current_state().stroke_color, Color::RGB(1.0, 0.0, 0.0));
@@ -822,7 +820,8 @@ mod tests {
 
     #[test]
     fn test_move_to_operator() {
-        let mut ctx = create_context();
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
 
         let op = Operation::new(
             OpCode::MoveTo,

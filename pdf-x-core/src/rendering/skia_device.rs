@@ -4,9 +4,9 @@ use tiny_skia::{
     PixmapMut, Transform, PathBuilder, Paint as SkiaPaint, Stroke, LineCap as SkiaLineCap,
     LineJoin as SkiaLineJoin, FillRule as SkiaFillRule, Pixmap, Mask, Path, Rect,
 };
-use crate::rendering::device::{Device, PathDrawMode, Paint, StrokeProps, ImageData};
+use crate::rendering::device::{Device, PathDrawMode, Paint, ImageData};
+use crate::rendering::{StrokeProps, Color, FillRule, LineCap, LineJoin};
 use crate::core::error::{PDFResult, PDFError};
-use crate::rendering::graphics_state::{Color, FillRule, LineCap, LineJoin};
 use std::collections::HashMap;
 use crate::rendering::font::Font;
 use ttf_parser::OutlineBuilder;
@@ -14,7 +14,7 @@ use ttf_parser::OutlineBuilder;
 // --- Conversion helpers ---
 
 fn to_skia_color(color: Color) -> tiny_skia::Color {
-    tiny_skia::Color::from_rgba8(color.r, color.g, color.b, color.a)
+    tiny_skia::Color::from_rgba8(color.r(), color.g(), color.b(), color.a())
 }
 
 fn to_skia_paint(paint: &Paint) -> SkiaPaint {
@@ -118,7 +118,7 @@ impl<'a> SkiaDevice<'a> {
     }
 
     pub fn load_font(&mut self, name: &str, data: &'static [u8]) -> PDFResult<()> {
-        let font = Font::new(data).map_err(|e| PDFError::RenderingError(format!("Failed to load font: {}", e)))?;
+        let font = Font::new(data).map_err(|e| PDFError::Generic(format!("Failed to load font: {}", e)))?;
         self.font_cache.insert(name.to_string(), font);
         Ok(())
     }
@@ -166,8 +166,10 @@ impl<'a> Device for SkiaDevice<'a> {
     }
 
     fn draw_path(&mut self, mode: PathDrawMode, paint: &Paint, stroke_props: &StrokeProps) -> PDFResult<()> {
-        let path = self.path_builder.finish().ok_or(PDFError::RenderingError("Invalid path".into()))?;
-        self.path_builder = PathBuilder::new();
+        // Take ownership of the path_builder and create a new one
+        let path = std::mem::replace(&mut self.path_builder, PathBuilder::new())
+            .finish()
+            .ok_or(PDFError::Generic("Invalid path".into()))?;
 
         let sk_paint = to_skia_paint(paint);
         let transform = self.current_state().transform;
@@ -204,22 +206,15 @@ impl<'a> Device for SkiaDevice<'a> {
     }
 
     fn clip_path(&mut self, rule: FillRule) -> PDFResult<()> {
-        let path = self.path_builder.finish().ok_or(PDFError::RenderingError("Invalid path".into()))?;
-        self.path_builder = PathBuilder::new();
+        // Take ownership of the path_builder and create a new one
+        let path = std::mem::replace(&mut self.path_builder, PathBuilder::new())
+            .finish()
+            .ok_or(PDFError::Generic("Invalid path".into()))?;
 
-        let new_clip_path = if let Some(old_clip) = &self.current_state().clip_path {
-            // Intersect new path with old one
-            if let Some(p) = old_clip.clone().intersect(&path, to_skia_fill_rule(rule)) {
-                p
-            } else {
-                // No intersection, so everything is clipped
-                PathBuilder::new().finish().unwrap()
-            }
-        } else {
-            path
-        };
-
-        self.current_state_mut().clip_path = Some(new_clip_path);
+        // For now, just replace the clip path with the new path
+        // TODO: Implement proper path intersection for clipping
+        let _ = rule; // Will be needed for proper intersection
+        self.current_state_mut().clip_path = Some(path);
 
         Ok(())
     }
@@ -258,7 +253,7 @@ impl<'a> Device for SkiaDevice<'a> {
         paint: &Paint,
     ) -> PDFResult<()> {
         let font = self.font_cache.get(font_name).ok_or_else(|| {
-            PDFError::RenderingError(format!("Font '{}' not found", font_name))
+            PDFError::Generic(format!("Font '{}' not found", font_name))
         })?;
 
         let shaped_buffer = font.shape(text);
@@ -275,7 +270,7 @@ impl<'a> Device for SkiaDevice<'a> {
             let mut converter = PathConverter(PathBuilder::new());
             let transform = Transform::from_scale(scale, -scale).post_translate(current_x, current_y);
 
-            let _ = font.face().outline_glyph(info.glyph_id, &mut converter);
+            let _ = font.face().outline_glyph(ttf_parser::GlyphId(info.glyph_id as u16), &mut converter);
 
             if let Some(p) = converter.0.finish() {
                  if let Some(path_transformed) = p.transform(transform) {
@@ -308,14 +303,14 @@ impl<'a> Device for SkiaDevice<'a> {
         // For now, we only support RGBA data.
         // A full implementation would handle different color spaces and formats.
         if !image.has_alpha || image.bits_per_component != 8 {
-            return Err(PDFError::RenderingError("Unsupported image format".into()));
+            return Err(PDFError::Generic("Unsupported image format".into()));
         }
 
         let image_pixmap = Pixmap::from_vec(
             image.data.to_vec(),
             tiny_skia::IntSize::from_wh(image.width, image.height).unwrap(),
         )
-        .ok_or(PDFError::RenderingError("Failed to create image pixmap".into()))?;
+        .ok_or(PDFError::Generic("Failed to create image pixmap".into()))?;
 
         let image_transform = Transform::from_row(
             transform[0] as f32, transform[1] as f32, transform[2] as f32,

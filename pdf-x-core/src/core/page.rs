@@ -268,6 +268,130 @@ impl Page {
 
         Ok(result)
     }
+
+    /// Renders this page to a rendering device.
+    ///
+    /// This method processes all content streams for the page and renders
+    /// them using the provided rendering device. The device handles the actual
+    /// drawing operations (canvas, image export, etc.).
+    ///
+    /// # Arguments
+    /// * `xref` - The cross-reference table for fetching objects
+    /// * `device` - A mutable reference to a rendering device
+    ///
+    /// # Returns
+    /// Ok(()) if rendering succeeded, or an error if something went wrong
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x_core::PDFDocument;
+    /// use pdf_x_core::rendering::{SkiaDevice, Device};
+    /// use tiny_skia::Pixmap;
+    ///
+    /// let pdf_data = std::fs::read("document.pdf").unwrap();
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    /// let page = doc.get_page(0).unwrap();
+    ///
+    /// // Create a pixmap for rendering
+    /// let mut pixmap = Pixmap::new(800, 600).unwrap();
+    /// let mut device = SkiaDevice::new(pixmap.as_mut());
+    ///
+    /// // Render the page
+    /// page.render(&mut doc.xref_mut(), &mut device).unwrap();
+    ///
+    /// // Save the result
+    /// pixmap.save_png("page1.png").unwrap();
+    /// ```
+    pub fn render<D: crate::rendering::Device>(
+        &self,
+        xref: &mut super::xref::XRef,
+        device: &mut D,
+    ) -> PDFResult<()> {
+        use crate::rendering::RenderingContext;
+        use super::{Lexer, Stream, Parser};
+        use super::decode::decode_flate;
+
+        let contents = match self.contents() {
+            Some(contents) => contents,
+            None => return Ok(()), // No content streams to render
+        };
+
+        // Dereference if it's a reference
+        let contents = xref.fetch_if_ref(contents)?;
+
+        // Handle single content stream or array of streams
+        let content_streams = match contents {
+            PDFObject::Stream { dict, data } => {
+                vec![(dict.clone(), data.clone())]
+            }
+            PDFObject::Array(arr) => {
+                // Multiple content streams - fetch each one
+                let mut streams = Vec::new();
+                for content_obj in &arr {
+                    match xref.fetch_if_ref(content_obj)? {
+                        PDFObject::Stream { dict, data } => {
+                            streams.push((dict, data));
+                        }
+                        _ => {
+                            return Err(super::PDFError::Generic(
+                                "Contents array contains non-stream object".to_string(),
+                            ));
+                        }
+                    }
+                }
+                streams
+            }
+            _ => {
+                // Handle unexpected Contents types gracefully
+                return Ok(());
+            }
+        };
+
+        // Get page dimensions for the device
+        let (width, height) = device.page_bounds();
+
+        // Process each content stream
+        for (dict, data) in content_streams {
+            // Decode the stream if it's compressed
+            let decoded_data = if let Some(filter) = dict.get("Filter") {
+                match filter {
+                    PDFObject::Name(filter_name) if filter_name == "FlateDecode" => {
+                        // Decompress FlateDecode stream
+                        match decode_flate(&data) {
+                            Ok(decompressed) => decompressed,
+                            Err(_) => continue, // Skip this stream if decompression fails
+                        }
+                    }
+                    _ => data // Other filters not yet supported, use raw data
+                }
+            } else {
+                data // No filter, use raw data
+            };
+
+            // Create a stream from the (decoded) content data
+            let stream = Box::new(Stream::from_bytes(decoded_data)) as Box<dyn super::BaseStream>;
+            let lexer = Lexer::new(stream)?;
+            let parser = Parser::new(lexer)?;
+            let mut evaluator = super::content_stream::ContentStreamEvaluator::new(parser);
+
+            // Create a rendering context to process operations
+            let mut ctx = RenderingContext::new(device);
+
+            // Load fonts from page resources (for proper text rendering)
+            if let Some(resources) = self.resources() {
+                // Note: For now, we'll handle font loading errors gracefully
+                // In a full implementation, we'd need to properly load fonts
+                let _ = resources;
+            }
+
+            // Parse and process each operation in the content stream
+            while let Ok(Some(op)) = evaluator.read_operation() {
+                ctx.process_operation(&op)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Page tree cache for efficient page lookups.

@@ -1024,4 +1024,623 @@ mod tests {
         assert_eq!(text_items.len(), 1);
         assert_eq!(text_items[0].text, "Text");
     }
+
+    // ============================================================================
+    // Comprehensive Path Operator Tests
+    // ============================================================================
+
+    #[test]
+    fn test_path_move_to() {
+        let mut eval = create_evaluator("10 20 m");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::MoveTo);
+        assert_eq!(op.args.len(), 2);
+        assert_eq!(op.args[0], PDFObject::Number(10.0));
+        assert_eq!(op.args[1], PDFObject::Number(20.0));
+    }
+
+    #[test]
+    fn test_path_line_to() {
+        let mut eval = create_evaluator("30 40 l");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::LineTo);
+        assert_eq!(op.args.len(), 2);
+        assert_eq!(op.args[0], PDFObject::Number(30.0));
+        assert_eq!(op.args[1], PDFObject::Number(40.0));
+    }
+
+    #[test]
+    fn test_path_curve_to() {
+        // c: x1 y1 x2 y2 x y
+        let mut eval = create_evaluator("10 20 30 40 50 60 c");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::CurveTo);
+        assert_eq!(op.args.len(), 6);
+    }
+
+    #[test]
+    fn test_path_curve_to2() {
+        // v: x2 y2 x y
+        let mut eval = create_evaluator("30 40 50 60 v");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::CurveTo2);
+        assert_eq!(op.args.len(), 4);
+    }
+
+    #[test]
+    fn test_path_curve_to3() {
+        // y: x1 y1 x y
+        let mut eval = create_evaluator("10 20 50 60 y");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::CurveTo3);
+        assert_eq!(op.args.len(), 4);
+    }
+
+    #[test]
+    fn test_path_close() {
+        let mut eval = create_evaluator("h");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::ClosePath);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_path_rectangle() {
+        // re: x y width height
+        let mut eval = create_evaluator("100 200 50 75 re");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::Rectangle);
+        assert_eq!(op.args.len(), 4);
+        assert_eq!(op.args[0], PDFObject::Number(100.0)); // x
+        assert_eq!(op.args[1], PDFObject::Number(200.0)); // y
+        assert_eq!(op.args[2], PDFObject::Number(50.0));  // width
+        assert_eq!(op.args[3], PDFObject::Number(75.0));  // height
+    }
+
+    // ============================================================================
+    // Path Painting Operator Tests
+    // ============================================================================
+
+    #[test]
+    fn test_path_stroke() {
+        let mut eval = create_evaluator("S");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::Stroke);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_path_close_stroke() {
+        let mut eval = create_evaluator("s");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::CloseStroke);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_path_fill() {
+        let mut eval = create_evaluator("f");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::Fill);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_path_eofill() {
+        let mut eval = create_evaluator("f*");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::EOFill);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_path_fill_stroke() {
+        let mut eval = create_evaluator("B");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::FillStroke);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_path_eofill_stroke() {
+        let mut eval = create_evaluator("B*");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::EOFillStroke);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_path_close_fill_stroke() {
+        let mut eval = create_evaluator("b");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::CloseFillStroke);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_path_close_eofill_stroke() {
+        let mut eval = create_evaluator("b*");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::CloseEOFillStroke);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_path_end() {
+        let mut eval = create_evaluator("n");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::EndPath);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    // ============================================================================
+    // Clipping Operator Tests
+    // ============================================================================
+
+    #[test]
+    fn test_clip_nonzero() {
+        let mut eval = create_evaluator("W");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::Clip);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_clip_evenodd() {
+        let mut eval = create_evaluator("W*");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::EOClip);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    // ============================================================================
+    // Color Operator Tests
+    // ============================================================================
+
+    #[test]
+    fn test_color_set_stroke_gray() {
+        let mut eval = create_evaluator("0.5 G");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetStrokeGray);
+        assert_eq!(op.args.len(), 1);
+        assert_eq!(op.args[0], PDFObject::Number(0.5));
+    }
+
+    #[test]
+    fn test_color_set_fill_gray() {
+        let mut eval = create_evaluator("0.75 g");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetFillGray);
+        assert_eq!(op.args.len(), 1);
+        assert_eq!(op.args[0], PDFObject::Number(0.75));
+    }
+
+    #[test]
+    fn test_color_set_stroke_rgb() {
+        let mut eval = create_evaluator("1.0 0.5 0.25 RG");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetStrokeRGBColor);
+        assert_eq!(op.args.len(), 3);
+        assert_eq!(op.args[0], PDFObject::Number(1.0));   // R
+        assert_eq!(op.args[1], PDFObject::Number(0.5));   // G
+        assert_eq!(op.args[2], PDFObject::Number(0.25));  // B
+    }
+
+    #[test]
+    fn test_color_set_fill_rgb() {
+        let mut eval = create_evaluator("0.1 0.2 0.3 rg");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetFillRGBColor);
+        assert_eq!(op.args.len(), 3);
+    }
+
+    #[test]
+    fn test_color_set_stroke_cmyk() {
+        let mut eval = create_evaluator("0.1 0.2 0.3 0.4 K");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetStrokeCMYKColor);
+        assert_eq!(op.args.len(), 4);
+    }
+
+    #[test]
+    fn test_color_set_fill_cmyk() {
+        let mut eval = create_evaluator("0.5 0.6 0.7 0.8 k");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetFillCMYKColor);
+        assert_eq!(op.args.len(), 4);
+    }
+
+    // ============================================================================
+    // Graphics State Tests
+    // ============================================================================
+
+    #[test]
+    fn test_set_line_width() {
+        let mut eval = create_evaluator("2.5 w");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetLineWidth);
+        assert_eq!(op.args.len(), 1);
+        assert_eq!(op.args[0], PDFObject::Number(2.5));
+    }
+
+    #[test]
+    fn test_set_line_cap() {
+        let mut eval = create_evaluator("1 J");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetLineCap);
+        assert_eq!(op.args.len(), 1);
+    }
+
+    #[test]
+    fn test_set_line_join() {
+        let mut eval = create_evaluator("0 j");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetLineJoin);
+        assert_eq!(op.args.len(), 1);
+    }
+
+    #[test]
+    fn test_set_miter_limit() {
+        let mut eval = create_evaluator("10.0 M");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetMiterLimit);
+        assert_eq!(op.args.len(), 1);
+    }
+
+    // ============================================================================
+    // Text Positioning Tests
+    // ============================================================================
+
+    #[test]
+    fn test_text_move_text() {
+        // Td: tx ty
+        let mut eval = create_evaluator("50 25 Td");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::MoveText);
+        assert_eq!(op.args.len(), 2);
+        assert_eq!(op.args[0], PDFObject::Number(50.0));
+        assert_eq!(op.args[1], PDFObject::Number(25.0));
+    }
+
+    #[test]
+    fn test_text_set_leading_move() {
+        // TD: tx ty
+        let mut eval = create_evaluator("10 20 TD");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetLeadingMoveText);
+        assert_eq!(op.args.len(), 2);
+    }
+
+    #[test]
+    fn test_text_set_matrix() {
+        // Tm: a b c d e f
+        let mut eval = create_evaluator("1 0 0 1 100 200 Tm");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::SetTextMatrix);
+        assert_eq!(op.args.len(), 6);
+    }
+
+    #[test]
+    fn test_text_next_line() {
+        let mut eval = create_evaluator("T*");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::NextLine);
+        assert_eq!(op.args.len(), 0);
+    }
+
+    #[test]
+    fn test_text_show_spaced() {
+        let mut eval = create_evaluator("[(A) 100 (B) -50 (C)] TJ");
+        let op = eval.read_operation().unwrap().unwrap();
+
+        assert_eq!(op.op, OpCode::ShowSpacedText);
+        assert_eq!(op.args.len(), 1); // Array argument
+    }
+
+    // ============================================================================
+    // Complex Content Stream Tests
+    // ============================================================================
+
+    #[test]
+    fn test_nested_save_restore() {
+        // Test nested q/Q pairs
+        let content = "q\n1 0 0 1 10 10 cm\nq\n2 0 0 2 20 20 cm\nQ\nQ\n";
+
+        let mut eval = create_evaluator(content);
+
+        // First save
+        let op1 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op1.op, OpCode::Save);
+
+        // First transform
+        let op2 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op2.op, OpCode::Transform);
+
+        // Second save
+        let op3 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op3.op, OpCode::Save);
+
+        // Second transform
+        let op4 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op4.op, OpCode::Transform);
+
+        // First restore (inner q)
+        let op5 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op5.op, OpCode::Restore);
+
+        // Second restore (outer q)
+        let op6 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op6.op, OpCode::Restore);
+    }
+
+    #[test]
+    fn test_transformation_matrix_accumulation() {
+        // Test that multiple transforms accumulate correctly
+        let content = "q\n1 0 0 1 10 0 cm\n1 0 0 1 0 20 cm\nQ\n";
+
+        let mut eval = create_evaluator(content);
+
+        eval.read_operation().unwrap().unwrap(); // q
+        let op1 = eval.read_operation().unwrap().unwrap(); // cm 1
+        let op2 = eval.read_operation().unwrap().unwrap(); // cm 2
+        eval.read_operation().unwrap().unwrap(); // Q
+
+        assert_eq!(op1.op, OpCode::Transform);
+        assert_eq!(op2.op, OpCode::Transform);
+
+        // Verify transforms
+        assert_eq!(op1.args[0], PDFObject::Number(1.0));
+        assert_eq!(op1.args[4], PDFObject::Number(10.0)); // tx
+
+        assert_eq!(op2.args[0], PDFObject::Number(1.0));
+        assert_eq!(op2.args[5], PDFObject::Number(20.0)); // ty
+    }
+
+    #[test]
+    fn test_complex_path_with_paint() {
+        // Draw a rectangle and fill it
+        let content = "100 200 50 75 re\n0.5 0.5 0.5 rg\nf\n";
+
+        let mut eval = create_evaluator(content);
+
+        // Rectangle
+        let op1 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op1.op, OpCode::Rectangle);
+
+        // Set fill color (RGB)
+        let op2 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op2.op, OpCode::SetFillRGBColor);
+
+        // Fill path
+        let op3 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op3.op, OpCode::Fill);
+    }
+
+    #[test]
+    fn test_mixed_graphics_and_text() {
+        // Test content stream with both graphics and text
+        let content = "0.0 0.0 0.0 1.0 rg\n10 10 5 5 re\nf\nBT\n/F1 12 Tf\n(Text) Tj\nET\n";
+
+        let mut eval = create_evaluator(content);
+
+        // Set fill RGB color
+        let op1 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op1.op, OpCode::SetFillRGBColor);
+
+        // Rectangle
+        let op2 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op2.op, OpCode::Rectangle);
+
+        // Fill
+        let op3 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op3.op, OpCode::Fill);
+
+        // Begin text
+        let op4 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op4.op, OpCode::BeginText);
+
+        // Set font
+        let op5 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op5.op, OpCode::SetFont);
+
+        // Show text
+        let op6 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op6.op, OpCode::ShowText);
+
+        // End text
+        let op7 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op7.op, OpCode::EndText);
+    }
+
+    #[test]
+    fn test_clipping_path() {
+        // Test clipping path with nonzero winding rule
+        let content = "100 100 200 200 re\nW\n0.5 g\nf\n";
+
+        let mut eval = create_evaluator(content);
+
+        // Rectangle (path to clip)
+        let op1 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op1.op, OpCode::Rectangle);
+
+        // Set clipping path
+        let op2 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op2.op, OpCode::Clip);
+
+        // Set fill gray
+        let op3 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op3.op, OpCode::SetFillGray);
+
+        // Fill
+        let op4 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op4.op, OpCode::Fill);
+    }
+
+    #[test]
+    fn test_clipping_path_evenodd() {
+        // Test clipping path with even-odd rule
+        let content = "50 50 100 100 re\nW*\n1.0 0.0 0.0 rg\nf\n";
+
+        let mut eval = create_evaluator(content);
+
+        // Rectangle
+        let op1 = eval.read_operation().unwrap().unwrap();
+
+        // Set clipping path (even-odd)
+        let op2 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op2.op, OpCode::EOClip);
+
+        // Set fill RGB color
+        let op3 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op3.op, OpCode::SetFillRGBColor);
+
+        // Fill
+        let op4 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op4.op, OpCode::Fill);
+    }
+
+    #[test]
+    fn test_text_state_operators() {
+        // Test text state operators
+        let content = "BT\n2.0 Tc\n3.0 Tw\n4.0 Tz\n5.0 TL\n6 Tr\n7.0 Ts\nET";
+
+        let mut eval = create_evaluator(content);
+
+        eval.read_operation().unwrap().unwrap(); // BT
+        let op1 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op1.op, OpCode::SetCharSpacing);
+        assert_eq!(op1.args[0], PDFObject::Number(2.0));
+
+        let op2 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op2.op, OpCode::SetWordSpacing);
+
+        let op3 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op3.op, OpCode::SetHScale);
+
+        let op4 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op4.op, OpCode::SetLeading);
+
+        let op5 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op5.op, OpCode::SetTextRenderingMode);
+
+        let op6 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op6.op, OpCode::SetTextRise);
+    }
+
+    #[test]
+    fn test_complete_drawing_workflow() {
+        // Complete drawing workflow: path, color, paint
+        let content = "10 10 m\n50 10 l\n50 50 l\n10 50 l\nh\n0.0 1.0 0.0 rg\nf\n";
+
+        let mut eval = create_evaluator(content);
+
+        // Move to (10, 10)
+        let op1 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op1.op, OpCode::MoveTo);
+
+        // Line to (50, 10)
+        let op2 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op2.op, OpCode::LineTo);
+
+        // Line to (50, 50)
+        let op3 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op3.op, OpCode::LineTo);
+
+        // Line to (10, 50)
+        let op4 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op4.op, OpCode::LineTo);
+
+        // Close path
+        let op5 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op5.op, OpCode::ClosePath);
+
+        // Set fill color (green)
+        let op6 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op6.op, OpCode::SetFillRGBColor);
+
+        // Fill
+        let op7 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op7.op, OpCode::Fill);
+    }
+
+    #[test]
+    fn test_text_with_advanced_positioning() {
+        // Test Tm (set text matrix) and T* (next line)
+        let content = "BT\n1 0 0 1 100 200 Tm\n(Text) Tj\nT*\n(More) Tj\nET";
+
+        let mut eval = create_evaluator(content);
+
+        eval.read_operation().unwrap().unwrap(); // BT
+
+        // Set text matrix
+        let op1 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op1.op, OpCode::SetTextMatrix);
+        assert_eq!(op1.args.len(), 6);
+
+        // Show text
+        let op2 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op2.op, OpCode::ShowText);
+
+        // Next line
+        let op3 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op3.op, OpCode::NextLine);
+
+        // Show more text
+        let op4 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op4.op, OpCode::ShowText);
+    }
+
+    #[test]
+    fn test_multiple_pages_in_stream() {
+        // Simulate multiple pages in one stream
+        let content = "100 100 50 50 re\nf\n1000 1000 100 100 re\nf\n";
+
+        let mut eval = create_evaluator(content);
+
+        // First rectangle and fill
+        let op1 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op1.op, OpCode::Rectangle);
+
+        let op2 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op2.op, OpCode::Fill);
+
+        // Second rectangle and fill
+        let op3 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op3.op, OpCode::Rectangle);
+
+        let op4 = eval.read_operation().unwrap().unwrap();
+        assert_eq!(op4.op, OpCode::Fill);
+    }
 }

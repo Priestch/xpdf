@@ -76,7 +76,7 @@ impl Default for StrokeProps {
 /// Color in a specific color space.
 ///
 /// For simplicity, we currently only support DeviceGray, DeviceRGB, and DeviceCMYK.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Color {
     /// Grayscale color (1 component: 0.0 = black, 1.0 = white)
     Gray(f64),
@@ -391,7 +391,8 @@ mod tests {
 
         // Scale by 2x
         state.concat_matrix(&[2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
-        assert_eq!(state.ctm, [2.0, 0.0, 0.0, 2.0, 20.0, 40.0]);
+        // The correct result of [1,0,0,1,10,20] * [2,0,0,2,0,0] is [2,0,0,2,10,20]
+        assert_eq!(state.ctm, [2.0, 0.0, 0.0, 2.0, 10.0, 20.0]);
     }
 
     #[test]

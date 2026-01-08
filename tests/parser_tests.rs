@@ -111,7 +111,16 @@ fn test_parser_boolean() {
     let mut stream = ByteStream::from_str("true");
     let mut parser = Parser::new(Box::new(stream));
 
-    // Parse and verify boolean
+    let result = parser.get_object();
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), parser::PDFObject::Boolean(true));
+
+    // Test false
+    let mut stream2 = ByteStream::from_str("false");
+    let mut parser2 = Parser::new(Box::new(stream2));
+    let result2 = parser2.get_object();
+    assert!(result2.is_ok());
+    assert_eq!(result2.unwrap(), parser::PDFObject::Boolean(false));
 }
 
 #[test]
@@ -119,7 +128,16 @@ fn test_parser_integer() {
     let mut stream = ByteStream::from_str("42");
     let mut parser = Parser::new(Box::new(stream));
 
-    // Parse and verify integer
+    let result = parser.get_object();
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), parser::PDFObject::Integer(42));
+
+    // Test negative integer
+    let mut stream2 = ByteStream::from_str("-123");
+    let mut parser2 = Parser::new(Box::new(stream2));
+    let result2 = parser2.get_object();
+    assert!(result2.is_ok());
+    assert_eq!(result2.unwrap(), parser::PDFObject::Integer(-123));
 }
 
 #[test]
@@ -127,7 +145,16 @@ fn test_parser_real() {
     let mut stream = ByteStream::from_str("3.14");
     let mut parser = Parser::new(Box::new(stream));
 
-    // Parse and verify real number
+    let result = parser.get_object();
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), parser::PDFObject::Real(3.14));
+
+    // Test negative real
+    let mut stream2 = ByteStream::from_str("-2.718");
+    let mut parser2 = Parser::new(Box::new(stream2));
+    let result2 = parser2.get_object();
+    assert!(result2.is_ok());
+    assert_eq!(result2.unwrap(), parser::PDFObject::Real(-2.718));
 }
 
 #[test]
@@ -135,7 +162,14 @@ fn test_parser_string() {
     let mut stream = ByteStream::from_str("(Hello, World!)");
     let mut parser = Parser::new(Box::new(stream));
 
-    // Parse and verify string
+    let result = parser.get_object();
+    assert!(result.is_ok());
+    match result.unwrap() {
+        parser::PDFObject::String(data) => {
+            assert_eq!(data.as_slice(), b"Hello, World!");
+        }
+        _ => panic!("Expected String object"),
+    }
 }
 
 #[test]
@@ -143,15 +177,32 @@ fn test_parser_name() {
     let mut stream = ByteStream::from_str("/PageMode");
     let mut parser = Parser::new(Box::new(stream));
 
-    // Parse and verify name
+    let result = parser.get_object();
+    assert!(result.is_ok());
+    match result.unwrap() {
+        parser::PDFObject::Name(name) => {
+            assert_eq!(name.as_bytes(), b"PageMode");
+        }
+        _ => panic!("Expected Name object"),
+    }
 }
 
 #[test]
 fn test_parser_array() {
-    let mut stream = ByteStream::from_str("[1 2 3 /Name (string)]");
+    let mut stream = ByteStream::from_str("[1 2 3]");
     let mut parser = Parser::new(Box::new(stream));
 
-    // Parse array and verify contents
+    let result = parser.get_object();
+    assert!(result.is_ok());
+    match result.unwrap() {
+        parser::PDFObject::Array(arr) => {
+            assert_eq!(arr.len(), 3);
+            assert_eq!(*arr[0], parser::PDFObject::Integer(1));
+            assert_eq!(*arr[1], parser::PDFObject::Integer(2));
+            assert_eq!(*arr[2], parser::PDFObject::Integer(3));
+        }
+        _ => panic!("Expected Array object"),
+    }
 }
 
 #[test]
@@ -159,7 +210,17 @@ fn test_parser_dictionary() {
     let mut stream = ByteStream::from_str("<< /Type /Page /Count 5 >>");
     let mut parser = Parser::new(Box::new(stream));
 
-    // Parse dictionary and verify keys/values
+    let result = parser.get_object();
+    assert!(result.is_ok());
+    match result.unwrap() {
+        parser::PDFObject::Dictionary(dict) => {
+            assert!(dict.contains_key("Type"));
+            assert!(dict.contains_key("Count"));
+            assert_eq!(*dict.get("Type").unwrap(), parser::PDFObject::Name(b"Page".to_vec()));
+            assert_eq!(*dict.get("Count").unwrap(), parser::PDFObject::Integer(5));
+        }
+        _ => panic!("Expected Dictionary object"),
+    }
 }
 
 #[test]
@@ -167,7 +228,9 @@ fn test_parser_null() {
     let mut stream = ByteStream::from_str("null");
     let mut parser = Parser::new(Box::new(stream));
 
-    // Parse and verify null
+    let result = parser.get_object();
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), parser::PDFObject::Null);
 }
 
 // ============================================================================

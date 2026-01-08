@@ -15,7 +15,7 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use pdf_x::core::PDFDocument;
+//! use pdf_x_core::core::PDFDocument;
 //!
 //! // Open a PDF file
 //! let pdf_data = std::fs::read("document.pdf")?;
@@ -49,7 +49,7 @@
 //! PDF-X supports progressive loading that mirrors PDF.js's architecture:
 //!
 //! ```rust
-//! use pdf_x::core::{PDFDocument, FileChunkedStream};
+//! use pdf_x_core::core::{PDFDocument, FileChunkedStream};
 //!
 //! // Open with chunked loading for large files
 //! let mut stream = FileChunkedStream::open("large.pdf")?;
@@ -65,7 +65,7 @@
 //! Extract text with detailed information:
 //!
 //! ```rust
-//! use pdf_x::core::PDFDocument;
+//! use pdf_x_core::core::PDFDocument;
 //!
 //! let mut doc = PDFDocument::open(pdf_data)?;
 //! let page = doc.get_page(0)?;

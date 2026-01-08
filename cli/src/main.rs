@@ -327,8 +327,8 @@ fn print_object(obj: &PDFObject, indent: usize) {
             }
             println!("{}>>", indent_str);
         }
-        PDFObject::Ref { num, generation } => {
-            println!("{}{} {} R", indent_str, num, generation)
+        PDFObject::Ref(ref_obj) => {
+            println!("{}{} {} R", indent_str, ref_obj.num, ref_obj.generation)
         }
         PDFObject::EOF => println!("{}EOF", indent_str),
     }
@@ -366,7 +366,7 @@ fn print_object_inline(obj: &PDFObject) {
         PDFObject::Array(_) => println!("[...]"),
         PDFObject::Dictionary(_) => println!("<< ... >>"),
         PDFObject::Stream { dict: _, data } => println!("stream ({} bytes)", data.len()),
-        PDFObject::Ref { num, generation } => println!("{} {} R", num, generation),
+        PDFObject::Ref(ref_obj) => println!("{} {} R", ref_obj.num, ref_obj.generation),
         PDFObject::EOF => println!("EOF"),
     }
 }
@@ -658,7 +658,7 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
     if let Some(colorspace) = dict.get("ColorSpace") {
         let cs_name = match colorspace {
             PDFObject::Name(name) => name.clone(),
-            PDFObject::Ref { num, generation } => format!("Ref({} {})", num, generation),
+            PDFObject::Ref(ref_obj) => format!("Ref({} {})", ref_obj.num, ref_obj.generation),
             _ => "Unknown".to_string(),
         };
         println!("      Color space: {}", cs_name);
@@ -1165,8 +1165,6 @@ fn show_page_sizes_info(doc: &mut PDFDocument) {
 }
 
 fn extract_annotations(doc: &mut PDFDocument) {
-    use pdf_x_core::Annotation;
-
     let page_count = match doc.page_count() {
         Ok(count) => count,
         Err(e) => {

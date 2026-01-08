@@ -46,6 +46,7 @@ rendering = ["tiny-skia", "rustybuzz", "ttf-parser"]  # Canvas rendering support
 [dev-dependencies]
 tempfile = "3.14"
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.5"
 
 [[bench]]
 name = "parsing"
@@ -54,4 +55,14 @@ harness = false
 [[test]]
 name = "rendering_tests"
 path = "tests/rendering_tests.rs"
+required-features = ["rendering"]
+
+[[test]]
+name = "render_pdf_example"
+path = "tests/render_pdf_example.rs"
+required-features = ["rendering"]
+
+[[example]]
+name = "render"
+path = "examples/render.rs"
 required-features = ["rendering"]

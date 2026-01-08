@@ -1,7 +1,7 @@
 //! Font loading and text shaping.
 
 use ttf_parser::{Face, FaceParsingError};
-use rustybuzz::{UnicodeBuffer, Face as BuzzFace};
+use rustybuzz::{UnicodeBuffer, GlyphBuffer, Face as BuzzFace};
 
 pub struct Font {
     face: Face<'static>,
@@ -15,7 +15,7 @@ impl Font {
         Ok(Font { face, buzz_face })
     }
 
-    pub fn shape(&self, text: &str) -> UnicodeBuffer {
+    pub fn shape(&self, text: &str) -> GlyphBuffer {
         let mut buffer = UnicodeBuffer::new();
         buffer.push_str(text);
         buffer.guess_segment_properties();
