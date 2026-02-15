@@ -6,6 +6,7 @@
 
 use super::graphics_state::{Color, FillRule, StrokeProps};
 use crate::core::error::PDFResult;
+use crate::core::parser::PDFObject;
 
 /// How to draw a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,13 +58,13 @@ impl Default for Paint {
 ///
 /// This represents image data that can be drawn by a device.
 #[derive(Debug, Clone)]
-pub struct ImageData<'a> {
+pub struct ImageData {
     /// Image width in pixels
     pub width: u32,
     /// Image height in pixels
     pub height: u32,
     /// Image data (RGB or RGBA)
-    pub data: &'a [u8],
+    pub data: Vec<u8>,
     /// Whether the image has an alpha channel
     pub has_alpha: bool,
     /// Bits per component
@@ -107,7 +108,12 @@ pub trait Device {
     /// * `mode` - How to draw the path (fill, stroke, or both)
     /// * `paint` - The paint/color to use
     /// * `stroke_props` - Stroke properties (only used for stroking)
-    fn draw_path(&mut self, mode: PathDrawMode, paint: &Paint, stroke_props: &StrokeProps) -> PDFResult<()>;
+    fn draw_path(
+        &mut self,
+        mode: PathDrawMode,
+        paint: &Paint,
+        stroke_props: &StrokeProps,
+    ) -> PDFResult<()>;
 
     /// Set a clipping path.
     ///
@@ -138,29 +144,64 @@ pub trait Device {
     /// Draw text at the current position.
     ///
     /// # Arguments
-    /// * `text` - The text to draw
+    /// * `text_bytes` - Raw text bytes using the font's encoding (NOT UTF-8)
     /// * `font_name` - Name of the font to use
     /// * `font_size` - Font size in points
     /// * `paint` - The paint/color to use
+    /// * `text_matrix` - Text transformation matrix (for positioning text in user space)
+    /// * `horizontal_scaling` - Horizontal text scaling as percentage (default: 100.0)
+    /// * `text_rise` - Text rise in user space units (for superscript/subscript)
+    ///
+    /// # Returns
+    /// The total rendered width in text space units
     fn draw_text(
         &mut self,
-        text: &str,
+        text_bytes: &[u8],
         font_name: &str,
         font_size: f64,
         paint: &Paint,
-    ) -> PDFResult<()>;
+        text_matrix: &[f64; 6],
+        horizontal_scaling: f64,
+        text_rise: f64,
+    ) -> PDFResult<f64>;
 
     /// Draw an image.
     ///
     /// # Arguments
     /// * `image` - The image data
     /// * `transform` - Transformation matrix for placing the image
-    fn draw_image(&mut self, image: ImageData<'_>, transform: &[f64; 6]) -> PDFResult<()>;
+    fn draw_image(&mut self, image: ImageData, transform: &[f64; 6]) -> PDFResult<()>;
 
     /// Get the current page bounds.
     ///
     /// Returns (width, height) in user space units.
     fn page_bounds(&self) -> (f64, f64);
+
+    /// Load font data for rendering.
+    ///
+    /// This method allows loading font data (TrueType, CFF, etc.) for text rendering.
+    /// Devices that don't support text rendering can ignore this.
+    ///
+    /// # Arguments
+    /// * `name` - The font name/identifier (e.g., "F1", "Helvetica")
+    /// * `data` - Raw font data
+    /// * `encoding` - Optional PDF Encoding dictionary for custom glyph name mappings
+    ///
+    /// # Returns
+    /// Ok(()) if successful, or an error if loading failed
+    fn load_font_data(
+        &mut self,
+        name: &str,
+        data: Vec<u8>,
+        encoding: Option<&PDFObject>,
+    ) -> PDFResult<()> {
+        // Default implementation ignores font loading
+        // (for devices that don't support text rendering)
+        let _ = name;
+        let _ = data;
+        let _ = encoding;
+        Ok(())
+    }
 }
 
 /// A simple CPU-based device implementation for testing.
@@ -233,19 +274,27 @@ impl Device for TestDevice {
     }
 
     fn curve_to(&mut self, cp1x: f64, cp1y: f64, cp2x: f64, cp2y: f64, x: f64, y: f64) {
-        self.operations.push(format!("curve_to({},{},{},{},{},{})",
-            cp1x, cp1y, cp2x, cp2y, x, y));
+        self.operations.push(format!(
+            "curve_to({},{},{},{},{},{})",
+            cp1x, cp1y, cp2x, cp2y, x, y
+        ));
     }
 
     fn rect(&mut self, x: f64, y: f64, width: f64, height: f64) {
-        self.operations.push(format!("rect({},{},{},{})", x, y, width, height));
+        self.operations
+            .push(format!("rect({},{},{},{})", x, y, width, height));
     }
 
     fn close_path(&mut self) {
         self.operations.push("close_path".to_string());
     }
 
-    fn draw_path(&mut self, mode: PathDrawMode, _paint: &Paint, _stroke_props: &StrokeProps) -> PDFResult<()> {
+    fn draw_path(
+        &mut self,
+        mode: PathDrawMode,
+        _paint: &Paint,
+        _stroke_props: &StrokeProps,
+    ) -> PDFResult<()> {
         match mode {
             PathDrawMode::Fill(rule) => {
                 self.operations.push(format!("draw_path(fill, {:?})", rule));
@@ -254,7 +303,8 @@ impl Device for TestDevice {
                 self.operations.push("draw_path(stroke)".to_string());
             }
             PathDrawMode::FillStroke(rule) => {
-                self.operations.push(format!("draw_path(fill_stroke, {:?})", rule));
+                self.operations
+                    .push(format!("draw_path(fill_stroke, {:?})", rule));
             }
         }
         Ok(())
@@ -304,19 +354,29 @@ impl Device for TestDevice {
 
     fn draw_text(
         &mut self,
-        text: &str,
+        text_bytes: &[u8],
         font_name: &str,
         font_size: f64,
         _paint: &Paint,
-    ) -> PDFResult<()> {
-        self.operations.push(format!("draw_text({}, {}, {})",
-            font_name, font_size, text));
-        Ok(())
+        _text_matrix: &[f64; 6],
+        _horizontal_scaling: f64,
+        _text_rise: f64,
+    ) -> PDFResult<f64> {
+        self.operations.push(format!(
+            "draw_text({}, {}, {:?})",
+            font_name, font_size, text_bytes
+        ));
+        // Return approximate width for testing
+        let num_chars = text_bytes.len() as f64;
+        let width = (num_chars * 500.0 * font_size) / 1000.0;
+        Ok(width)
     }
 
-    fn draw_image(&mut self, image: ImageData<'_>, transform: &[f64; 6]) -> PDFResult<()> {
-        self.operations.push(format!("draw_image({}x{}, {:?})",
-            image.width, image.height, transform));
+    fn draw_image(&mut self, image: ImageData, transform: &[f64; 6]) -> PDFResult<()> {
+        self.operations.push(format!(
+            "draw_image({}x{}, {:?})",
+            image.width, image.height, transform
+        ));
         Ok(())
     }
 
@@ -336,7 +396,13 @@ mod tests {
         device.begin_path();
         device.move_to(100.0, 200.0);
         device.line_to(300.0, 400.0);
-        device.draw_path(PathDrawMode::Stroke, &Paint::black(), &StrokeProps::default()).unwrap();
+        device
+            .draw_path(
+                PathDrawMode::Stroke,
+                &Paint::black(),
+                &StrokeProps::default(),
+            )
+            .unwrap();
 
         let ops = device.operations();
         assert_eq!(ops[0], "begin_path");

@@ -14,6 +14,7 @@ fn main() {
             commands::extract_text_from_page,
             commands::get_document_outline,
             commands::get_page_sizes,
+            commands::render_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

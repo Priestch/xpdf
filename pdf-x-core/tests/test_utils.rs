@@ -4,8 +4,8 @@
 //! similar to PDF.js's test_utils.js
 
 use pdf_x_core::core::*;
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 
 /// Get the path to the test fixtures directory
 pub fn fixtures_dir() -> PathBuf {
@@ -55,8 +55,8 @@ pub fn create_file_stream(name: &str) -> Result<FileChunkedStream, PDFError> {
 
 /// Helper to assert that a PDF loads without errors
 pub fn assert_pdf_loads(name: &str) -> Result<PDFDocument, PDFError> {
-    let bytes = load_test_pdf_bytes(name)
-        .map_err(|e| PDFError::Generic(format!("IO Error: {}", e)))?;
+    let bytes =
+        load_test_pdf_bytes(name).map_err(|e| PDFError::Generic(format!("IO Error: {}", e)))?;
     PDFDocument::open(bytes)
 }
 

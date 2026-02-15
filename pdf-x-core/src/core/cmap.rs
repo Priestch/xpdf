@@ -85,7 +85,6 @@ impl CMap {
                 let count = Self::parse_count(trimmed)?;
                 Self::parse_bfchar(&mut cmap, &mut lines, count)?;
             }
-
             // Parse bfrange mappings (range mappings)
             else if trimmed.ends_with("beginbfrange") {
                 let count = Self::parse_count(trimmed)?;
@@ -100,15 +99,12 @@ impl CMap {
     fn parse_count(line: &str) -> PDFResult<usize> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 2 {
-            return Err(PDFError::Generic(format!(
-                "Invalid CMap line: '{}'", line
-            )));
+            return Err(PDFError::Generic(format!("Invalid CMap line: '{}'", line)));
         }
 
-        parts[0].parse::<usize>()
-            .map_err(|_| PDFError::Generic(format!(
-                "Invalid count in CMap line: '{}'", line
-            )))
+        parts[0]
+            .parse::<usize>()
+            .map_err(|_| PDFError::Generic(format!("Invalid count in CMap line: '{}'", line)))
     }
 
     /// Parses bfchar entries (single character mappings).
@@ -120,7 +116,8 @@ impl CMap {
         I: Iterator<Item = &'a str>,
     {
         for _ in 0..count {
-            let line = lines.next()
+            let line = lines
+                .next()
                 .ok_or_else(|| PDFError::Generic("Unexpected end of bfchar section".to_string()))?;
 
             let trimmed = line.trim();
@@ -154,8 +151,9 @@ impl CMap {
         I: Iterator<Item = &'a str>,
     {
         for _ in 0..count {
-            let line = lines.next()
-                .ok_or_else(|| PDFError::Generic("Unexpected end of bfrange section".to_string()))?;
+            let line = lines.next().ok_or_else(|| {
+                PDFError::Generic("Unexpected end of bfrange section".to_string())
+            })?;
 
             let trimmed = line.trim();
 
@@ -193,9 +191,7 @@ impl CMap {
         let hex = hex_str.trim_start_matches('<').trim_end_matches('>');
 
         u16::from_str_radix(hex, 16)
-            .map_err(|_| PDFError::Generic(format!(
-                "Invalid hex code: '{}'", hex_str
-            )))
+            .map_err(|_| PDFError::Generic(format!("Invalid hex code: '{}'", hex_str)))
     }
 
     /// Parses a hex Unicode value like `<0020>` into a char.
@@ -205,14 +201,10 @@ impl CMap {
         let hex = hex_str.trim_start_matches('<').trim_end_matches('>');
 
         let code = u32::from_str_radix(hex, 16)
-            .map_err(|_| PDFError::Generic(format!(
-                "Invalid hex Unicode: '{}'", hex_str
-            )))?;
+            .map_err(|_| PDFError::Generic(format!("Invalid hex Unicode: '{}'", hex_str)))?;
 
         char::from_u32(code)
-            .ok_or_else(|| PDFError::Generic(format!(
-                "Invalid Unicode code point: 0x{:X}", code
-            )))
+            .ok_or_else(|| PDFError::Generic(format!("Invalid Unicode code point: 0x{:X}", code)))
     }
 
     /// Maps a character code (CID) to Unicode.
@@ -230,7 +222,7 @@ impl CMap {
     /// assert_eq!(cmap.to_unicode(3), Some(' '));
     /// assert_eq!(cmap.to_unicode(999), None);
     /// ```
-    #[inline(always)]  // Hot path - called for every character during text extraction
+    #[inline(always)] // Hot path - called for every character during text extraction
     pub fn to_unicode(&self, cid: u16) -> Option<char> {
         self.mappings.get(&cid).copied()
     }

@@ -7,8 +7,8 @@
 //! - File encryption key derivation
 //! - PDF object decryption (strings and streams)
 
+use crate::core::crypto::{AES128Cipher, AES256Cipher, ARC4Cipher, PDF20, PDFPasswordAlgorithm};
 use crate::core::error::{PDFError, PDFResult};
-use crate::core::crypto::{PDFPasswordAlgorithm, PDF17, PDF20, ARC4Cipher, AES128Cipher, AES256Cipher};
 use crate::core::parser::PDFObject;
 
 /// PDF encryption version
@@ -115,40 +115,54 @@ impl EncryptDict {
     /// Parse an /Encrypt dictionary from a PDF object
     pub fn from_object(encrypt_obj: &PDFObject) -> PDFResult<Self> {
         if let PDFObject::Dictionary(dict) = encrypt_obj {
-            let filter = dict.get("Filter")
+            let filter = dict
+                .get("Filter")
                 .ok_or_else(|| PDFError::parse_error("Missing Filter in Encrypt dict", None))?
                 .as_name()
                 .ok_or_else(|| PDFError::parse_error("Filter must be a name", None))?;
 
-            let version = dict.get("V")
+            let version = dict
+                .get("V")
                 .ok_or_else(|| PDFError::parse_error("Missing V in Encrypt dict", None))?
                 .as_number()
-                .ok_or_else(|| PDFError::parse_error("V must be a number", None))? as i32;
+                .ok_or_else(|| PDFError::parse_error("V must be a number", None))?
+                as i32;
 
-            let revision = dict.get("R")
+            let revision = dict
+                .get("R")
                 .ok_or_else(|| PDFError::parse_error("Missing R in Encrypt dict", None))?
                 .as_number()
-                .ok_or_else(|| PDFError::parse_error("R must be a number", None))? as i32;
+                .ok_or_else(|| PDFError::parse_error("R must be a number", None))?
+                as i32;
 
-            let o = dict.get("O")
+            let o = dict
+                .get("O")
                 .ok_or_else(|| PDFError::parse_error("Missing O in Encrypt dict", None))?
                 .as_string()
                 .ok_or_else(|| PDFError::parse_error("O must be a string", None))?;
 
-            let u = dict.get("U")
+            let u = dict
+                .get("U")
                 .ok_or_else(|| PDFError::parse_error("Missing U in Encrypt dict", None))?
                 .as_string()
                 .ok_or_else(|| PDFError::parse_error("U must be a string", None))?;
 
-            let p = dict.get("P")
+            let p = dict
+                .get("P")
                 .ok_or_else(|| PDFError::parse_error("Missing P in Encrypt dict", None))?
                 .as_number()
-                .ok_or_else(|| PDFError::parse_error("P must be a number", None))? as u32;
+                .ok_or_else(|| PDFError::parse_error("P must be a number", None))?
+                as u32;
 
-            let oe = dict.get("OE").and_then(|obj| obj.as_string().map(|v| v.to_vec()));
-            let ue = dict.get("UE").and_then(|obj| obj.as_string().map(|v| v.to_vec()));
+            let oe = dict
+                .get("OE")
+                .and_then(|obj| obj.as_string().map(|v| v.to_vec()));
+            let ue = dict
+                .get("UE")
+                .and_then(|obj| obj.as_string().map(|v| v.to_vec()));
 
-            let encrypt_metadata = dict.get("EncryptMetadata")
+            let encrypt_metadata = dict
+                .get("EncryptMetadata")
                 .and_then(|obj| obj.as_boolean())
                 .unwrap_or(true);
 
@@ -165,7 +179,10 @@ impl EncryptDict {
                 encryption_key: None,
             })
         } else {
-            Err(PDFError::parse_error("Encrypt dict must be a dictionary", None))
+            Err(PDFError::parse_error(
+                "Encrypt dict must be a dictionary",
+                None,
+            ))
         }
     }
 
@@ -253,12 +270,8 @@ impl EncryptDict {
 
                 // If user password failed, try as owner password
                 // Decode the user password from the owner password
-                let decoded_user_pwd = decode_user_password(
-                    password,
-                    o,
-                    self.revision,
-                    self.key_length(),
-                );
+                let decoded_user_pwd =
+                    decode_user_password(password, o, self.revision, self.key_length());
 
                 // Try again with the decoded user password
                 if let Some(key) = check_user_password_legacy(
@@ -304,7 +317,12 @@ impl EncryptDict {
                     if self.u.len() >= 48 {
                         let u_bytes = &self.u[0..48];
 
-                        if alg.check_owner_password(password, owner_validation_salt, u_bytes, owner_password_hash) {
+                        if alg.check_owner_password(
+                            password,
+                            owner_validation_salt,
+                            u_bytes,
+                            owner_password_hash,
+                        ) {
                             // Derive encryption key
                             if let Some(ref oe) = self.oe {
                                 let owner_key_salt = &self.o[40..48];
@@ -323,9 +341,9 @@ impl EncryptDict {
     /// Get the file encryption key length in bytes
     pub fn key_length(&self) -> usize {
         match self.encryption_version() {
-            EncryptionVersion::V1 => 5,  // 40-bit RC4
-            EncryptionVersion::V2 => 16, // 128-bit RC4
-            EncryptionVersion::V4 => 16, // 128-bit AES
+            EncryptionVersion::V1 => 5,                              // 40-bit RC4
+            EncryptionVersion::V2 => 16,                             // 128-bit RC4
+            EncryptionVersion::V4 => 16,                             // 128-bit AES
             EncryptionVersion::V5R5 | EncryptionVersion::V5R6 => 32, // 256-bit AES
         }
     }
@@ -346,10 +364,12 @@ impl EncryptDict {
 
         let encryption_key = self.get_encryption_key().unwrap(); // Safe: caller should ensure key is derived
 
-        let is_aes = self.algorithm() == EncryptionAlgorithm::AES128 || self.algorithm() == EncryptionAlgorithm::AES256;
+        let is_aes = self.algorithm() == EncryptionAlgorithm::AES128
+            || self.algorithm() == EncryptionAlgorithm::AES256;
 
         // Build the key data
-        let mut key_data = Vec::with_capacity(encryption_key.len() + 5 + (if is_aes { 4 } else { 0 }));
+        let mut key_data =
+            Vec::with_capacity(encryption_key.len() + 5 + (if is_aes { 4 } else { 0 }));
         key_data.extend_from_slice(encryption_key);
         key_data.extend_from_slice(&obj_num.to_le_bytes()[0..3]); // 3 bytes, little-endian
         key_data.extend_from_slice(&gen_num.to_le_bytes()[0..2]); // 2 bytes, little-endian
@@ -389,7 +409,7 @@ impl EncryptDict {
                 if key.len() != 16 {
                     return Err(PDFError::parse_error(
                         &format!("AES-128 key length is {}, expected 16", key.len()),
-                        None
+                        None,
                     ));
                 }
                 let key_array: [u8; 16] = key.try_into().unwrap();
@@ -406,7 +426,7 @@ impl EncryptDict {
                 if key.len() != 32 {
                     return Err(PDFError::parse_error(
                         &format!("AES-256 key length is {}, expected 32", key.len()),
-                        None
+                        None,
                     ));
                 }
                 let key_array: [u8; 32] = key.try_into().unwrap();
@@ -441,7 +461,7 @@ impl EncryptDict {
                 if key.len() != 16 {
                     return Err(PDFError::parse_error(
                         &format!("AES-128 key length is {}, expected 16", key.len()),
-                        None
+                        None,
                     ));
                 }
                 let key_array: [u8; 16] = key.try_into().unwrap();
@@ -449,7 +469,10 @@ impl EncryptDict {
 
                 // AES-128 streams use CBC mode with IV prepended to the data
                 if data.len() < 16 {
-                    return Err(PDFError::parse_error("AES-128 encrypted stream too short for IV", None));
+                    return Err(PDFError::parse_error(
+                        "AES-128 encrypted stream too short for IV",
+                        None,
+                    ));
                 }
 
                 let iv_array: [u8; 16] = data[0..16].try_into().unwrap();
@@ -465,7 +488,7 @@ impl EncryptDict {
                 if key.len() != 32 {
                     return Err(PDFError::parse_error(
                         &format!("AES-256 key length is {}, expected 32", key.len()),
-                        None
+                        None,
                     ));
                 }
                 let key_array: [u8; 32] = key.try_into().unwrap();
@@ -473,7 +496,10 @@ impl EncryptDict {
 
                 // AES-256 streams use CBC mode with IV prepended to the data
                 if data.len() < 16 {
-                    return Err(PDFError::parse_error("AES-256 encrypted stream too short for IV", None));
+                    return Err(PDFError::parse_error(
+                        "AES-256 encrypted stream too short for IV",
+                        None,
+                    ));
                 }
 
                 let iv_array: [u8; 16] = data[0..16].try_into().unwrap();
@@ -491,10 +517,8 @@ impl EncryptDict {
 
 /// Default password padding bytes used in PDF 1.7 and earlier
 const DEFAULT_PASSWORD_PAD: [u8; 32] = [
-    0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41,
-    0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
-    0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80,
-    0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+    0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+    0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
 ];
 
 /// Pads a password to exactly 32 bytes using the default password padding.
@@ -573,7 +597,15 @@ fn check_user_password_legacy(
     u_expected: &[u8],
 ) -> Option<Vec<u8>> {
     // Derive the encryption key
-    let key = derive_encryption_key(password, o, p, file_id, revision, key_length, encrypt_metadata);
+    let key = derive_encryption_key(
+        password,
+        o,
+        p,
+        file_id,
+        revision,
+        key_length,
+        encrypt_metadata,
+    );
 
     // For R >= 3, do 19 rounds of RC4 with varying keys
     let check_data = if revision >= 3 {
@@ -698,23 +730,21 @@ mod tests {
     fn test_rc4_128_password_verification() {
         // File ID from PDF.js test
         let file_id = [
-            0xF6u8, 0xC6, 0xAF, 0x17, 0xF3, 0x72, 0x52, 0x8D,
-            0x52, 0x4D, 0x9A, 0x80, 0xD1, 0xEF, 0xDF, 0x18,
+            0xF6u8, 0xC6, 0xAF, 0x17, 0xF3, 0x72, 0x52, 0x8D, 0x52, 0x4D, 0x9A, 0x80, 0xD1, 0xEF,
+            0xDF, 0x18,
         ];
 
         // Encrypted dictionary values (O, U, P, R)
         let o = [
-            0x80u8, 0xC3, 0x04, 0x96, 0x91, 0x6F, 0x20, 0x73,
-            0x6C, 0x3A, 0xE6, 0x1B, 0x13, 0x54, 0x91, 0xF2,
-            0x0D, 0x56, 0x12, 0xE3, 0xFF, 0x5E, 0x0B, 0xE9,
-            0x56, 0x4F, 0xD8, 0x6B, 0x9A, 0xCA, 0x7C, 0x5D,
+            0x80u8, 0xC3, 0x04, 0x96, 0x91, 0x6F, 0x20, 0x73, 0x6C, 0x3A, 0xE6, 0x1B, 0x13, 0x54,
+            0x91, 0xF2, 0x0D, 0x56, 0x12, 0xE3, 0xFF, 0x5E, 0x0B, 0xE9, 0x56, 0x4F, 0xD8, 0x6B,
+            0x9A, 0xCA, 0x7C, 0x5D,
         ];
 
         let u = [
-            0x6Au8, 0x0C, 0x8D, 0x3E, 0x59, 0x19, 0x00, 0xBC,
-            0x6A, 0x64, 0x7D, 0x91, 0xBD, 0xAA, 0x00, 0x18,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x6Au8, 0x0C, 0x8D, 0x3E, 0x59, 0x19, 0x00, 0xBC, 0x6A, 0x64, 0x7D, 0x91, 0xBD, 0xAA,
+            0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
         ];
 
         let p: u32 = 0xFFFFFC0C; // -1028 as unsigned (from PDF.js test)
@@ -753,11 +783,18 @@ mod tests {
             hash_data_check.extend_from_slice(&o);
             hash_data_check.extend_from_slice(&p.to_le_bytes());
             hash_data_check.extend_from_slice(&file_id);
-            println!("Hash data for MD5 (first 64 bytes): {:02x?}", &hash_data_check[..64.min(hash_data_check.len())]);
+            println!(
+                "Hash data for MD5 (first 64 bytes): {:02x?}",
+                &hash_data_check[..64.min(hash_data_check.len())]
+            );
             println!("Hash data length: {}", hash_data_check.len());
 
             let test_key1 = derive_encryption_key(user_password, &o, p, &file_id, r, 16, true);
-            println!("Derived key length: {}, key: {:02x?}", test_key1.len(), test_key1);
+            println!(
+                "Derived key length: {}, key: {:02x?}",
+                test_key1.len(),
+                test_key1
+            );
 
             // Let's manually verify the MD5 computation
             let manual_md5 = calculate_md5(&hash_data_check);
@@ -778,7 +815,10 @@ mod tests {
                 println!("  After iteration: {:02x?}", &check_data[..16]);
             }
 
-            println!("Final computed U (first 16 bytes): {:02x?}", &check_data[..16]);
+            println!(
+                "Final computed U (first 16 bytes): {:02x?}",
+                &check_data[..16]
+            );
             println!("Expected U (first 16 bytes): {:02x?}", &u[..16]);
         }
 
@@ -813,24 +853,21 @@ mod tests {
     fn test_aes_128_blank_password() {
         // File ID from PDF.js test
         let file_id = [
-            0x3Cu8, 0x4C, 0x5F, 0x3A, 0x44, 0x96, 0xAF, 0x40,
-            0x9A, 0x9D, 0xB3, 0x3C, 0x78, 0x1C, 0x76, 0xAC,
+            0x3Cu8, 0x4C, 0x5F, 0x3A, 0x44, 0x96, 0xAF, 0x40, 0x9A, 0x9D, 0xB3, 0x3C, 0x78, 0x1C,
+            0x76, 0xAC,
         ];
 
         // Encrypted dictionary values
         let o = [
-            0x73u8, 0x46, 0x14, 0x76, 0x2E, 0x79, 0x35, 0x27,
-            0xDB, 0x97, 0x0A, 0x35, 0x22, 0xB3, 0xE1, 0xD4,
-            0xAD, 0xBD, 0x9B, 0x3C, 0xB4, 0xA5, 0x89, 0x75,
-            0x15, 0xB2, 0x59, 0xF1, 0x68, 0xD9, 0xE9, 0xF4,
+            0x73u8, 0x46, 0x14, 0x76, 0x2E, 0x79, 0x35, 0x27, 0xDB, 0x97, 0x0A, 0x35, 0x22, 0xB3,
+            0xE1, 0xD4, 0xAD, 0xBD, 0x9B, 0x3C, 0xB4, 0xA5, 0x89, 0x75, 0x15, 0xB2, 0x59, 0xF1,
+            0x68, 0xD9, 0xE9, 0xF4,
         ];
 
         let u = [
-            0x93u8, 0x04, 0x89, 0xA9, 0xBF, 0x8A, 0x45, 0xA6,
-            0x88, 0xA2, 0xDB, 0xC2, 0xA0, 0xA8, 0x67, 0x6E,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00,
+            0x93u8, 0x04, 0x89, 0xA9, 0xBF, 0x8A, 0x45, 0xA6, 0x88, 0xA2, 0xDB, 0xC2, 0xA0, 0xA8,
+            0x67, 0x6E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let p: u32 = 0xFFFFFBB4; // -1084 as unsigned (from PDF.js test)
@@ -861,41 +898,35 @@ mod tests {
 
         // File ID from PDF.js test
         let file_id = [
-            0xF6u8, 0xC6, 0xAF, 0x17, 0xF3, 0x72, 0x52, 0x8D,
-            0x52, 0x4D, 0x9A, 0x80, 0xD1, 0xEF, 0xDF, 0x18,
+            0xF6u8, 0xC6, 0xAF, 0x17, 0xF3, 0x72, 0x52, 0x8D, 0x52, 0x4D, 0x9A, 0x80, 0xD1, 0xEF,
+            0xDF, 0x18,
         ];
 
         // Encrypted dictionary values for AES-256 R=5
         let o = [
-            0x3Cu8, 0x62, 0x89, 0x23, 0x33, 0x65, 0xC8, 0x98,
-            0xD2, 0xB2, 0xE2, 0xE4, 0x86, 0xCD, 0xA3, 0x18,
-            0xCC, 0x7E, 0xB1, 0x24, 0x6A, 0x32, 0x34, 0x7D,
-            0xD2, 0xAC, 0xAB, 0x78, 0xDE, 0x6C, 0x8B, 0x73,
-            0xF3, 0x76, 0x47, 0x99, 0x80, 0x11, 0x65, 0x3E,
-            0xC8, 0xF5, 0xF2, 0x0C, 0xDA, 0x7B, 0x18, 0x78,
+            0x3Cu8, 0x62, 0x89, 0x23, 0x33, 0x65, 0xC8, 0x98, 0xD2, 0xB2, 0xE2, 0xE4, 0x86, 0xCD,
+            0xA3, 0x18, 0xCC, 0x7E, 0xB1, 0x24, 0x6A, 0x32, 0x34, 0x7D, 0xD2, 0xAC, 0xAB, 0x78,
+            0xDE, 0x6C, 0x8B, 0x73, 0xF3, 0x76, 0x47, 0x99, 0x80, 0x11, 0x65, 0x3E, 0xC8, 0xF5,
+            0xF2, 0x0C, 0xDA, 0x7B, 0x18, 0x78,
         ];
 
         let u = [
-            0x83u8, 0xF2, 0x8F, 0xA0, 0x57, 0x02, 0x8A, 0x86,
-            0x4F, 0xFD, 0xBD, 0xAD, 0xE0, 0x49, 0x90, 0xF1,
-            0xBE, 0x51, 0xC5, 0x0F, 0xF9, 0x69, 0x91, 0x97,
-            0x0F, 0xC2, 0x41, 0x03, 0x01, 0x7E, 0xBB, 0xDD,
-            0x75, 0xA9, 0x04, 0x20, 0x9F, 0x65, 0x16, 0xDC,
-            0xA8, 0x5E, 0xD7, 0xC0, 0x64, 0x26, 0xBC, 0x28,
+            0x83u8, 0xF2, 0x8F, 0xA0, 0x57, 0x02, 0x8A, 0x86, 0x4F, 0xFD, 0xBD, 0xAD, 0xE0, 0x49,
+            0x90, 0xF1, 0xBE, 0x51, 0xC5, 0x0F, 0xF9, 0x69, 0x91, 0x97, 0x0F, 0xC2, 0x41, 0x03,
+            0x01, 0x7E, 0xBB, 0xDD, 0x75, 0xA9, 0x04, 0x20, 0x9F, 0x65, 0x16, 0xDC, 0xA8, 0x5E,
+            0xD7, 0xC0, 0x64, 0x26, 0xBC, 0x28,
         ];
 
         let oe = [
-            0xD5u8, 0xCA, 0x0E, 0xBD, 0x6E, 0x4C, 0x46, 0xBF,
-            0x06, 0xC3, 0x0A, 0xBE, 0x9D, 0x64, 0x90, 0x55,
-            0x08, 0x3E, 0x7B, 0xB2, 0x9C, 0xE5, 0x32, 0x28,
-            0xE5, 0xD8, 0x6D, 0xE2, 0x22, 0x26, 0x6A, 0xDF,
+            0xD5u8, 0xCA, 0x0E, 0xBD, 0x6E, 0x4C, 0x46, 0xBF, 0x06, 0xC3, 0x0A, 0xBE, 0x9D, 0x64,
+            0x90, 0x55, 0x08, 0x3E, 0x7B, 0xB2, 0x9C, 0xE5, 0x32, 0x28, 0xE5, 0xD8, 0x6D, 0xE2,
+            0x22, 0x26, 0x6A, 0xDF,
         ];
 
         let ue = [
-            0x23u8, 0x96, 0xC3, 0xA9, 0xF5, 0x33, 0x33, 0xFF,
-            0x9E, 0x9E, 0x21, 0xF2, 0xE7, 0x4B, 0x7D, 0xBE,
-            0x19, 0x7E, 0xAC, 0x72, 0xC3, 0xF4, 0x89, 0xF5,
-            0xEA, 0xA5, 0x2A, 0x4A, 0x3C, 0x26, 0x11, 0x11,
+            0x23u8, 0x96, 0xC3, 0xA9, 0xF5, 0x33, 0x33, 0xFF, 0x9E, 0x9E, 0x21, 0xF2, 0xE7, 0x4B,
+            0x7D, 0xBE, 0x19, 0x7E, 0xAC, 0x72, 0xC3, 0xF4, 0x89, 0xF5, 0xEA, 0xA5, 0x2A, 0x4A,
+            0x3C, 0x26, 0x11, 0x11,
         ];
 
         let p: u32 = 0xFFFFFBB4; // -1084 as unsigned (from PDF.js test)
@@ -944,7 +975,10 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(0xFFFFFFFC),
             encrypt_metadata: true,
-            encryption_key: Some(vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]),
+            encryption_key: Some(vec![
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                0x0E, 0x0F,
+            ]),
         };
 
         // Derive object key for object 123, generation 0
@@ -1032,7 +1066,8 @@ mod tests {
         // Test that wrong password fails
         let mut encrypt_dict2 = encrypt_dict.clone();
         encrypt_dict2.encryption_key = None;
-        let wrong_result = encrypt_dict2.derive_encryption_key_with_file_id(b"wrongpassword", &file_id);
+        let wrong_result =
+            encrypt_dict2.derive_encryption_key_with_file_id(b"wrongpassword", &file_id);
         assert!(!wrong_result, "Wrong password should fail for R=2");
     }
 
@@ -1111,8 +1146,10 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(0xFFFFFFFC),
             encrypt_metadata: true,
-            encryption_key: Some(vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                                    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]),
+            encryption_key: Some(vec![
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                0x0E, 0x0F,
+            ]),
         };
 
         // Test data
@@ -1121,14 +1158,16 @@ mod tests {
         let gen_num = 0;
 
         // Encrypt the data
-        let encrypted = encrypt_dict.decrypt_string(original, obj_num, gen_num)
+        let encrypted = encrypt_dict
+            .decrypt_string(original, obj_num, gen_num)
             .expect("RC4 encryption should succeed");
 
         // Encrypted data should be different from original (unless key is all zeros)
         assert_ne!(encrypted, original.to_vec());
 
         // Decrypt the data (RC4 is symmetric, so decrypt_string is the same operation)
-        let decrypted = encrypt_dict.decrypt_string(&encrypted, obj_num, gen_num)
+        let decrypted = encrypt_dict
+            .decrypt_string(&encrypted, obj_num, gen_num)
             .expect("RC4 decryption should succeed");
 
         assert_eq!(decrypted, original.to_vec());
@@ -1157,10 +1196,11 @@ mod tests {
             ue: Some(vec![0u8; 32]),
             permissions: PDFPermissions::from_p_value(0xFFFFFFFC),
             encrypt_metadata: true,
-            encryption_key: Some(vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                                    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-                                    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-                                    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F]),
+            encryption_key: Some(vec![
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+                0x1C, 0x1D, 0x1E, 0x1F,
+            ]),
         };
 
         // Test data
@@ -1169,14 +1209,16 @@ mod tests {
         let gen_num = 0;
 
         // Encrypt the data
-        let encrypted = encrypt_dict.decrypt_string(original, obj_num, gen_num)
+        let encrypted = encrypt_dict
+            .decrypt_string(original, obj_num, gen_num)
             .expect("AES-256 encryption should succeed");
 
         // Encrypted data should be different from original
         assert_ne!(encrypted, original.to_vec());
 
         // Decrypt the data
-        let decrypted = encrypt_dict.decrypt_string(&encrypted, obj_num, gen_num)
+        let decrypted = encrypt_dict
+            .decrypt_string(&encrypted, obj_num, gen_num)
             .expect("AES-256 decryption should succeed");
 
         assert_eq!(decrypted, original.to_vec());
@@ -1189,7 +1231,10 @@ mod tests {
 
         // Create a mock /Encrypt dictionary
         let mut dict = HashMap::new();
-        dict.insert("Filter".to_string(), PDFObject::Name("Standard".to_string()));
+        dict.insert(
+            "Filter".to_string(),
+            PDFObject::Name("Standard".to_string()),
+        );
         dict.insert("V".to_string(), PDFObject::Number(2.0));
         dict.insert("R".to_string(), PDFObject::Number(3.0));
         dict.insert("O".to_string(), PDFObject::String(vec![0u8; 32]));
@@ -1223,7 +1268,10 @@ mod tests {
         // Test with missing required fields
         use std::collections::HashMap;
         let mut dict = HashMap::new();
-        dict.insert("Filter".to_string(), PDFObject::Name("Standard".to_string()));
+        dict.insert(
+            "Filter".to_string(),
+            PDFObject::Name("Standard".to_string()),
+        );
         // Missing V, R, O, U, P fields
 
         let encrypt_obj = PDFObject::Dictionary(dict);
@@ -1245,8 +1293,10 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(0xFFFFFFFC),
             encrypt_metadata: true,
-            encryption_key: Some(vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                                    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]),
+            encryption_key: Some(vec![
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                0x0E, 0x0F,
+            ]),
         };
 
         // Test data (simulating compressed stream content)
@@ -1255,14 +1305,16 @@ mod tests {
         let gen_num = 0;
 
         // Encrypt the stream
-        let encrypted = encrypt_dict.decrypt_stream(original, obj_num, gen_num)
+        let encrypted = encrypt_dict
+            .decrypt_stream(original, obj_num, gen_num)
             .expect("Stream encryption should succeed");
 
         // Encrypted data should be different from original
         assert_ne!(encrypted, original.to_vec());
 
         // Decrypt the stream
-        let decrypted = encrypt_dict.decrypt_stream(&encrypted, obj_num, gen_num)
+        let decrypted = encrypt_dict
+            .decrypt_stream(&encrypted, obj_num, gen_num)
             .expect("Stream decryption should succeed");
 
         assert_eq!(decrypted, original.to_vec());

@@ -76,18 +76,34 @@ impl fmt::Display for PDFError {
                 write!(f, "Data not loaded for chunk {}", chunk)
             }
             PDFError::DataMissing { position, length } => {
-                write!(f, "Data missing at position {} ({} bytes needed)", position, length)
+                write!(
+                    f,
+                    "Data missing at position {} ({} bytes needed)",
+                    position, length
+                )
             }
             PDFError::InvalidPosition { pos, length } => {
-                write!(f, "Invalid position {} for stream of length {}", pos, length)
+                write!(
+                    f,
+                    "Invalid position {} for stream of length {}",
+                    pos, length
+                )
             }
             PDFError::InvalidObject { expected, found } => {
                 write!(f, "Invalid object: expected {}, found {}", expected, found)
             }
-            PDFError::ParseError { message, context, position } => {
-                let pos_str = position.map(|p| format!(" at byte {}", p)).unwrap_or_default();
+            PDFError::ParseError {
+                message,
+                context,
+                position,
+            } => {
+                let pos_str = position
+                    .map(|p| format!(" at byte {}", p))
+                    .unwrap_or_default();
                 match context {
-                    Some(ctx) => write!(f, "Parse error{}: {} (context: {})", pos_str, message, ctx),
+                    Some(ctx) => {
+                        write!(f, "Parse error{}: {} (context: {})", pos_str, message, ctx)
+                    }
                     None => write!(f, "Parse error{}: {}", pos_str, message),
                 }
             }
@@ -136,7 +152,11 @@ impl PDFError {
     }
 
     /// Creates a parse error with context and file position.
-    pub fn parse_error_at<S: Into<String>>(message: S, context: Option<S>, position: usize) -> Self {
+    pub fn parse_error_at<S: Into<String>>(
+        message: S,
+        context: Option<S>,
+        position: usize,
+    ) -> Self {
         PDFError::ParseError {
             message: message.into(),
             context: context.map(|s| s.into()),
@@ -226,16 +246,25 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = PDFError::data_missing(100, 50);
-        assert_eq!(format!("{}", err), "Data missing at position 100 (50 bytes needed)");
+        assert_eq!(
+            format!("{}", err),
+            "Data missing at position 100 (50 bytes needed)"
+        );
 
         let err = PDFError::xref_error("Invalid entry");
-        assert_eq!(format!("{}", err), "Cross-reference table error: Invalid entry");
+        assert_eq!(
+            format!("{}", err),
+            "Cross-reference table error: Invalid entry"
+        );
 
         let err = PDFError::page_error("Page not found");
         assert_eq!(format!("{}", err), "Page error: Page not found");
 
         let err = PDFError::parse_error("Invalid token", Some("while reading object"));
-        assert_eq!(format!("{}", err), "Parse error: Invalid token (context: while reading object)");
+        assert_eq!(
+            format!("{}", err),
+            "Parse error: Invalid token (context: while reading object)"
+        );
 
         let err = PDFError::unsupported("Linearized PDFs");
         assert_eq!(format!("{}", err), "Unsupported feature: Linearized PDFs");
@@ -245,7 +274,11 @@ mod tests {
     fn test_error_creation_methods() {
         let err = PDFError::parse_error("test", Some("context"));
         match err {
-            PDFError::ParseError { message, context, position } => {
+            PDFError::ParseError {
+                message,
+                context,
+                position,
+            } => {
                 assert_eq!(message, "test");
                 assert_eq!(context, Some("context".to_string()));
                 assert_eq!(position, None);
@@ -255,7 +288,11 @@ mod tests {
 
         let err = PDFError::parse_error_at("test", Some("context"), 42);
         match err {
-            PDFError::ParseError { message, context, position } => {
+            PDFError::ParseError {
+                message,
+                context,
+                position,
+            } => {
                 assert_eq!(message, "test");
                 assert_eq!(context, Some("context".to_string()));
                 assert_eq!(position, Some(42));

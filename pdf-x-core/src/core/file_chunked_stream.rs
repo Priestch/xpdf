@@ -9,15 +9,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// Helper function to standardize mutex lock error handling for the file handle.
 #[inline]
 fn lock_file(file: &Arc<Mutex<File>>) -> PDFResult<MutexGuard<'_, File>> {
-    file.lock()
-        .map_err(|_| PDFError::StreamError("Failed to lock file handle (mutex poisoned)".to_string()))
+    file.lock().map_err(|_| {
+        PDFError::StreamError("Failed to lock file handle (mutex poisoned)".to_string())
+    })
 }
 
 /// Helper function to standardize mutex lock error handling for the chunk manager.
 #[inline]
 fn lock_manager(manager: &Arc<Mutex<ChunkManager>>) -> PDFResult<MutexGuard<'_, ChunkManager>> {
-    manager.lock()
-        .map_err(|_| PDFError::StreamError("Failed to lock chunk manager (mutex poisoned)".to_string()))
+    manager.lock().map_err(|_| {
+        PDFError::StreamError("Failed to lock chunk manager (mutex poisoned)".to_string())
+    })
 }
 
 /// A chunked stream that progressively loads data from a filesystem file.
@@ -89,9 +91,8 @@ impl FileChunkedStream {
         max_cached_chunks: Option<usize>,
     ) -> PDFResult<Self> {
         let file_path = path.as_ref().to_path_buf();
-        let mut file = File::open(&file_path).map_err(|e| {
-            PDFError::StreamError(format!("Failed to open file: {}", e))
-        })?;
+        let mut file = File::open(&file_path)
+            .map_err(|e| PDFError::StreamError(format!("Failed to open file: {}", e)))?;
 
         // Get file length
         let length = file
@@ -175,10 +176,7 @@ impl FileChunkedStream {
 
     /// Returns the total number of chunks in the file.
     pub fn num_chunks(&self) -> usize {
-        self.manager
-            .lock()
-            .map(|m| m.num_chunks())
-            .unwrap_or(0)
+        self.manager.lock().map(|m| m.num_chunks()).unwrap_or(0)
     }
 
     /// Returns true if all chunks are loaded.
@@ -221,10 +219,7 @@ impl FileChunkedStream {
 
 impl BaseStream for FileChunkedStream {
     fn length(&self) -> usize {
-        self.manager
-            .lock()
-            .map(|m| m.length())
-            .unwrap_or(0)
+        self.manager.lock().map(|m| m.length()).unwrap_or(0)
     }
 
     fn is_empty(&self) -> bool {
@@ -300,18 +295,16 @@ impl BaseStream for FileChunkedStream {
         let manager = lock_manager(&self.manager)?;
 
         for chunk_num in begin_chunk..=end_chunk {
-            let chunk = manager
-                .get_chunk(chunk_num)
-                .ok_or_else(|| {
-                    // This shouldn't happen after the check above, but handle it
-                    let chunk_size = manager.chunk_size();
-                    let chunk_start = chunk_num * chunk_size;
-                    let chunk_end = std::cmp::min(chunk_start + chunk_size, self.length());
-                    PDFError::DataMissing {
-                        position: chunk_start,
-                        length: chunk_end - chunk_start,
-                    }
-                })?;
+            let chunk = manager.get_chunk(chunk_num).ok_or_else(|| {
+                // This shouldn't happen after the check above, but handle it
+                let chunk_size = manager.chunk_size();
+                let chunk_start = chunk_num * chunk_size;
+                let chunk_end = std::cmp::min(chunk_start + chunk_size, self.length());
+                PDFError::DataMissing {
+                    position: chunk_start,
+                    length: chunk_end - chunk_start,
+                }
+            })?;
 
             // Calculate the start offset within this chunk
             let chunk_start_pos = chunk_num * chunk_size;
@@ -374,18 +367,16 @@ impl BaseStream for FileChunkedStream {
         let chunk_size = manager.chunk_size();
 
         for chunk_num in begin_chunk..=end_chunk {
-            let chunk = manager
-                .get_chunk(chunk_num)
-                .ok_or_else(|| {
-                    // This shouldn't happen after the check above, but handle it
-                    let chunk_size = manager.chunk_size();
-                    let chunk_start = chunk_num * chunk_size;
-                    let chunk_end = std::cmp::min(chunk_start + chunk_size, self.length());
-                    PDFError::DataMissing {
-                        position: chunk_start,
-                        length: chunk_end - chunk_start,
-                    }
-                })?;
+            let chunk = manager.get_chunk(chunk_num).ok_or_else(|| {
+                // This shouldn't happen after the check above, but handle it
+                let chunk_size = manager.chunk_size();
+                let chunk_start = chunk_num * chunk_size;
+                let chunk_end = std::cmp::min(chunk_start + chunk_size, self.length());
+                PDFError::DataMissing {
+                    position: chunk_start,
+                    length: chunk_end - chunk_start,
+                }
+            })?;
 
             // Calculate the start offset within this chunk
             let chunk_start_pos = chunk_num * chunk_size;
@@ -497,8 +488,7 @@ mod tests {
     #[test]
     fn test_chunk_caching() {
         let temp_file = create_test_file(200_000); // ~3 chunks at 64KB each
-        let mut stream =
-            FileChunkedStream::open(temp_file.path(), Some(65536), Some(2)).unwrap();
+        let mut stream = FileChunkedStream::open(temp_file.path(), Some(65536), Some(2)).unwrap();
 
         assert_eq!(stream.num_chunks(), 4);
 

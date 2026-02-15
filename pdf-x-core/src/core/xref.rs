@@ -2,10 +2,10 @@ use super::base_stream::BaseStream;
 use super::decode;
 use super::error::{PDFError, PDFResult};
 use super::lexer::Lexer;
-use super::parser::{PDFObject, Parser, Ref};
+use super::parser::{PDFObject, Parser};
 use super::stream::Stream;
 use lru::LruCache;
-use std::collections::HashMap;  // Still needed for String keys in dictionaries
+use std::collections::HashMap; // Still needed for String keys in dictionaries
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 
@@ -22,10 +22,7 @@ pub enum XRefEntry {
     Uncompressed { offset: u64, generation: u32 },
 
     /// Compressed entry - object is stored in an object stream
-    Compressed {
-        obj_stream_num: u32,
-        index: u32,
-    },
+    Compressed { obj_stream_num: u32, index: u32 },
 }
 
 impl XRefEntry {
@@ -146,10 +143,10 @@ impl XRef {
             // Position stream at this xref location
             self.stream.set_pos(pos)?;
 
-            let lexer = Lexer::new(self.stream.make_sub_stream(
-                pos,
-                self.stream.length() - pos,
-            )?)?;
+            let lexer = Lexer::new(
+                self.stream
+                    .make_sub_stream(pos, self.stream.length() - pos)?,
+            )?;
             let mut parser = Parser::new(lexer)?;
 
             // First token could be "xref" (traditional) or a number (XRef stream object)
@@ -163,9 +160,7 @@ impl XRef {
                     // read_xref_table consumed the "trailer" keyword, so read the dictionary directly
                     let trailer = parser.get_object()?;
                     if !matches!(trailer, PDFObject::Dictionary(_)) {
-                        return Err(PDFError::Generic(
-                            "Expected trailer dictionary".to_string(),
-                        ));
+                        return Err(PDFError::Generic("Expected trailer dictionary".to_string()));
                     }
 
                     trailer
@@ -217,7 +212,7 @@ impl XRef {
                         _ => {
                             return Err(PDFError::Generic(
                                 "Expected XRef stream object".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -225,7 +220,7 @@ impl XRef {
                     return Err(PDFError::Generic(format!(
                         "Expected 'xref' keyword or object number, got {:?}",
                         obj
-                    )))
+                    )));
                 }
             };
 
@@ -326,7 +321,10 @@ impl XRef {
             match size {
                 PDFObject::Number(n) => {
                     use smallvec::smallvec;
-                    smallvec![Box::new(PDFObject::Number(0.0)), Box::new(PDFObject::Number(*n))]
+                    smallvec![
+                        Box::new(PDFObject::Number(0.0)),
+                        Box::new(PDFObject::Number(*n))
+                    ]
                 }
                 _ => return Err(PDFError::Generic("/Size must be a number".to_string())),
             }
@@ -391,7 +389,6 @@ impl XRef {
             }
         }
 
-        
         // Parse entries from the decompressed data
         let (w1, w2, w3) = widths;
         let entry_size = w1 + w2 + w3;
@@ -405,7 +402,7 @@ impl XRef {
                 _ => {
                     return Err(PDFError::Generic(
                         "Index entry must be a number".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -414,16 +411,14 @@ impl XRef {
                 _ => {
                     return Err(PDFError::Generic(
                         "Index entry must be a number".to_string(),
-                    ))
+                    ));
                 }
             };
 
             // Read 'count' entries starting from 'first'
             for j in 0..count {
                 if pos + entry_size > decompressed_data.len() {
-                    return Err(PDFError::Generic(
-                        "XRef stream data truncated".to_string(),
-                    ));
+                    return Err(PDFError::Generic("XRef stream data truncated".to_string()));
                 }
 
                 // Read type field (w1 bytes)
@@ -469,7 +464,7 @@ impl XRef {
                         return Err(PDFError::xref_error(format!(
                             "Invalid XRef entry type: {} at object {}",
                             entry_type, obj_num
-                        )))
+                        )));
                     }
                 };
 
@@ -515,7 +510,7 @@ impl XRef {
                     return Err(PDFError::Generic(format!(
                         "Expected subsection start number or 'trailer', got {:?}",
                         first_obj
-                    )))
+                    )));
                 }
             };
 
@@ -527,20 +522,22 @@ impl XRef {
                     return Err(PDFError::Generic(format!(
                         "Expected subsection count, got {:?}",
                         count_obj
-                    )))
+                    )));
                 }
             };
 
             // Ensure we have enough space in the entries vector
             // Use checked arithmetic to prevent overflow on corrupt PDFs
-            let needed_size = first.checked_add(count)
-                .ok_or_else(|| PDFError::corrupted_pdf(format!(
+            let needed_size = first.checked_add(count).ok_or_else(|| {
+                PDFError::corrupted_pdf(format!(
                     "XRef table overflow: first={}, count={}",
                     first, count
-                )))? as usize;
+                ))
+            })? as usize;
 
             // Sanity check: prevent extremely large allocations
-            if needed_size > 10_000_000 {  // 10 million objects is unreasonable
+            if needed_size > 10_000_000 {
+                // 10 million objects is unreasonable
                 return Err(PDFError::corrupted_pdf(format!(
                     "XRef table size {} exceeds reasonable limit",
                     needed_size
@@ -577,7 +574,7 @@ impl XRef {
                 return Err(PDFError::Generic(format!(
                     "Expected offset in xref entry, got {:?}",
                     offset_obj
-                )))
+                )));
             }
         };
 
@@ -589,7 +586,7 @@ impl XRef {
                 return Err(PDFError::Generic(format!(
                     "Expected generation in xref entry, got {:?}",
                     gen_obj
-                )))
+                )));
             }
         };
 
@@ -602,7 +599,7 @@ impl XRef {
                 return Err(PDFError::Generic(format!(
                     "Expected 'f' or 'n' in xref entry, got {:?}",
                     type_obj
-                )))
+                )));
             }
         };
 
@@ -756,7 +753,7 @@ impl XRef {
                             return Err(PDFError::Generic(format!(
                                 "Expected object number, got {:?}",
                                 num
-                            )))
+                            )));
                         }
                     };
 
@@ -766,7 +763,7 @@ impl XRef {
                             return Err(PDFError::Generic(format!(
                                 "Expected offset, got {:?}",
                                 offset
-                            )))
+                            )));
                         }
                     };
 
@@ -781,7 +778,8 @@ impl XRef {
                 if obj_offset >= decompressed_data.len() {
                     return Err(PDFError::corrupted_pdf(format!(
                         "ObjStm: object offset {} exceeds stream length {}",
-                        obj_offset, decompressed_data.len()
+                        obj_offset,
+                        decompressed_data.len()
                     )));
                 }
 
@@ -798,7 +796,9 @@ impl XRef {
                 if obj_end > decompressed_data.len() {
                     return Err(PDFError::corrupted_pdf(format!(
                         "ObjStm: object range {}..{} exceeds stream length {}",
-                        obj_offset, obj_end, decompressed_data.len()
+                        obj_offset,
+                        obj_end,
+                        decompressed_data.len()
                     )));
                 }
 
@@ -820,7 +820,8 @@ impl XRef {
             PDFObject::Dictionary(_) => {
                 // If it's just a dictionary without stream data, we can't decompress it yet
                 Err(PDFError::Generic(
-                    "ObjStm is a dictionary but stream data parsing not yet implemented".to_string(),
+                    "ObjStm is a dictionary but stream data parsing not yet implemented"
+                        .to_string(),
                 ))
             }
             _ => Err(PDFError::Generic(
@@ -909,8 +910,7 @@ impl XRef {
                     // 1. self_ptr is valid for the duration of parser.get_object()
                     // 2. No other code can modify or move the XRef during this time
                     // 3. We're only calling fetch() which is part of XRef's public API
-                    unsafe { (*self_ptr).fetch(num, generation) }
-                        .map(|rc| (*rc).clone())
+                    unsafe { (*self_ptr).fetch(num, generation) }.map(|rc| (*rc).clone())
                 });
 
                 // Read object number
@@ -921,7 +921,7 @@ impl XRef {
                         return Err(PDFError::Generic(format!(
                             "Expected object number, got {:?}",
                             num_obj
-                        )))
+                        )));
                     }
                 };
 
@@ -940,7 +940,7 @@ impl XRef {
                         return Err(PDFError::Generic(format!(
                             "Expected generation number, got {:?}",
                             gen_obj
-                        )))
+                        )));
                     }
                 };
 
@@ -999,6 +999,13 @@ impl XRef {
         self.trailer.as_ref()
     }
 
+    /// Returns the length of the underlying stream.
+    ///
+    /// This is useful for determining the original PDF file size.
+    pub fn stream_length(&self) -> usize {
+        self.stream.length()
+    }
+
     /// Returns the catalog (root) dictionary.
     pub fn catalog(&mut self) -> PDFResult<PDFObject> {
         // Clone the root reference to avoid borrow checker issues
@@ -1010,11 +1017,7 @@ impl XRef {
 
             let trailer_dict = match trailer {
                 PDFObject::Dictionary(dict) => dict,
-                _ => {
-                    return Err(PDFError::Generic(
-                        "Trailer is not a dictionary".to_string(),
-                    ))
-                }
+                _ => return Err(PDFError::Generic("Trailer is not a dictionary".to_string())),
             };
 
             trailer_dict
@@ -1046,11 +1049,7 @@ impl XRef {
 
         let trailer_dict = match trailer {
             PDFObject::Dictionary(dict) => dict,
-            _ => {
-                return Err(PDFError::Generic(
-                    "Trailer is not a dictionary".to_string(),
-                ))
-            }
+            _ => return Err(PDFError::Generic("Trailer is not a dictionary".to_string())),
         };
 
         // Get the ID entry - it's an array of two byte strings
@@ -1069,7 +1068,7 @@ impl XRef {
                         let mut bytes = Vec::new();
                         for i in (0..hex_str.len()).step_by(2) {
                             if i + 1 < hex_str.len() {
-                                let byte_str = &hex_str[i..i+2];
+                                let byte_str = &hex_str[i..i + 2];
                                 if let Ok(byte) = u8::from_str_radix(byte_str, 16) {
                                     bytes.push(byte);
                                 }
@@ -1077,7 +1076,9 @@ impl XRef {
                         }
                         Ok(bytes)
                     }
-                    _ => Err(PDFError::Generic("ID array element is not a string".to_string())),
+                    _ => Err(PDFError::Generic(
+                        "ID array element is not a string".to_string(),
+                    )),
                 }
             }
             _ => Err(PDFError::Generic("ID is not an array".to_string())),
@@ -1148,6 +1149,7 @@ fn read_big_endian(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::parser::Ref; // Import Ref for test code
     use super::*;
     use crate::core::Stream;
 
@@ -1328,13 +1330,11 @@ mod tests {
         // Build the PDF data manually
         let mut data = Vec::new();
 
-            // Binary XRef stream data (12 bytes total: 3 entries * 4 bytes each)
+        // Binary XRef stream data (12 bytes total: 3 entries * 4 bytes each)
         let xref_data = vec![
             // Entry 0: type=0, next_free=0 (0x0000), generation=255 (0xFF)
-            0x00, 0x00, 0x00, 0xFF,
-            // Entry 1: type=1, offset=15 (0x000F), generation=0
-            0x01, 0x00, 0x0F, 0x00,
-            // Entry 2: type=1, offset=79 (0x004F), generation=0
+            0x00, 0x00, 0x00, 0xFF, // Entry 1: type=1, offset=15 (0x000F), generation=0
+            0x01, 0x00, 0x0F, 0x00, // Entry 2: type=1, offset=79 (0x004F), generation=0
             0x01, 0x00, 0x4F, 0x00,
         ];
 
@@ -1410,13 +1410,11 @@ mod tests {
 
         let mut data = Vec::new();
 
-          // Binary XRef stream data (12 bytes total: 3 entries * 4 bytes each)
+        // Binary XRef stream data (12 bytes total: 3 entries * 4 bytes each)
         let xref_data = vec![
             // Entry 0: free
-            0x00, 0x00, 0x00, 0xFF,
-            // Entry 1: compressed in stream 5, index 0
-            0x02, 0x00, 0x05, 0x00,
-            // Entry 2: compressed in stream 5, index 1
+            0x00, 0x00, 0x00, 0xFF, // Entry 1: compressed in stream 5, index 0
+            0x02, 0x00, 0x05, 0x00, // Entry 2: compressed in stream 5, index 1
             0x02, 0x00, 0x05, 0x01,
         ];
 
@@ -1440,7 +1438,11 @@ mod tests {
 
         // Check entry 1 (compressed)
         let entry1 = xref.get_entry(1).unwrap();
-        if let XRefEntry::Compressed { obj_stream_num, index } = entry1 {
+        if let XRefEntry::Compressed {
+            obj_stream_num,
+            index,
+        } = entry1
+        {
             assert_eq!(*obj_stream_num, 5);
             assert_eq!(*index, 0);
         } else {
@@ -1449,7 +1451,11 @@ mod tests {
 
         // Check entry 2 (compressed)
         let entry2 = xref.get_entry(2).unwrap();
-        if let XRefEntry::Compressed { obj_stream_num, index } = entry2 {
+        if let XRefEntry::Compressed {
+            obj_stream_num,
+            index,
+        } = entry2
+        {
             assert_eq!(*obj_stream_num, 5);
             assert_eq!(*index, 1);
         } else {

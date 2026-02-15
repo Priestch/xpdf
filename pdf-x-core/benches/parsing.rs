@@ -1,8 +1,7 @@
 /// Benchmarks for PDF-X parsing performance
 ///
 /// Run with: cargo bench
-
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use pdf_x::PDFDocument;
 use std::fs;
 
@@ -21,15 +20,9 @@ fn benchmark_open(c: &mut Criterion) {
             let file_size = data.len();
             group.throughput(Throughput::Bytes(file_size as u64));
 
-            group.bench_with_input(
-                BenchmarkId::from_parameter(file_path),
-                &data,
-                |b, data| {
-                    b.iter(|| {
-                        PDFDocument::open(black_box(data.clone()))
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::from_parameter(file_path), &data, |b, data| {
+                b.iter(|| PDFDocument::open(black_box(data.clone())));
+            });
         }
     }
 
@@ -51,9 +44,7 @@ fn benchmark_open_file(c: &mut Criterion) {
                 BenchmarkId::from_parameter(file_path),
                 file_path,
                 |b, path| {
-                    b.iter(|| {
-                        PDFDocument::open_file(black_box(path), None, None)
-                    });
+                    b.iter(|| PDFDocument::open_file(black_box(path), None, None));
                 },
             );
         }
@@ -70,15 +61,11 @@ fn benchmark_text_extraction(c: &mut Criterion) {
     if let Ok(mut doc) = PDFDocument::open_file(file_path, None, None) {
         if let Ok(page) = doc.get_page(0) {
             group.bench_function("extract_text_page_0", |b| {
-                b.iter(|| {
-                    page.extract_text(black_box(doc.xref_mut()))
-                });
+                b.iter(|| page.extract_text(black_box(doc.xref_mut())));
             });
 
             group.bench_function("extract_text_as_string_page_0", |b| {
-                b.iter(|| {
-                    page.extract_text_as_string(black_box(doc.xref_mut()))
-                });
+                b.iter(|| page.extract_text_as_string(black_box(doc.xref_mut())));
             });
         }
     }

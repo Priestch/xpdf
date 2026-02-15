@@ -105,6 +105,82 @@ cargo fmt
 cargo clippy
 ```
 
+## **CRITICAL RULE: Always Check References Before Implementing**
+
+This is a **NON-NEGOTIABLE** development practice that MUST be followed for ALL features:
+
+**Before implementing ANY feature, algorithm, or conversion, you MUST:**
+
+1. **Search PDF.js source code** (`pdf.js/src/`) for the corresponding implementation
+2. **Check hayro libraries** (`../hayro/`) for existing implementations
+3. **Copy the exact algorithm** from the reference, adapting it to Rust
+4. **Add code comments** with the reference file path
+
+**Why This Matters:**
+
+When implementing features without consulting references, you introduce bugs that could have been avoided. For example:
+
+❌ **WRONG**: Implementing CMYK to RGB conversion using a naive formula
+```rust
+// Naive, incorrect implementation
+let c = 255.0 - chunk[0] as f32;
+let r = (c * k / 255.0) as u8;  // Produces wrong colors
+```
+
+✅ **CORRECT**: Using PDF.js's proven polynomial coefficients
+```rust
+// Reference: pdf.js/src/core/colorspace.js - DeviceCmykCS.#toRgb
+// Uses polynomial coefficients derived from US Web Coated (SWOP) colorspace
+let r = 255.0 +
+    c * (-4.387332384609988 * c + 54.48615194189176 * m + ...) +
+    m * (1.7149763477362134 * m - 5.6096736904047315 * y + ...) +
+    y * (-2.5217340131683033 * y - 21.248923337353073 * k + ...) +
+    k * (-21.86122147463605 * k - 189.48180835922747);
+```
+
+**Reference Checking Workflow:**
+
+```bash
+# 1. Search PDF.js for the feature
+grep -r "CMYK\|cmyk" ../pdf.js/src/core/
+
+# 2. Find the specific implementation
+#    - ../pdf.js/src/core/colorspace.js for color conversions
+#    - ../pdf.js/src/core/image.js for image handling
+#    - ../pdf.js/src/core/evaluator.js for content stream operators
+
+# 3. Check hayro libraries
+ls ../hayro/hayro-*/src/
+```
+
+**What to Reference:**
+
+| Feature | PDF.js Location | Hayro Library |
+|---------|-----------------|---------------|
+| Color spaces (CMYK, Lab, etc.) | `core/colorspace.js` | N/A |
+| Image decoding | `core/image.js`, `core/jpg.js` | N/A |
+| Content stream operators | `core/evaluator.js` | N/A |
+| Font handling | `core/font.js`, `core/cff_parser.js` | `hayro-font/` |
+| JPEG2000 decoding | N/A | `hayro-jpeg2000/` |
+| JBIG2 decoding | N/A | `hayro-jbig2/` |
+
+**Consequences of Not Checking References:**
+
+- **Incorrect implementations** that produce wrong results
+- **Wasted time** debugging issues already solved in PDF.js
+- **Incompatibility** with PDF files that work in PDF.js
+- **Technical debt** that must be fixed later
+
+**This rule applies to:**
+- All color space conversions (CMYK, Lab, ICC-based, etc.)
+- All image format handling (JPEG, PNG, JPEG2000, JBIG2, etc.)
+- All content stream operators (text, paths, images, etc.)
+- All font parsing (Type1, TrueType, CFF, etc.)
+- All encryption algorithms (RC4, AES-128, AES-256, etc.)
+- All compression algorithms (Flate, ASCIIHex, ASCII85, etc.)
+
+**Remember**: PDF.js has 10+ years of bug fixes and real-world testing. Their implementations are proven to work with thousands of PDF files. Always leverage this knowledge.
+
 ## Progressive Loading Implementation Notes
 
 Progressive loading is the **core differentiator** of this project. Key concepts from PDF.js to replicate:

@@ -1,7 +1,7 @@
 //! Font loading and text shaping.
 
+use rustybuzz::{Face as BuzzFace, GlyphBuffer, UnicodeBuffer};
 use ttf_parser::{Face, FaceParsingError};
-use rustybuzz::{UnicodeBuffer, GlyphBuffer, Face as BuzzFace};
 
 pub struct Font {
     face: Face<'static>,

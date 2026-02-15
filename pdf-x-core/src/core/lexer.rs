@@ -121,7 +121,7 @@ impl Lexer {
     /// Checks if a character is whitespace according to PDF spec.
     ///
     /// PDF whitespace: NUL, TAB, LF, FF, CR, SPACE
-    #[inline(always)]  // Hot function - called in tight loops
+    #[inline(always)] // Hot function - called in tight loops
     fn is_whitespace(ch: i32) -> bool {
         matches!(ch, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
     }
@@ -129,7 +129,7 @@ impl Lexer {
     /// Checks if a character is a delimiter according to PDF spec.
     ///
     /// PDF delimiters: ( ) < > [ ] { } / %
-    #[inline(always)]  // Hot function - called in tight loops
+    #[inline(always)] // Hot function - called in tight loops
     fn is_delimiter(ch: i32) -> bool {
         matches!(
             ch,
@@ -138,7 +138,7 @@ impl Lexer {
     }
 
     /// Checks if a character is special (whitespace or delimiter).
-    #[inline(always)]  // Hot function - called in tight loops
+    #[inline(always)] // Hot function - called in tight loops
     fn is_special(ch: i32) -> bool {
         Self::is_whitespace(ch) || Self::is_delimiter(ch)
     }
@@ -438,8 +438,8 @@ impl Lexer {
                         0x6E => self.str_buf.push(b'\n'), // \n
                         0x72 => self.str_buf.push(b'\r'), // \r
                         0x74 => self.str_buf.push(b'\t'), // \t
-                        0x62 => self.str_buf.push(0x08), // \b (backspace)
-                        0x66 => self.str_buf.push(0x0C), // \f (form feed)
+                        0x62 => self.str_buf.push(0x08),  // \b (backspace)
+                        0x66 => self.str_buf.push(0x0C),  // \f (form feed)
                         0x5C | 0x28 | 0x29 => {
                             // \\, \(, \)
                             self.str_buf.push(ch as u8);
@@ -679,7 +679,7 @@ impl Lexer {
     /// 'stream' and 'endstream' keywords.
     ///
     /// IMPORTANT: This uses current_char if available, then reads from stream.
-    #[inline]  // Called frequently when reading stream data
+    #[inline] // Called frequently when reading stream data
     pub fn get_stream_byte(&mut self) -> PDFResult<u8> {
         let byte = if self.current_char >= 0 {
             self.current_char as u8
@@ -917,7 +917,10 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut lexer = Lexer::new(stream).unwrap();
 
-        assert_eq!(lexer.get_object().unwrap(), Token::String(b"hello".to_vec()));
+        assert_eq!(
+            lexer.get_object().unwrap(),
+            Token::String(b"hello".to_vec())
+        );
     }
 
     #[test]
@@ -1004,10 +1007,7 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut lexer = Lexer::new(stream).unwrap();
 
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::HexString(b"A".to_vec())
-        );
+        assert_eq!(lexer.get_object().unwrap(), Token::HexString(b"A".to_vec()));
     }
 
     #[test]
@@ -1028,10 +1028,7 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut lexer = Lexer::new(stream).unwrap();
 
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Name("Type".to_string())
-        );
+        assert_eq!(lexer.get_object().unwrap(), Token::Name("Type".to_string()));
     }
 
     #[test]
@@ -1052,10 +1049,7 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut lexer = Lexer::new(stream).unwrap();
 
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Name("A/B".to_string())
-        );
+        assert_eq!(lexer.get_object().unwrap(), Token::Name("A/B".to_string()));
     }
 
     #[test]
@@ -1064,18 +1058,9 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut lexer = Lexer::new(stream).unwrap();
 
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Name("Type".to_string())
-        );
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Name("Font".to_string())
-        );
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Name("Name".to_string())
-        );
+        assert_eq!(lexer.get_object().unwrap(), Token::Name("Type".to_string()));
+        assert_eq!(lexer.get_object().unwrap(), Token::Name("Font".to_string()));
+        assert_eq!(lexer.get_object().unwrap(), Token::Name("Name".to_string()));
     }
 
     #[test]
@@ -1111,14 +1096,8 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut lexer = Lexer::new(stream).unwrap();
 
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Command("q".to_string())
-        );
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Command("Q".to_string())
-        );
+        assert_eq!(lexer.get_object().unwrap(), Token::Command("q".to_string()));
+        assert_eq!(lexer.get_object().unwrap(), Token::Command("Q".to_string()));
         assert_eq!(
             lexer.get_object().unwrap(),
             Token::Command("BT".to_string())
@@ -1136,18 +1115,9 @@ mod tests {
         let mut lexer = Lexer::new(stream).unwrap();
 
         assert_eq!(lexer.get_object().unwrap(), Token::DictStart);
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Name("Type".to_string())
-        );
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Name("Font".to_string())
-        );
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Name("Size".to_string())
-        );
+        assert_eq!(lexer.get_object().unwrap(), Token::Name("Type".to_string()));
+        assert_eq!(lexer.get_object().unwrap(), Token::Name("Font".to_string()));
+        assert_eq!(lexer.get_object().unwrap(), Token::Name("Size".to_string()));
         assert_eq!(lexer.get_object().unwrap(), Token::Number(12.0));
         assert_eq!(lexer.get_object().unwrap(), Token::DictEnd);
     }
@@ -1161,10 +1131,7 @@ mod tests {
         assert_eq!(lexer.get_object().unwrap(), Token::ArrayStart);
         assert_eq!(lexer.get_object().unwrap(), Token::Number(1.0));
         assert_eq!(lexer.get_object().unwrap(), Token::Number(2.5));
-        assert_eq!(
-            lexer.get_object().unwrap(),
-            Token::Name("Name".to_string())
-        );
+        assert_eq!(lexer.get_object().unwrap(), Token::Name("Name".to_string()));
         assert_eq!(
             lexer.get_object().unwrap(),
             Token::String(b"string".to_vec())
@@ -1191,13 +1158,23 @@ mod tests {
     #[test]
     fn test_single_decimal_or_sign_as_zero() {
         // These should all parse as 0
-        let test_cases = vec![b".".to_vec(), b"-".to_vec(), b"+".to_vec(), b"-.".to_vec(), b"+.".to_vec()];
+        let test_cases = vec![
+            b".".to_vec(),
+            b"-".to_vec(),
+            b"+".to_vec(),
+            b"-.".to_vec(),
+            b"+.".to_vec(),
+        ];
 
         for data in test_cases {
             let stream = Box::new(Stream::from_bytes(data.clone())) as Box<dyn BaseStream>;
             let mut lexer = Lexer::new(stream).unwrap();
-            assert_eq!(lexer.get_object().unwrap(), Token::Number(0.0),
-                "Failed for input: {:?}", String::from_utf8_lossy(&data));
+            assert_eq!(
+                lexer.get_object().unwrap(),
+                Token::Number(0.0),
+                "Failed for input: {:?}",
+                String::from_utf8_lossy(&data)
+            );
         }
     }
 

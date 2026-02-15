@@ -94,8 +94,8 @@ macro_rules! retry_on_data_missing_with_limit {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::error::{PDFError, PDFResult};
     use crate::core::base_stream::BaseStream;
+    use crate::core::error::{PDFError, PDFResult};
     use crate::core::stream::Stream;
 
     #[test]
@@ -103,9 +103,7 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5];
         let mut stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
 
-        let result: PDFResult<u8> = retry_on_data_missing!(stream, {
-            stream.get_byte()
-        });
+        let result: PDFResult<u8> = retry_on_data_missing!(stream, { stream.get_byte() });
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 1);
@@ -123,14 +121,12 @@ mod tests {
         stream.get_byte()?;
 
         // Now reading should fail with UnexpectedEndOfStream
-        let result: PDFResult<u8> = retry_on_data_missing!(stream, {
-            stream.get_byte()
-        });
+        let result: PDFResult<u8> = retry_on_data_missing!(stream, { stream.get_byte() });
 
         assert!(result.is_err());
         // Should be UnexpectedEndOfStream, not DataMissing
         match result {
-            Err(PDFError::UnexpectedEndOfStream) => {},
+            Err(PDFError::UnexpectedEndOfStream) => {}
             _ => panic!("Expected UnexpectedEndOfStream, got {:?}", result),
         }
         Ok(())

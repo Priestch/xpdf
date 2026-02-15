@@ -3,10 +3,10 @@
 //! These tests validate the exception-driven progressive loading architecture.
 //! Based on PDF.js's fetch_stream_spec.js and common_pdfstream_tests.js
 
-use pdf_x_core::core::*;
-use pdf_x_core::core::file_chunked_stream::FileChunkedStream;
 use pdf_x_core::core::base_stream::BaseStream;
+use pdf_x_core::core::file_chunked_stream::FileChunkedStream;
 use pdf_x_core::core::stream::Stream;
+use pdf_x_core::core::*;
 use pdf_x_core::retry_on_data_missing;
 
 #[test]
@@ -22,19 +22,27 @@ fn test_chunk_caching_behavior() {
     // Create stream with small cache (2 chunks)
     let mut stream = FileChunkedStream::open(
         test_pdf,
-        Some(4096),  // 4KB chunks
-        Some(2),      // Cache 2 chunks
-    ).expect("Should create stream");
+        Some(4096), // 4KB chunks
+        Some(2),    // Cache 2 chunks
+    )
+    .expect("Should create stream");
 
     // Load first chunk
-    let _data1 = stream.get_byte_range(0, 100).expect("Should load first chunk");
+    let _data1 = stream
+        .get_byte_range(0, 100)
+        .expect("Should load first chunk");
     let chunks_after_first = stream.num_chunks_loaded();
     assert!(chunks_after_first > 0, "Should have loaded chunk");
 
     // Access same range again - should use cached chunk
-    let _data2 = stream.get_byte_range(0, 100).expect("Should use cached chunk");
+    let _data2 = stream
+        .get_byte_range(0, 100)
+        .expect("Should use cached chunk");
     let chunks_after_second = stream.num_chunks_loaded();
-    assert_eq!(chunks_after_second, chunks_after_first, "Should not load additional chunks");
+    assert_eq!(
+        chunks_after_second, chunks_after_first,
+        "Should not load additional chunks"
+    );
 }
 
 #[test]
@@ -50,20 +58,29 @@ fn test_chunk_eviction_from_cache() {
     // Create stream with tiny cache (1 chunk)
     let mut stream = FileChunkedStream::open(
         test_pdf,
-        Some(1024),  // 1KB chunks
-        Some(1),      // Cache only 1 chunk
-    ).expect("Should create stream");
+        Some(1024), // 1KB chunks
+        Some(1),    // Cache only 1 chunk
+    )
+    .expect("Should create stream");
 
     // Load first chunk
-    let _data1 = stream.get_byte_range(0, 100).expect("Should load first chunk");
+    let _data1 = stream
+        .get_byte_range(0, 100)
+        .expect("Should load first chunk");
     assert_eq!(stream.num_chunks_loaded(), 1, "Should have 1 chunk cached");
 
     // Load a far-away chunk (should evict first chunk from cache)
     let file_size = stream.length();
-    let _data2 = stream.get_byte_range(file_size - 100, file_size).expect("Should load last chunk");
+    let _data2 = stream
+        .get_byte_range(file_size - 100, file_size)
+        .expect("Should load last chunk");
 
     // Cache size should still be 1, but we loaded 2 chunks total
-    assert_eq!(stream.num_chunks_loaded(), 1, "Cache should only hold 1 chunk at a time");
+    assert_eq!(
+        stream.num_chunks_loaded(),
+        1,
+        "Cache should only hold 1 chunk at a time"
+    );
 }
 
 #[test]
@@ -96,9 +113,7 @@ fn test_retry_macro_basic() -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
 
     // The retry macro should work with operations that don't throw DataMissing
-    let result = retry_on_data_missing!(stream, {
-        stream.get_byte()
-    });
+    let result = retry_on_data_missing!(stream, { stream.get_byte() });
 
     assert!(result.is_ok(), "Retry macro should succeed");
     assert_eq!(result.unwrap(), 1, "Should get first byte");
@@ -117,9 +132,10 @@ fn test_get_missing_chunks_list() {
 
     let stream = FileChunkedStream::open(
         test_pdf,
-        Some(2048),  // 2KB chunks
-        Some(5),      // Cache 5 chunks
-    ).expect("Should create stream");
+        Some(2048), // 2KB chunks
+        Some(5),    // Cache 5 chunks
+    )
+    .expect("Should create stream");
 
     // Initially, no chunks are loaded
     let missing = stream.get_missing_chunks();
@@ -130,7 +146,10 @@ fn test_get_missing_chunks_list() {
 
     // Missing chunks list should be updated
     let missing_after = stream.get_missing_chunks();
-    assert!(missing_after.len() < missing.len(), "Should have fewer missing chunks");
+    assert!(
+        missing_after.len() < missing.len(),
+        "Should have fewer missing chunks"
+    );
 }
 
 #[test]
@@ -143,11 +162,8 @@ fn test_preload_range() {
         return;
     }
 
-    let mut stream = FileChunkedStream::open(
-        test_pdf,
-        Some(1024),
-        Some(2),
-    ).expect("Should create stream");
+    let mut stream =
+        FileChunkedStream::open(test_pdf, Some(1024), Some(2)).expect("Should create stream");
 
     // Preload a range
     let result = stream.preload_range(1000, 5000);
@@ -167,21 +183,26 @@ fn test_is_fully_loaded() {
         return;
     }
 
-    let mut stream = FileChunkedStream::open(
-        test_pdf,
-        Some(1024),
-        Some(10),
-    ).expect("Should create stream");
+    let mut stream =
+        FileChunkedStream::open(test_pdf, Some(1024), Some(10)).expect("Should create stream");
 
     // Initially not fully loaded
-    assert!(!stream.is_fully_loaded(), "Should not be fully loaded initially");
+    assert!(
+        !stream.is_fully_loaded(),
+        "Should not be fully loaded initially"
+    );
 
     // Read entire file
     let file_size = stream.length();
-    let _data = stream.get_byte_range(0, file_size).expect("Should read entire file");
+    let _data = stream
+        .get_byte_range(0, file_size)
+        .expect("Should read entire file");
 
     // Now should be fully loaded
-    assert!(stream.is_fully_loaded(), "Should be fully loaded after reading all");
+    assert!(
+        stream.is_fully_loaded(),
+        "Should be fully loaded after reading all"
+    );
 }
 
 #[test]
@@ -199,8 +220,8 @@ fn test_pdf_open_with_progressive_loading() {
     // Open with small chunks to simulate network loading
     let result = PDFDocument::open_file(
         test_pdf,
-        Some(2048),  // 2KB chunks
-        Some(3),      // Cache 3 chunks
+        Some(2048), // 2KB chunks
+        Some(3),    // Cache 3 chunks
     );
 
     assert!(result.is_ok(), "Should open PDF with progressive loading");
@@ -227,11 +248,7 @@ fn test_lazy_page_loading() {
 
     use pdf_x_core::core::PDFDocument;
 
-    let mut doc = PDFDocument::open_file(
-        test_pdf,
-        Some(4096),
-        Some(3),
-    ).expect("Should open PDF");
+    let mut doc = PDFDocument::open_file(test_pdf, Some(4096), Some(3)).expect("Should open PDF");
 
     // Get page count without loading page contents
     let page_count = doc.page_count().expect("Should get page count");
@@ -254,11 +271,7 @@ fn test_xref_stream_parsing() {
 
     use pdf_x_core::core::PDFDocument;
 
-    let result = PDFDocument::open_file(
-        test_pdf,
-        Some(4096),
-        Some(3),
-    );
+    let result = PDFDocument::open_file(test_pdf, Some(4096), Some(3));
 
     assert!(result.is_ok(), "Should open PDF with XRef stream");
 }
@@ -275,11 +288,7 @@ fn test_incremental_updates_parsing() {
 
     use pdf_x_core::core::PDFDocument;
 
-    let result = PDFDocument::open_file(
-        test_pdf,
-        Some(4096),
-        Some(5),
-    );
+    let result = PDFDocument::open_file(test_pdf, Some(4096), Some(5));
 
     assert!(result.is_ok(), "Should open PDF with incremental updates");
 
@@ -287,7 +296,10 @@ fn test_incremental_updates_parsing() {
 
     // Should be able to access document despite incremental updates
     let page_count = doc.page_count();
-    assert!(page_count.is_ok(), "Should get page count from incremental PDF");
+    assert!(
+        page_count.is_ok(),
+        "Should get page count from incremental PDF"
+    );
 }
 
 #[test]
@@ -302,11 +314,7 @@ fn test_linearized_pdf_loading() {
 
     use pdf_x_core::core::PDFDocument;
 
-    let result = PDFDocument::open_file(
-        test_pdf,
-        Some(4096),
-        Some(5),
-    );
+    let result = PDFDocument::open_file(test_pdf, Some(4096), Some(5));
 
     assert!(result.is_ok(), "Should open linearized PDF");
 
@@ -327,18 +335,19 @@ fn test_chunk_boundaries() {
         return;
     }
 
-    let mut stream = FileChunkedStream::open(
-        test_pdf,
-        Some(1024),
-        Some(5),
-    ).expect("Should create stream");
+    let mut stream =
+        FileChunkedStream::open(test_pdf, Some(1024), Some(5)).expect("Should create stream");
 
     // Read first chunk
-    let chunk1 = stream.get_byte_range(0, 1024).expect("Should read first chunk");
+    let chunk1 = stream
+        .get_byte_range(0, 1024)
+        .expect("Should read first chunk");
     assert_eq!(chunk1.len(), 1024, "First chunk should be 1KB");
 
     // Read second chunk
-    let chunk2 = stream.get_byte_range(1024, 2048).expect("Should read second chunk");
+    let chunk2 = stream
+        .get_byte_range(1024, 2048)
+        .expect("Should read second chunk");
     assert_eq!(chunk2.len(), 1024, "Second chunk should be 1KB");
 
     // Verify data integrity - first chunk should have PDF header
@@ -360,13 +369,21 @@ fn test_random_access_chunk_loading() {
     let file_size = stream.length();
 
     // Jump to end and read
-    let end_data = stream.get_byte_range(file_size - 100, file_size).expect("Should read from end");
+    let end_data = stream
+        .get_byte_range(file_size - 100, file_size)
+        .expect("Should read from end");
     assert_eq!(end_data.len(), 100, "Should read 100 bytes from end");
 
     // Jump back to beginning
-    let start_data = stream.get_byte_range(0, 50).expect("Should read from beginning");
+    let start_data = stream
+        .get_byte_range(0, 50)
+        .expect("Should read from beginning");
     assert_eq!(start_data.len(), 50, "Should read 50 bytes from beginning");
 
     // Verify we got the PDF header at the beginning
-    assert_eq!(&start_data[0..4], b"%PDF", "Should have PDF header at beginning");
+    assert_eq!(
+        &start_data[0..4],
+        b"%PDF",
+        "Should have PDF header at beginning"
+    );
 }

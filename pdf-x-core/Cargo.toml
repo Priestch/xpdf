@@ -21,7 +21,7 @@ tokio = { workspace = true, optional = true }
 sha2 = { version = "0.10", optional = true }
 
 # Hayro dependencies (direct paths - they have their own workspace)
-hayro-font = { path = "../hayro/hayro-font", default-features = false }
+hayro-font = { path = "../hayro/hayro-font", default-features = false, optional = true }
 
 # Optional image decoding
 zune-jpeg = { workspace = true, optional = true }
@@ -41,12 +41,14 @@ png-decoding = ["image"]
 advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
 async = ["reqwest", "tokio"]
 crypto = ["sha2"]  # AES implementation is now built-in, only SHA-2 is external
-rendering = ["tiny-skia", "rustybuzz", "ttf-parser"]  # Canvas rendering support
+rendering = ["tiny-skia", "rustybuzz", "ttf-parser", "hayro-font"]  # Canvas rendering support
+debug-logging = []  # Enable verbose debug logging for rendering operations
 
 [dev-dependencies]
 tempfile = "3.14"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.5"
+hex = "0.4"
 
 [[bench]]
 name = "parsing"
@@ -60,6 +62,16 @@ required-features = ["rendering"]
 [[test]]
 name = "render_pdf_example"
 path = "tests/render_pdf_example.rs"
+required-features = ["rendering"]
+
+[[test]]
+name = "coordinate_transform_test"
+path = "tests/coordinate_transform_test.rs"
+required-features = ["rendering"]
+
+[[test]]
+name = "image_rendering_test"
+path = "tests/image_rendering_test.rs"
 required-features = ["rendering"]
 
 [[example]]

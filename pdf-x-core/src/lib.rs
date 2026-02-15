@@ -104,16 +104,17 @@ pub mod rendering;
 
 // Re-export main types for convenience
 pub use core::{
-    Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags,
-    AnnotationRect, AnnotationType, BaseStream, DestinationType, FileAttachmentAnnotation,
-    FileChunkedStream, FormFieldType, ImageDecoder, ImageFormat, LinearizedInfo, Lexer,
-    LinkAction, LinkAnnotation, OutlineDestination, OutlineItem, Page, PDFDocument, PDFError,
-    PDFObject, Parser, PopupAnnotation, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation,
-    XRef, XRefEntry,
+    Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags, AnnotationRect,
+    AnnotationType, BaseStream, DestinationType, FileAttachmentAnnotation, FileChunkedStream,
+    FormFieldType, ImageDecoder, ImageFormat, Lexer, LinearizedInfo, LinkAction, LinkAnnotation,
+    OutlineDestination, OutlineItem, PDFDocument, PDFError, PDFObject, Page, Parser,
+    PopupAnnotation, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef, XRefEntry,
 };
 
 // Re-export rendering types
-pub use rendering::{Device, GraphicsState, Paint, Path, PathBuilder, PathDrawMode, RenderingContext};
+pub use rendering::{
+    Device, GraphicsState, Paint, Path, PathBuilder, PathDrawMode, RenderingContext,
+};
 
 #[cfg(feature = "rendering")]
 pub use rendering::SkiaDevice;

@@ -307,7 +307,10 @@ impl OpCode {
             "BX" => Ok(OpCode::BeginCompat),
             "EX" => Ok(OpCode::EndCompat),
 
-            _ => Err(PDFError::content_stream_error(format!("Unknown PDF operator: '{}'", cmd))),
+            _ => Err(PDFError::content_stream_error(format!(
+                "Unknown PDF operator: '{}'",
+                cmd
+            ))),
         }
     }
 
@@ -649,7 +652,9 @@ impl ContentStreamEvaluator {
             OpCode::MoveText => {
                 if op.args.len() >= 2 && self.text_state.in_text_object {
                     // Td - move text position
-                    if let (PDFObject::Number(tx), PDFObject::Number(ty)) = (&op.args[0], &op.args[1]) {
+                    if let (PDFObject::Number(tx), PDFObject::Number(ty)) =
+                        (&op.args[0], &op.args[1])
+                    {
                         // Update line matrix: Tlm = Tlm * [1 0 0 1 tx ty]
                         self.text_state.text_line_matrix[4] += tx;
                         self.text_state.text_line_matrix[5] += ty;
@@ -661,7 +666,8 @@ impl ContentStreamEvaluator {
             OpCode::NextLine => {
                 if self.text_state.in_text_object {
                     // T* - move to next line using leading
-                    self.text_state.text_line_matrix[5] -= self.text_state.text_line_matrix[5] * 0.0; // Simplified
+                    self.text_state.text_line_matrix[5] -=
+                        self.text_state.text_line_matrix[5] * 0.0; // Simplified
                     self.text_state.text_matrix = self.text_state.text_line_matrix;
                 }
             }
@@ -717,7 +723,8 @@ impl ContentStreamEvaluator {
                                     }
 
                                     // Adjust text position for spacing
-                                    let font_size = self.text_state.current_font_size.unwrap_or(12.0);
+                                    let font_size =
+                                        self.text_state.current_font_size.unwrap_or(12.0);
                                     self.text_state.text_matrix[4] -= spacing * font_size * 0.001;
                                 }
                                 _ => {}
@@ -749,25 +756,46 @@ impl ContentStreamEvaluator {
     /// Decodes text bytes using the current font's encoding (CMap).
     ///
     /// This method converts character codes (CIDs) to Unicode characters using
-    /// the font's ToUnicode CMap if available. Falls back to UTF-8/Latin-1 if no font is loaded.
+    /// the font's ToUnicode CMap if available, with fallback to encoding tables.
+    ///
+    /// For CID fonts: Multi-byte character codes (typically 2 bytes)
+    /// For simple fonts: Single-byte character codes
     ///
     /// # Arguments
     /// * `text_bytes` - Raw text bytes from the PDF content stream
     ///
     /// # Returns
     /// Decoded Unicode string
-    #[inline]  // Hot path during text extraction
+    #[inline] // Hot path during text extraction
     fn decode_text(&self, text_bytes: &[u8]) -> String {
         // Try to use the current font's CMap
         if let Some(ref font_name) = self.text_state.current_font_name {
             if let Some(font) = self.fonts.get(font_name) {
-                // Decode using font's ToUnicode CMap
                 let mut decoded = String::new();
 
-                for &byte in text_bytes {
-                    let cid = byte as u16;
-                    let unicode_char = font.to_unicode(cid);
-                    decoded.push(unicode_char);
+                // Check if this is a CID font (multi-byte character codes)
+                if font.font_type().is_cid_font() {
+                    // CID fonts use multi-byte character codes (typically 2 bytes)
+                    let mut i = 0;
+                    while i + 1 < text_bytes.len() {
+                        // Combine two bytes to form a CID
+                        let cid = u16::from_be_bytes([text_bytes[i], text_bytes[i + 1]]);
+                        let unicode_char = font.char_code_to_unicode(cid);
+                        decoded.push(unicode_char);
+                        i += 2;
+                    }
+                    // Handle any remaining single byte
+                    if i < text_bytes.len() {
+                        let cid = text_bytes[i] as u16;
+                        decoded.push(font.char_code_to_unicode(cid));
+                    }
+                } else {
+                    // Simple fonts use single-byte character codes
+                    for &byte in text_bytes {
+                        let cid = byte as u16;
+                        let unicode_char = font.char_code_to_unicode(cid);
+                        decoded.push(unicode_char);
+                    }
                 }
 
                 return decoded;
@@ -1008,7 +1036,7 @@ mod tests {
         // -50 and -50 don't trigger space, 100 is positive so no space
         // Note: " Wo" already has a leading space in the PDF
         assert_eq!(text_items.len(), 1);
-        assert_eq!(text_items[0].text, "Hello World");  // Space from " Wo" string
+        assert_eq!(text_items[0].text, "Hello World"); // Space from " Wo" string
         assert_eq!(text_items[0].font_name, Some("F1".to_string()));
         assert_eq!(text_items[0].font_size, Some(12.0));
     }
@@ -1100,8 +1128,8 @@ mod tests {
         assert_eq!(op.args.len(), 4);
         assert_eq!(op.args[0], PDFObject::Number(100.0)); // x
         assert_eq!(op.args[1], PDFObject::Number(200.0)); // y
-        assert_eq!(op.args[2], PDFObject::Number(50.0));  // width
-        assert_eq!(op.args[3], PDFObject::Number(75.0));  // height
+        assert_eq!(op.args[2], PDFObject::Number(50.0)); // width
+        assert_eq!(op.args[3], PDFObject::Number(75.0)); // height
     }
 
     // ============================================================================
@@ -1242,9 +1270,9 @@ mod tests {
 
         assert_eq!(op.op, OpCode::SetStrokeRGBColor);
         assert_eq!(op.args.len(), 3);
-        assert_eq!(op.args[0], PDFObject::Number(1.0));   // R
-        assert_eq!(op.args[1], PDFObject::Number(0.5));   // G
-        assert_eq!(op.args[2], PDFObject::Number(0.25));  // B
+        assert_eq!(op.args[0], PDFObject::Number(1.0)); // R
+        assert_eq!(op.args[1], PDFObject::Number(0.5)); // G
+        assert_eq!(op.args[2], PDFObject::Number(0.25)); // B
     }
 
     #[test]

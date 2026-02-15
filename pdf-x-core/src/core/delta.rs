@@ -3,9 +3,9 @@
 //! The delta layer enables editing capabilities while keeping the base PDF immutable.
 //! All modifications are tracked separately and can be applied as incremental updates.
 
-use std::collections::{HashMap, HashSet};
 use crate::core::error::{PDFError, PDFResult};
 use crate::core::parser::{PDFObject, Ref};
+use std::collections::{HashMap, HashSet};
 
 /// Object reference ID (object number and generation number).
 pub type ObjectId = (u32, u32);
@@ -72,13 +72,30 @@ pub struct DeltaObject {
     pub generation: u32,
 }
 
+/// Callback type for fetching objects from the base PDF.
+///
+/// This function takes an object reference and returns the object
+/// from the base PDF (or an error if not found).
+///
+/// Note: This is a function pointer rather than a trait object to allow
+/// stack-allocated closures to be passed by reference without requiring `Rc`.
+pub type BaseObjectFetcher<'a> = dyn Fn(Ref) -> PDFResult<PDFObject> + 'a;
+
 /// Command for reversible operations (undo/redo).
 ///
 /// All modifications through the delta layer should use commands
 /// to enable undo/redo functionality.
 pub trait Command {
     /// Execute the command
-    fn execute(&mut self, delta: &mut DeltaLayer) -> PDFResult<()>;
+    ///
+    /// # Arguments
+    /// * `delta` - The delta layer to modify
+    /// * `fetch_base` - Optional callback to fetch objects from the base PDF
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()>;
 
     /// Undo the command
     fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()>;
@@ -137,11 +154,14 @@ impl DeltaLayer {
         self.deleted.remove(&key);
 
         // Add to modified map
-        self.modified.insert(key, DeltaObject {
-            object: new_obj,
-            obj_num: obj_ref.num,
-            generation: obj_ref.generation,
-        });
+        self.modified.insert(
+            key,
+            DeltaObject {
+                object: new_obj,
+                obj_num: obj_ref.num,
+                generation: obj_ref.generation,
+            },
+        );
     }
 
     /// Add a new object (doesn't exist in base PDF).
@@ -236,8 +256,13 @@ impl DeltaLayer {
     ///
     /// # Arguments
     /// * `cmd` - The command to execute
-    pub fn execute_command(&mut self, mut cmd: Box<dyn Command>) -> PDFResult<()> {
-        cmd.execute(self)?;
+    /// * `fetch_base` - Optional callback to fetch objects from the base PDF
+    pub fn execute_command<'a>(
+        &mut self,
+        mut cmd: Box<dyn Command>,
+        fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        cmd.execute(self, fetch_base)?;
         self.history.push(cmd);
         self.undo_stack.clear(); // Clear redo stack on new command
         Ok(())
@@ -248,7 +273,9 @@ impl DeltaLayer {
     /// # Returns
     /// Error if there's nothing to undo
     pub fn undo(&mut self) -> PDFResult<()> {
-        let mut cmd = self.history.pop()
+        let mut cmd = self
+            .history
+            .pop()
             .ok_or_else(|| PDFError::Generic("Nothing to undo".into()))?;
 
         cmd.undo(self)?;
@@ -261,7 +288,9 @@ impl DeltaLayer {
     /// # Returns
     /// Error if there's nothing to redo
     pub fn redo(&mut self) -> PDFResult<()> {
-        let mut cmd = self.undo_stack.pop()
+        let mut cmd = self
+            .undo_stack
+            .pop()
             .ok_or_else(|| PDFError::Generic("Nothing to redo".into()))?;
 
         cmd.redo(self)?;
@@ -314,6 +343,166 @@ impl DeltaLayer {
     /// Get iterator over deleted object references.
     pub fn iter_deleted(&self) -> impl Iterator<Item = &ObjectId> {
         self.deleted.iter()
+    }
+}
+
+// ========== Common Commands ==========
+
+/// Command to rotate a page.
+///
+/// This command modifies the /Rotate entry in a page dictionary.
+/// The rotation value must be a multiple of 90 (as per PDF spec).
+///
+/// # Example
+/// ```
+/// # use pdf_x_core::core::delta::RotatePageCommand;
+/// # use pdf_x_core::core::parser::Ref;
+/// // Rotate page 5 (object 10) by 90 degrees clockwise
+/// let cmd = RotatePageCommand::new(Ref::new(10, 0), 90);
+/// ```
+#[derive(Debug)]
+pub struct RotatePageCommand {
+    /// The page object reference to rotate
+    page_ref: Ref,
+
+    /// The rotation amount in degrees (must be multiple of 90)
+    degrees: u16,
+
+    /// The original rotation value (for undo)
+    original_rotation: Option<u16>,
+}
+
+impl RotatePageCommand {
+    /// Create a new RotatePageCommand.
+    ///
+    /// # Arguments
+    /// * `page_ref` - The object reference of the page to rotate
+    /// * `degrees` - The rotation amount (must be multiple of 90: 0, 90, 180, 270)
+    ///
+    /// # Panics
+    /// Panics if degrees is not a multiple of 90
+    pub fn new(page_ref: Ref, degrees: u16) -> Self {
+        // Validate that degrees is a multiple of 90
+        if degrees % 90 != 0 {
+            panic!(
+                "Page rotation must be a multiple of 90 degrees, got {}",
+                degrees
+            );
+        }
+
+        Self {
+            page_ref,
+            degrees,
+            original_rotation: None,
+        }
+    }
+}
+
+impl Command for RotatePageCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        // Get the current page object from delta or base PDF
+        let page_dict = match delta.get(&self.page_ref) {
+            Some(delta_obj) => {
+                // Page is already in delta (modified or new)
+                delta_obj.object.clone()
+            }
+            None => {
+                // Page not in delta - fetch from base PDF
+                let fetcher = fetch_base.ok_or_else(|| {
+                    PDFError::Generic(
+                        "Cannot fetch base page object - no fetch callback provided. \
+                        Execute commands through PDFDocument::execute_command() instead."
+                            .into(),
+                    )
+                })?;
+
+                fetcher(self.page_ref)?
+            }
+        };
+
+        // Extract the current dictionary and rotation value
+        let (dict, current_rotation) = match page_dict {
+            PDFObject::Dictionary(d) => {
+                let rotation = d.get("Rotate").and_then(|obj| match obj {
+                    PDFObject::Number(n) => Some(*n as u16),
+                    _ => None,
+                });
+                (d, rotation)
+            }
+            _ => {
+                return Err(PDFError::Generic(format!(
+                    "Page object {} {} is not a dictionary",
+                    self.page_ref.num, self.page_ref.generation
+                )));
+            }
+        };
+
+        // Store original rotation for undo
+        self.original_rotation = current_rotation;
+
+        // Clone the dictionary and modify the rotation
+        let mut new_dict = dict.clone();
+        new_dict.insert("Rotate".to_string(), PDFObject::Number(self.degrees as f64));
+
+        // Modify the page object in delta
+        delta.modify_object(self.page_ref, PDFObject::Dictionary(new_dict));
+
+        Ok(())
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        // Get the current page object (it should be in delta now since we just modified it)
+        let delta_obj = delta.get(&self.page_ref).ok_or_else(|| {
+            PDFError::Generic("Page object not found in delta during undo".into())
+        })?;
+
+        let mut dict = match &delta_obj.object {
+            PDFObject::Dictionary(d) => d.clone(),
+            _ => {
+                return Err(PDFError::Generic(format!(
+                    "Page object {} {} is not a dictionary",
+                    self.page_ref.num, self.page_ref.generation
+                )));
+            }
+        };
+
+        // Restore the original rotation value
+        if let Some(original) = self.original_rotation {
+            dict.insert("Rotate".to_string(), PDFObject::Number(original as f64));
+        } else {
+            // If there was no original rotation, remove the Rotate key
+            dict.remove("Rotate");
+        }
+
+        delta.modify_object(self.page_ref, PDFObject::Dictionary(dict));
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        // Get the current page object
+        let delta_obj = delta.get(&self.page_ref).ok_or_else(|| {
+            PDFError::Generic("Page object not found in delta during redo".into())
+        })?;
+
+        let mut dict = match &delta_obj.object {
+            PDFObject::Dictionary(d) => d.clone(),
+            _ => {
+                return Err(PDFError::Generic(format!(
+                    "Page object {} {} is not a dictionary",
+                    self.page_ref.num, self.page_ref.generation
+                )));
+            }
+        };
+
+        // Re-apply the rotation
+        dict.insert("Rotate".to_string(), PDFObject::Number(self.degrees as f64));
+
+        delta.modify_object(self.page_ref, PDFObject::Dictionary(dict));
+        Ok(())
     }
 }
 
@@ -433,10 +622,19 @@ mod tests {
         delta.add_object(PDFObject::Null);
         assert_eq!(delta.change_count(), 1);
 
-        delta.modify_object(Ref { num: 5, generation: 0 }, PDFObject::Null);
+        delta.modify_object(
+            Ref {
+                num: 5,
+                generation: 0,
+            },
+            PDFObject::Null,
+        );
         assert_eq!(delta.change_count(), 2);
 
-        delta.delete_object(Ref { num: 10, generation: 0 });
+        delta.delete_object(Ref {
+            num: 10,
+            generation: 0,
+        });
         assert_eq!(delta.change_count(), 3);
     }
 }

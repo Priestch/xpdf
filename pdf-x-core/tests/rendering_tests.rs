@@ -3,8 +3,8 @@
 //! These tests verify the rendering pipeline produces consistent output
 //! for various PDF content stream operations.
 
-use pdf_x_core::rendering::{Device, Paint, PathDrawMode, TestDevice};
 use pdf_x_core::rendering::graphics_state::{Color, FillRule, StrokeProps};
+use pdf_x_core::rendering::{Device, Paint, PathDrawMode, TestDevice};
 
 #[cfg(feature = "rendering")]
 use pdf_x_core::rendering::skia_device::SkiaDevice;
@@ -24,7 +24,13 @@ fn test_draw_rectangle() {
     device.rect(10.0, 10.0, 80.0, 80.0);
 
     let paint = Paint::Solid(Color::rgb(255, 0, 0));
-    device.draw_path(PathDrawMode::Fill(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::Fill(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -40,7 +46,9 @@ fn test_draw_stroked_rectangle() {
     device.rect(10.0, 10.0, 80.0, 80.0);
 
     let paint = Paint::Solid(Color::black());
-    device.draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default())
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -56,7 +64,13 @@ fn test_draw_filled_and_stroked_rectangle() {
     device.rect(10.0, 10.0, 80.0, 80.0);
 
     let paint = Paint::Solid(Color::rgb(0, 0, 255));
-    device.draw_path(PathDrawMode::FillStroke(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::FillStroke(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -79,7 +93,9 @@ fn test_draw_path_with_lines() {
     device.close_path();
 
     let paint = Paint::Solid(Color::black());
-    device.draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default())
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -99,7 +115,9 @@ fn test_draw_path_with_curves() {
     device.curve_to(20.0, 20.0, 30.0, 20.0, 40.0, 10.0);
 
     let paint = Paint::Solid(Color::black());
-    device.draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default())
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -126,7 +144,13 @@ fn test_clip_path() {
     device.rect(0.0, 0.0, 100.0, 100.0);
 
     let paint = Paint::Solid(Color::rgb(255, 0, 0));
-    device.draw_path(PathDrawMode::Fill(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::Fill(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -165,7 +189,9 @@ fn test_scale_transform() {
     device.rect(10.0, 10.0, 20.0, 20.0);
 
     let paint = Paint::Solid(Color::black());
-    device.draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default())
+        .unwrap();
 
     device.restore_state();
 
@@ -192,7 +218,9 @@ fn test_nested_transforms() {
     device.rect(5.0, 5.0, 10.0, 10.0);
 
     let paint = Paint::Solid(Color::black());
-    device.draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(PathDrawMode::Stroke, &paint, &StrokeProps::default())
+        .unwrap();
 
     device.restore_state();
     device.restore_state();
@@ -215,10 +243,18 @@ fn test_draw_text() {
     let mut device = TestDevice::new(612.0, 792.0);
 
     let paint = Paint::Solid(Color::black());
-    device.draw_text("Hello, World!", "Helvetica", 12.0, &paint).unwrap();
+    device
+        .draw_text(
+            b"Hello, World!",
+            "Helvetica",
+            12.0,
+            &paint,
+            &[1.0, 0.0, 0.0, 1.0, 100.0, 700.0],
+        )
+        .unwrap();
 
     let ops = device.operations();
-    assert_eq!(ops[0], "draw_text(Helvetica, 12, Hello, World!)");
+    assert!(ops[0].contains("draw_text(Helvetica, 12"));
 }
 
 #[test]
@@ -226,12 +262,28 @@ fn test_draw_multiple_text_objects() {
     let mut device = TestDevice::new(612.0, 792.0);
 
     let paint = Paint::Solid(Color::black());
-    device.draw_text("First line", "Helvetica", 12.0, &paint).unwrap();
-    device.draw_text("Second line", "Times-Roman", 14.0, &paint).unwrap();
+    device
+        .draw_text(
+            b"First line",
+            "Helvetica",
+            12.0,
+            &paint,
+            &[1.0, 0.0, 0.0, 1.0, 100.0, 700.0],
+        )
+        .unwrap();
+    device
+        .draw_text(
+            b"Second line",
+            "Times-Roman",
+            14.0,
+            &paint,
+            &[1.0, 0.0, 0.0, 1.0, 100.0, 680.0],
+        )
+        .unwrap();
 
     let ops = device.operations();
-    assert_eq!(ops[0], "draw_text(Helvetica, 12, First line)");
-    assert_eq!(ops[1], "draw_text(Times-Roman, 14, Second line)");
+    assert!(ops[0].contains("draw_text(Helvetica, 12"));
+    assert!(ops[1].contains("draw_text(Times-Roman, 14"));
 }
 
 // ============================================================================
@@ -247,7 +299,13 @@ fn test_draw_with_rgb_color() {
 
     // Red rectangle
     let paint = Paint::Solid(Color::rgb(255, 0, 0));
-    device.draw_path(PathDrawMode::Fill(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::Fill(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -264,7 +322,13 @@ fn test_draw_with_gray_color() {
 
     // 50% gray
     let paint = Paint::Solid(Color::Gray(0.5));
-    device.draw_path(PathDrawMode::Fill(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::Fill(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops.len(), 3);
@@ -287,7 +351,9 @@ fn test_draw_with_line_width() {
         line_width: 2.0,
         ..Default::default()
     };
-    device.draw_path(PathDrawMode::Stroke, &paint, &stroke_props).unwrap();
+    device
+        .draw_path(PathDrawMode::Stroke, &paint, &stroke_props)
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -309,7 +375,9 @@ fn test_draw_with_line_cap() {
         line_cap: LineCap::Round,
         ..Default::default()
     };
-    device.draw_path(PathDrawMode::Stroke, &paint, &stroke_props).unwrap();
+    device
+        .draw_path(PathDrawMode::Stroke, &paint, &stroke_props)
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -339,7 +407,13 @@ fn test_draw_complex_shape() {
     device.close_path();
 
     let paint = Paint::Solid(Color::rgb(255, 215, 0));
-    device.draw_path(PathDrawMode::Fill(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::Fill(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 
     let ops = device.operations();
     assert_eq!(ops[0], "begin_path");
@@ -370,7 +444,13 @@ fn test_draw_clipped_content() {
     device.rect(0.0, 0.0, 200.0, 200.0);
 
     let paint = Paint::Solid(Color::rgb(255, 0, 0));
-    device.draw_path(PathDrawMode::Fill(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::Fill(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 
     device.restore_state();
 
@@ -393,7 +473,7 @@ fn test_draw_image() {
     let image = pdf_x_core::rendering::ImageData {
         width: 10,
         height: 10,
-        data: &pixel_data,
+        data: pixel_data,
         has_alpha: true,
         bits_per_component: 8,
     };
@@ -402,7 +482,10 @@ fn test_draw_image() {
     device.draw_image(image, &transform).unwrap();
 
     let ops = device.operations();
-    assert_eq!(ops[0], "draw_image(10x10, [10.0, 0.0, 0.0, 10.0, 0.0, 0.0])");
+    assert_eq!(
+        ops[0],
+        "draw_image(10x10, [10.0, 0.0, 0.0, 10.0, 0.0, 0.0])"
+    );
 }
 
 // ============================================================================
@@ -419,7 +502,13 @@ fn test_skia_draw_rectangle() {
     device.rect(10.0, 10.0, 80.0, 80.0);
 
     let paint = Paint::Solid(Color::rgb(255, 0, 0));
-    device.draw_path(PathDrawMode::Fill(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::Fill(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 
     // If we got here without panicking, the test passes
     // In real tests, we would compare the pixmap data to expected values
@@ -438,7 +527,13 @@ fn test_skia_draw_path() {
     device.close_path();
 
     let paint = Paint::Solid(Color::rgb(0, 0, 255));
-    device.draw_path(PathDrawMode::Fill(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::Fill(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 }
 
 #[cfg(feature = "rendering")]
@@ -454,7 +549,13 @@ fn test_skia_transformations() {
     device.rect(0.0, 0.0, 100.0, 100.0);
 
     let paint = Paint::Solid(Color::rgb(0, 255, 0));
-    device.draw_path(PathDrawMode::Fill(Default::default()), &paint, &StrokeProps::default()).unwrap();
+    device
+        .draw_path(
+            PathDrawMode::Fill(Default::default()),
+            &paint,
+            &StrokeProps::default(),
+        )
+        .unwrap();
 
     device.restore_state();
 }

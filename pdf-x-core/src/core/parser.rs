@@ -260,9 +260,9 @@ impl Parser {
 
             // Array/dict end tokens are errors here (should be consumed by parse_array/parse_dictionary)
             Token::ArrayEnd => Err(PDFError::Generic("Unexpected array end token".to_string())),
-            Token::DictEnd => {
-                Err(PDFError::Generic("Unexpected dictionary end token".to_string()))
-            }
+            Token::DictEnd => Err(PDFError::Generic(
+                "Unexpected dictionary end token".to_string(),
+            )),
 
             // Number: could be the start of an indirect reference (N1 N2 R)
             Token::Number(n) => {
@@ -311,7 +311,9 @@ impl Parser {
 
             // Check for EOF (error: unterminated array)
             if let Some(Token::EOF) = &self.buf1 {
-                return Err(PDFError::Generic("Unterminated array (missing ']')".to_string()));
+                return Err(PDFError::Generic(
+                    "Unterminated array (missing ']')".to_string(),
+                ));
             }
 
             // Parse the next object in the array with error recovery
@@ -386,7 +388,7 @@ impl Parser {
                 None => {
                     return Err(PDFError::Generic(
                         "Unexpected empty buffer in dictionary parsing".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -411,7 +413,10 @@ impl Parser {
                 Err(e) => {
                     // Try to recover from parsing errors by inserting null
                     // and continuing with the next key-value pair
-                    eprintln!("Warning: Error parsing dictionary value for key '{}': {:?}, using null", key, e);
+                    eprintln!(
+                        "Warning: Error parsing dictionary value for key '{}': {:?}, using null",
+                        key, e
+                    );
                     PDFObject::Null
                 }
             };
@@ -512,7 +517,9 @@ impl Parser {
                         Ok(resolved) => match resolved {
                             PDFObject::Number(n) => Some(n as usize),
                             _ => {
-                                eprintln!("Warning: Resolved /Length is not a number, scanning for endstream");
+                                eprintln!(
+                                    "Warning: Resolved /Length is not a number, scanning for endstream"
+                                );
                                 None
                             }
                         },
@@ -522,13 +529,18 @@ impl Parser {
                             return Err(e);
                         }
                         Err(e) => {
-                            eprintln!("Warning: Failed to resolve /Length reference {} {} R: {:?}, scanning for endstream", ref_obj.num, ref_obj.generation, e);
+                            eprintln!(
+                                "Warning: Failed to resolve /Length reference {} {} R: {:?}, scanning for endstream",
+                                ref_obj.num, ref_obj.generation, e
+                            );
                             None
                         }
                     }
                 } else {
                     // No resolver available, fall back to scanning
-                    eprintln!("Warning: /Length is an indirect reference but no resolver available, scanning for endstream");
+                    eprintln!(
+                        "Warning: /Length is an indirect reference but no resolver available, scanning for endstream"
+                    );
                     None
                 }
             }
@@ -581,7 +593,7 @@ impl Parser {
                     Err(_) => {
                         return Err(PDFError::Generic(
                             "EOF while reading stream data".to_string(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -691,8 +703,14 @@ mod tests {
         assert_eq!(
             obj,
             PDFObject::Array(smallvec![
-                Box::new(PDFObject::Array(smallvec![Box::new(PDFObject::Number(1.0)), Box::new(PDFObject::Number(2.0))])),
-                Box::new(PDFObject::Array(smallvec![Box::new(PDFObject::Number(3.0)), Box::new(PDFObject::Number(4.0))])),
+                Box::new(PDFObject::Array(smallvec![
+                    Box::new(PDFObject::Number(1.0)),
+                    Box::new(PDFObject::Number(2.0))
+                ])),
+                Box::new(PDFObject::Array(smallvec![
+                    Box::new(PDFObject::Number(3.0)),
+                    Box::new(PDFObject::Number(4.0))
+                ])),
             ])
         );
     }
@@ -719,10 +737,7 @@ mod tests {
             _ => panic!("Expected dictionary"),
         };
 
-        assert_eq!(
-            dict.get("Type"),
-            Some(&PDFObject::Name("Font".to_string()))
-        );
+        assert_eq!(dict.get("Type"), Some(&PDFObject::Name("Font".to_string())));
         assert_eq!(dict.get("Size"), Some(&PDFObject::Number(12.0)));
         assert_eq!(dict.get("Bold"), Some(&PDFObject::Boolean(true)));
     }
@@ -766,13 +781,25 @@ mod tests {
     #[test]
     fn test_parse_indirect_reference() {
         let obj = parse_string("5 0 R").unwrap();
-        assert_eq!(obj, PDFObject::Ref(Ref { num: 5, generation: 0 }));
+        assert_eq!(
+            obj,
+            PDFObject::Ref(Ref {
+                num: 5,
+                generation: 0
+            })
+        );
     }
 
     #[test]
     fn test_parse_indirect_reference_with_generation() {
         let obj = parse_string("10 2 R").unwrap();
-        assert_eq!(obj, PDFObject::Ref(Ref { num: 10, generation: 2 }));
+        assert_eq!(
+            obj,
+            PDFObject::Ref(Ref {
+                num: 10,
+                generation: 2
+            })
+        );
     }
 
     #[test]
@@ -781,8 +808,14 @@ mod tests {
         assert_eq!(
             obj,
             PDFObject::Array(smallvec![
-                Box::new(PDFObject::Ref(Ref { num: 5, generation: 0 })),
-                Box::new(PDFObject::Ref(Ref { num: 10, generation: 2 })),
+                Box::new(PDFObject::Ref(Ref {
+                    num: 5,
+                    generation: 0
+                })),
+                Box::new(PDFObject::Ref(Ref {
+                    num: 10,
+                    generation: 2
+                })),
             ])
         );
     }
@@ -797,7 +830,10 @@ mod tests {
 
         assert_eq!(
             dict.get("Parent"),
-            Some(&PDFObject::Ref(Ref { num: 5, generation: 0 }))
+            Some(&PDFObject::Ref(Ref {
+                num: 5,
+                generation: 0
+            }))
         );
     }
 
@@ -812,10 +848,7 @@ mod tests {
         };
 
         // Check Type
-        assert_eq!(
-            dict.get("Type"),
-            Some(&PDFObject::Name("Page".to_string()))
-        );
+        assert_eq!(dict.get("Type"), Some(&PDFObject::Name("Page".to_string())));
 
         // Check Contents array
         let contents = match dict.get("Contents") {
@@ -831,7 +864,10 @@ mod tests {
         };
         assert_eq!(
             resources.get("Font"),
-            Some(&PDFObject::Ref(Ref { num: 7, generation: 0 }))
+            Some(&PDFObject::Ref(Ref {
+                num: 7,
+                generation: 0
+            }))
         );
     }
 

@@ -1,6 +1,6 @@
-use pdf_x_core::{PDFDocument, PDFObject, XRefEntry};
-use pdf_x_core::{ImageDecoder, ImageFormat, Page};
 use pdf_x_core::decode::{decode_flate, decode_png_predictor};
+use pdf_x_core::{ImageDecoder, ImageFormat, Page};
+use pdf_x_core::{PDFDocument, PDFObject, XRefEntry};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -85,9 +85,7 @@ fn main() {
     println!("\nFile: {}\n", pdf_path);
 
     // Get file size
-    let file_size = fs::metadata(pdf_path)
-        .map(|m| m.len())
-        .ok();
+    let file_size = fs::metadata(pdf_path).map(|m| m.len()).ok();
 
     // Show basic information
     println!("═══════════════ BASIC INFORMATION ═══════════════");
@@ -105,7 +103,10 @@ fn main() {
         } else if size < 1024 * 1024 * 1024 {
             println!("File Size: {:.2} MB", size as f64 / (1024.0 * 1024.0));
         } else {
-            println!("File Size: {:.2} GB", size as f64 / (1024.0 * 1024.0 * 1024.0));
+            println!(
+                "File Size: {:.2} GB",
+                size as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
         }
     }
 
@@ -373,13 +374,19 @@ fn print_object_inline(obj: &PDFObject) {
 
 fn print_xref_table(xref: &pdf_x_core::XRef) {
     println!("Total entries: {}\n", xref.len());
-    println!("{:<8} {:<12} {:<12} {:<8}", "Object", "Type", "Offset/Ref", "Gen");
+    println!(
+        "{:<8} {:<12} {:<12} {:<8}",
+        "Object", "Type", "Offset/Ref", "Gen"
+    );
     println!("{}", "─".repeat(50));
 
     for i in 0..xref.len() {
         if let Some(entry) = xref.get_entry(i as u32) {
             match entry {
-                XRefEntry::Free { next_free, generation } => {
+                XRefEntry::Free {
+                    next_free,
+                    generation,
+                } => {
                     println!(
                         "{:<8} {:<12} {:<12} {:<8}",
                         i, "free", next_free, generation
@@ -491,38 +498,41 @@ fn extract_page_images(page: &Page, doc: &mut PDFDocument, total_size: &mut usiz
                 };
 
                 // Iterate through XObject entries
-            for (name, xobject_ref) in xobject_dict {
-                println!("  🖼️  Image: {}", name);
+                for (name, xobject_ref) in xobject_dict {
+                    println!("  🖼️  Image: {}", name);
 
-                // Get the actual XObject
-                let xobject = match doc.xref_mut().fetch_if_ref(&xobject_ref) {
-                    Ok(obj) => obj,
-                    Err(e) => {
-                        println!("    ❌ Error fetching XObject '{}': {:?}", name, e);
-                        continue;
-                    }
-                };
+                    // Get the actual XObject
+                    let xobject = match doc.xref_mut().fetch_if_ref(&xobject_ref) {
+                        Ok(obj) => obj,
+                        Err(e) => {
+                            println!("    ❌ Error fetching XObject '{}': {:?}", name, e);
+                            continue;
+                        }
+                    };
 
-                // Check if it's an image stream
-                if let PDFObject::Stream { dict, data } = xobject {
-                    // Check if it's an image XObject
-                    if let Some(subtype) = dict.get("Subtype") {
-                        if let PDFObject::Name(subtype_name) = subtype {
-                            if subtype_name == "Image" {
-                                images_found += 1;
-                                *total_size += data.len();
+                    // Check if it's an image stream
+                    if let PDFObject::Stream { dict, data } = xobject {
+                        // Check if it's an image XObject
+                        if let Some(subtype) = dict.get("Subtype") {
+                            if let PDFObject::Name(subtype_name) = subtype {
+                                if subtype_name == "Image" {
+                                    images_found += 1;
+                                    *total_size += data.len();
 
-                                // Extract image information
-                                extract_image_info(&name, &dict, &data);
-                            } else {
-                                println!("    ℹ️  XObject '{}' is not an image (subtype: {})", name, subtype_name);
+                                    // Extract image information
+                                    extract_image_info(&name, &dict, &data);
+                                } else {
+                                    println!(
+                                        "    ℹ️  XObject '{}' is not an image (subtype: {})",
+                                        name, subtype_name
+                                    );
+                                }
                             }
                         }
+                    } else {
+                        println!("    ⚠️  XObject '{}' is not a stream", name);
                     }
-                } else {
-                    println!("    ⚠️  XObject '{}' is not a stream", name);
                 }
-            }
             } else {
                 println!("  ℹ️  No XObject dictionary found in page resources");
             }
@@ -536,10 +546,18 @@ fn extract_page_images(page: &Page, doc: &mut PDFDocument, total_size: &mut usiz
     images_found
 }
 
-fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFObject>, data: &[u8]) {
+fn extract_image_info(
+    name: &str,
+    dict: &std::collections::HashMap<String, PDFObject>,
+    data: &[u8],
+) {
     println!("    📋 Image Information:");
     println!("      Name: {}", name);
-    println!("      Data size: {} bytes ({:.1} KB)", data.len(), data.len() as f64 / 1024.0);
+    println!(
+        "      Data size: {} bytes ({:.1} KB)",
+        data.len(),
+        data.len() as f64 / 1024.0
+    );
 
     // Detect format from PDF filter information first (more reliable for PDF images)
     let format = if let Some(filter) = dict.get("Filter") {
@@ -669,8 +687,15 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
         let filter_name = match filter {
             PDFObject::Name(name) => name.clone(),
             PDFObject::Array(filters) => {
-                let names: Vec<String> = filters.iter()
-                    .filter_map(|f| if let PDFObject::Name(n) = &**f { Some(n.clone()) } else { None })
+                let names: Vec<String> = filters
+                    .iter()
+                    .filter_map(|f| {
+                        if let PDFObject::Name(n) = &**f {
+                            Some(n.clone())
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 names.join(", ")
             }
@@ -698,16 +723,37 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
                     let mut raw_data = data.to_vec();
 
                     // Extract metadata for decoding
-                    let width = dict.get("Width")
-                        .and_then(|w| if let PDFObject::Number(n) = w { Some(*n as u32) } else { None })
+                    let width = dict
+                        .get("Width")
+                        .and_then(|w| {
+                            if let PDFObject::Number(n) = w {
+                                Some(*n as u32)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
 
-                    let height = dict.get("Height")
-                        .and_then(|h| if let PDFObject::Number(n) = h { Some(*n as u32) } else { None })
+                    let height = dict
+                        .get("Height")
+                        .and_then(|h| {
+                            if let PDFObject::Number(n) = h {
+                                Some(*n as u32)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
 
-                    let bpc = dict.get("BitsPerComponent")
-                        .and_then(|b| if let PDFObject::Number(n) = b { Some(*n as u8) } else { None })
+                    let bpc = dict
+                        .get("BitsPerComponent")
+                        .and_then(|b| {
+                            if let PDFObject::Number(n) = b {
+                                Some(*n as u8)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(8);
 
                     if let Some(colorspace_obj) = dict.get("ColorSpace") {
@@ -715,10 +761,18 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
 
                         if width > 0 && height > 0 {
                             // Try decoding with current data
-                            match ImageDecoder::decode_raw_image(&raw_data, width, height, bpc, color_space.clone()) {
+                            match ImageDecoder::decode_raw_image(
+                                &raw_data,
+                                width,
+                                height,
+                                bpc,
+                                color_space.clone(),
+                            ) {
                                 Ok(decoded) => {
-                                    println!("      ✅ Decoded successfully: {}x{} ({} channels)",
-                                        decoded.width, decoded.height, decoded.channels);
+                                    println!(
+                                        "      ✅ Decoded successfully: {}x{} ({} channels)",
+                                        decoded.width, decoded.height, decoded.channels
+                                    );
                                 }
                                 Err(e) => {
                                     // If decoding failed and we have FlateDecode, try decompressing first
@@ -726,26 +780,59 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
                                         match decode_flate(&data) {
                                             Ok(mut decompressed) => {
                                                 // Check for PNG predictor in DecodeParms
-                                                if let Some(decode_parms) = dict.get("DecodeParms") {
-                                                    if let PDFObject::Dictionary(parms) = decode_parms {
-                                                        if let Some(PDFObject::Number(predictor)) = parms.get("Predictor") {
+                                                if let Some(decode_parms) = dict.get("DecodeParms")
+                                                {
+                                                    if let PDFObject::Dictionary(parms) =
+                                                        decode_parms
+                                                    {
+                                                        if let Some(PDFObject::Number(predictor)) =
+                                                            parms.get("Predictor")
+                                                        {
                                                             let pred_val = *predictor as u32;
                                                             // PNG predictor is 10-15
                                                             if pred_val >= 10 && pred_val <= 15 {
-                                                                let colors = parms.get("Colors")
-                                                                    .and_then(|c| if let PDFObject::Number(n) = c { Some(*n as usize) } else { None })
+                                                                let colors = parms
+                                                                    .get("Colors")
+                                                                    .and_then(|c| {
+                                                                        if let PDFObject::Number(
+                                                                            n,
+                                                                        ) = c
+                                                                        {
+                                                                            Some(*n as usize)
+                                                                        } else {
+                                                                            None
+                                                                        }
+                                                                    })
                                                                     .unwrap_or(1);
 
-                                                                let columns = parms.get("Columns")
-                                                                    .and_then(|c| if let PDFObject::Number(n) = c { Some(*n as usize) } else { None })
+                                                                let columns = parms
+                                                                    .get("Columns")
+                                                                    .and_then(|c| {
+                                                                        if let PDFObject::Number(
+                                                                            n,
+                                                                        ) = c
+                                                                        {
+                                                                            Some(*n as usize)
+                                                                        } else {
+                                                                            None
+                                                                        }
+                                                                    })
                                                                     .unwrap_or(width as usize);
 
-                                                                match decode_png_predictor(&decompressed, colors, bpc as usize, columns) {
+                                                                match decode_png_predictor(
+                                                                    &decompressed,
+                                                                    colors,
+                                                                    bpc as usize,
+                                                                    columns,
+                                                                ) {
                                                                     Ok(unpredicted) => {
                                                                         decompressed = unpredicted;
                                                                     }
                                                                     Err(pred_err) => {
-                                                                        println!("      ⚠️  PNG predictor failed: {:?}", pred_err);
+                                                                        println!(
+                                                                            "      ⚠️  PNG predictor failed: {:?}",
+                                                                            pred_err
+                                                                        );
                                                                     }
                                                                 }
                                                             }
@@ -756,18 +843,34 @@ fn extract_image_info(name: &str, dict: &std::collections::HashMap<String, PDFOb
                                                 raw_data = decompressed;
 
                                                 // Try decoding again with decompressed data
-                                                match ImageDecoder::decode_raw_image(&raw_data, width, height, bpc, color_space) {
+                                                match ImageDecoder::decode_raw_image(
+                                                    &raw_data,
+                                                    width,
+                                                    height,
+                                                    bpc,
+                                                    color_space,
+                                                ) {
                                                     Ok(decoded) => {
-                                                        println!("      ✅ Decoded successfully: {}x{} ({} channels)",
-                                                            decoded.width, decoded.height, decoded.channels);
+                                                        println!(
+                                                            "      ✅ Decoded successfully: {}x{} ({} channels)",
+                                                            decoded.width,
+                                                            decoded.height,
+                                                            decoded.channels
+                                                        );
                                                     }
                                                     Err(decode_err) => {
-                                                        println!("      ⚠️  Decoding failed: {:?}", decode_err);
+                                                        println!(
+                                                            "      ⚠️  Decoding failed: {:?}",
+                                                            decode_err
+                                                        );
                                                     }
                                                 }
                                             }
                                             Err(decompress_err) => {
-                                                println!("      ⚠️  Decompression failed: {:?}", decompress_err);
+                                                println!(
+                                                    "      ⚠️  Decompression failed: {:?}",
+                                                    decompress_err
+                                                );
                                             }
                                         }
                                     } else {
@@ -952,7 +1055,8 @@ fn extract_all_text(doc: &mut PDFDocument) {
                         println!("  (No text on this page)");
                     } else {
                         // Group text by line (similar Y position)
-                        let mut lines: std::collections::BTreeMap<i32, Vec<String>> = std::collections::BTreeMap::new();
+                        let mut lines: std::collections::BTreeMap<i32, Vec<String>> =
+                            std::collections::BTreeMap::new();
 
                         for item in text_items {
                             let y_key = if let Some(pos) = item.position {
@@ -1019,7 +1123,10 @@ fn print_outline_item(item: &pdf_x_core::OutlineItem, indent: usize) {
     // Print destination
     if let Some(dest) = &item.dest {
         match dest {
-            pdf_x_core::OutlineDestination::Explicit { page_index, dest_type } => {
+            pdf_x_core::OutlineDestination::Explicit {
+                page_index,
+                dest_type,
+            } => {
                 println!("{}  → Page {} ({:?})", indent_str, page_index, dest_type);
             }
             pdf_x_core::OutlineDestination::Named(name) => {
@@ -1028,7 +1135,11 @@ fn print_outline_item(item: &pdf_x_core::OutlineItem, indent: usize) {
             pdf_x_core::OutlineDestination::URL(url) => {
                 println!("{}  → URL: {}", indent_str, url);
             }
-            pdf_x_core::OutlineDestination::GoToRemote { url, dest, new_window } => {
+            pdf_x_core::OutlineDestination::GoToRemote {
+                url,
+                dest,
+                new_window,
+            } => {
                 println!("{}  → Remote PDF: {}", indent_str, url);
                 if let Some(d) = dest {
                     println!("{}     Destination: {}", indent_str, d);
@@ -1063,17 +1174,17 @@ fn print_outline_item(item: &pdf_x_core::OutlineItem, indent: usize) {
 fn show_statistics(doc: &mut PDFDocument, file_size: Option<u64>) {
     let page_count = doc.page_count().unwrap_or(0);
     let xref_len = doc.xref().len();
-    
+
     println!("Page Count: {}", page_count);
     println!("XRef Entries: {}", xref_len);
-    
+
     if let Some(size) = file_size {
         if size < 1024 * 1024 {
             println!("File Size: {:.2} KB", size as f64 / 1024.0);
         } else {
             println!("File Size: {:.2} MB", size as f64 / (1024.0 * 1024.0));
         }
-        
+
         if page_count > 0 {
             let avg_page_size = size as f64 / page_count as f64;
             if avg_page_size < 1024.0 {
@@ -1083,18 +1194,18 @@ fn show_statistics(doc: &mut PDFDocument, file_size: Option<u64>) {
             }
         }
     }
-    
+
     if doc.is_linearized() {
         println!("Linearized: Yes (optimized for fast web view)");
     } else {
         println!("Linearized: No");
     }
-    
+
     match doc.pdf_version() {
         Ok(version) => println!("PDF Version: {}", version),
         Err(_) => println!("PDF Version: Unknown"),
     }
-    
+
     // Count fonts
     let font_count = count_fonts(doc);
     if font_count > 0 {
@@ -1110,7 +1221,7 @@ fn show_page_sizes_info(doc: &mut PDFDocument) {
             return;
         }
     };
-    
+
     for page_num in 0..page_count {
         match doc.get_page(page_num as usize) {
             Ok(page) => {
@@ -1118,7 +1229,8 @@ fn show_page_sizes_info(doc: &mut PDFDocument) {
                     // MediaBox should be an array of 4 numbers [llx, lly, urx, ury]
                     match media_box_obj {
                         PDFObject::Array(arr) if arr.len() >= 4 => {
-                            let values: Vec<f64> = arr.iter()
+                            let values: Vec<f64> = arr
+                                .iter()
                                 .filter_map(|obj| {
                                     if let PDFObject::Number(n) = obj.as_ref() {
                                         Some(*n)
@@ -1131,10 +1243,13 @@ fn show_page_sizes_info(doc: &mut PDFDocument) {
                             if values.len() >= 4 {
                                 let width = values[2] - values[0];
                                 let height = values[3] - values[1];
-                                println!("Page {}: {:.2} x {:.2} points ({:.2} x {:.2} inches)",
+                                println!(
+                                    "Page {}: {:.2} x {:.2} points ({:.2} x {:.2} inches)",
                                     page_num + 1,
-                                    width, height,
-                                    width / 72.0, height / 72.0
+                                    width,
+                                    height,
+                                    width / 72.0,
+                                    height / 72.0
                                 );
                             } else {
                                 println!("Page {}: Invalid MediaBox format", page_num + 1);
@@ -1186,7 +1301,11 @@ fn extract_annotations(doc: &mut PDFDocument) {
                 let annotations = match page.extract_annotations(doc.xref_mut()) {
                     Ok(annots) => annots,
                     Err(e) => {
-                        println!("Page {}: Error extracting annotations - {:?}", page_idx + 1, e);
+                        println!(
+                            "Page {}: Error extracting annotations - {:?}",
+                            page_idx + 1,
+                            e
+                        );
                         continue;
                     }
                 };
@@ -1195,15 +1314,21 @@ fn extract_annotations(doc: &mut PDFDocument) {
                     continue;
                 }
 
-                println!("Page {} ({} annotation(s)):", page_idx + 1, annotations.len());
+                println!(
+                    "Page {} ({} annotation(s)):",
+                    page_idx + 1,
+                    annotations.len()
+                );
                 total_annotations += annotations.len();
 
                 for (i, annot) in annotations.iter().enumerate() {
                     println!("  [{}] {:?}", i + 1, annot.annotation_type);
 
                     // Show location
-                    println!("      Location: [{}, {}, {}, {}]",
-                             annot.rect[0], annot.rect[1], annot.rect[2], annot.rect[3]);
+                    println!(
+                        "      Location: [{}, {}, {}, {}]",
+                        annot.rect[0], annot.rect[1], annot.rect[2], annot.rect[3]
+                    );
 
                     // Show contents if present
                     if let Some(ref contents) = annot.contents {
@@ -1219,20 +1344,18 @@ fn extract_annotations(doc: &mut PDFDocument) {
 
                     // Show type-specific data
                     match &annot.data {
-                        pdf_x_core::AnnotationData::Link(link) => {
-                            match &link.action {
-                                pdf_x_core::LinkAction::URI { url, .. } => {
-                                    println!("      → URL: {}", url);
-                                }
-                                pdf_x_core::LinkAction::GoTo { page_index, dest } => {
-                                    println!("      → Page {} ({:?})", page_index, dest);
-                                }
-                                pdf_x_core::LinkAction::GoToNamed { name } => {
-                                    println!("      → Named destination: {}", name);
-                                }
-                                _ => {}
+                        pdf_x_core::AnnotationData::Link(link) => match &link.action {
+                            pdf_x_core::LinkAction::URI { url, .. } => {
+                                println!("      → URL: {}", url);
                             }
-                        }
+                            pdf_x_core::LinkAction::GoTo { page_index, dest } => {
+                                println!("      → Page {} ({:?})", page_index, dest);
+                            }
+                            pdf_x_core::LinkAction::GoToNamed { name } => {
+                                println!("      → Named destination: {}", name);
+                            }
+                            _ => {}
+                        },
                         pdf_x_core::AnnotationData::Text(text) => {
                             println!("      Open: {}", text.open);
                             if let Some(ref icon) = text.icon {
@@ -1251,10 +1374,12 @@ fn extract_annotations(doc: &mut PDFDocument) {
                     // Show color if present
                     if let Some(ref color) = annot.color {
                         if color.len() >= 3 {
-                            println!("      Color: RGB({:.0}, {:.0}, {:.0})",
-                                     color[0] * 255.0,
-                                     color[1] * 255.0,
-                                     color[2] * 255.0);
+                            println!(
+                                "      Color: RGB({:.0}, {:.0}, {:.0})",
+                                color[0] * 255.0,
+                                color[1] * 255.0,
+                                color[2] * 255.0
+                            );
                         }
                     }
                 }
@@ -1270,7 +1395,10 @@ fn extract_annotations(doc: &mut PDFDocument) {
         if page_idx >= 9 {
             let remaining = page_count - 10;
             if remaining > 0 {
-                println!("... and {} more page(s) with potential annotations", remaining);
+                println!(
+                    "... and {} more page(s) with potential annotations",
+                    remaining
+                );
             }
             break;
         }
@@ -1285,14 +1413,14 @@ fn extract_annotations(doc: &mut PDFDocument) {
 
 fn count_fonts(doc: &mut PDFDocument) -> usize {
     use std::collections::HashSet;
-    
+
     let page_count = match doc.page_count() {
         Ok(count) => count,
         Err(_) => return 0,
     };
-    
+
     let mut font_set = HashSet::new();
-    
+
     for page_num in 0..page_count {
         if let Ok(page) = doc.get_page(page_num as usize) {
             if let Some(resources) = page.resources() {
@@ -1310,6 +1438,6 @@ fn count_fonts(doc: &mut PDFDocument) -> usize {
             }
         }
     }
-    
+
     font_set.len()
 }

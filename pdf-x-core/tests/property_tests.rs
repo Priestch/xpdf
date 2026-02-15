@@ -4,10 +4,10 @@
 
 mod test_utils;
 
-use pdf_x_core::core::*;
 use pdf_x_core::core::error::PDFResult;
-use test_utils::*;
+use pdf_x_core::core::*;
 use proptest::prelude::*;
+use test_utils::*;
 
 // ============================================================================
 // XRef Property Tests

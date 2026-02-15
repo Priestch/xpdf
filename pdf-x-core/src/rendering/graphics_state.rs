@@ -117,11 +117,7 @@ impl Color {
     /// This is a convenience method for creating colors with byte values
     /// instead of normalized floats.
     pub fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Color::RGB(
-            r as f64 / 255.0,
-            g as f64 / 255.0,
-            b as f64 / 255.0,
-        )
+        Color::RGB(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
     }
 
     /// Get RGBA components as u8 values.
@@ -350,10 +346,7 @@ impl GraphicsState {
     /// Transformed (x, y) coordinates
     pub fn transform_point(&self, x: f64, y: f64) -> (f64, f64) {
         let [a, b, c, d, e, f] = self.ctm;
-        (
-            a * x + c * y + e,
-            b * x + d * y + f,
-        )
+        (a * x + c * y + e, b * x + d * y + f)
     }
 
     /// Set the text matrix.

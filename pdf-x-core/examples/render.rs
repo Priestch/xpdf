@@ -8,11 +8,11 @@
 //! Example:
 //!     cargo run --example render --features rendering -- test.pdf output.png 0
 
+use pdf_x_core::rendering::Device; // Import Device trait for concat_matrix
+use pdf_x_core::rendering::skia_device::SkiaDevice;
+use pdf_x_core::{PDFDocument, Page};
 use std::env;
 use std::path::Path;
-use pdf_x_core::{PDFDocument, Page};
-use pdf_x_core::rendering::skia_device::SkiaDevice;
-use pdf_x_core::rendering::Device; // Import Device trait for concat_matrix
 use tiny_skia::Pixmap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,7 +54,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PDF has {} pages", page_count);
 
     if page_number >= page_count as usize {
-        eprintln!("Error: Page {} out of range (0-{})", page_number, page_count - 1);
+        eprintln!(
+            "Error: Page {} out of range (0-{})",
+            page_number,
+            page_count - 1
+        );
         std::process::exit(1);
     }
 
@@ -62,8 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let page = doc.get_page(page_number)?;
 
     // Get the page dimensions from the MediaBox
-    let mediabox = page.media_box()
-        .ok_or("No MediaBox found")?;
+    let mediabox = page.media_box().ok_or("No MediaBox found")?;
 
     // MediaBox is typically an array [x1 y1 x2 y2]
     let coords = if let pdf_x_core::PDFObject::Array(arr) = mediabox {
@@ -78,18 +81,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Invalid MediaBox format".into());
     };
 
-    let width = coords[2] - coords[0];  // x2 - x1
+    let width = coords[2] - coords[0]; // x2 - x1
     let height = coords[3] - coords[1]; // y2 - y1
 
-    println!("Page {} dimensions: {:.1} x {:.1}", page_number, width, height);
+    println!(
+        "Page {} dimensions: {:.1} x {:.1}",
+        page_number, width, height
+    );
 
     // Create pixmap for rendering (2x scale for better quality)
     let scale = 2.0;
     let pixmap_width = (width * scale).ceil() as u32;
     let pixmap_height = (height * scale).ceil() as u32;
 
-    let mut pixmap = Pixmap::new(pixmap_width, pixmap_height)
-        .ok_or("Failed to create pixmap")?;
+    let mut pixmap = Pixmap::new(pixmap_width, pixmap_height).ok_or("Failed to create pixmap")?;
 
     // Fill with white background
     pixmap.fill(tiny_skia::Color::WHITE);
@@ -100,10 +105,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up coordinate transform
     // PDF coordinates: (0,0) at bottom-left, y increases upward
     // Image coordinates: (0,0) at top-left, y increases downward
+    // We need to flip Y and translate the origin
     device.concat_matrix(&[
-        scale, 0.0,
-        0.0, scale,
-        0.0, coords[3],  // Translate to top-left (using y2)
+        scale,     // sx: scale X
+        0.0,       // kx: no skew
+        0.0,       // ky: no skew
+        -scale,    // sy: negative scale flips Y-axis
+        0.0,       // tx: no X translation
+        coords[3] * scale, // ty: move origin to page height
     ]);
 
     println!("Rendering page {}...", page_number);
@@ -113,7 +122,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(_) => println!("Rendering complete!"),
         Err(e) => {
             eprintln!("Warning: Rendering encountered errors: {:?}", e);
-            eprintln!("The output may be incomplete. Note: Full font and image support is still in development.");
+            eprintln!(
+                "The output may be incomplete. Note: Full font and image support is still in development."
+            );
         }
     }
 

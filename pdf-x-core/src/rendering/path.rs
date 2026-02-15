@@ -108,7 +108,8 @@ impl Path {
             self.move_to(cp1x, cp1y);
         }
 
-        self.elements.push(PathElement::CurveTo(cp1x, cp1y, cp2x, cp2y, x, y));
+        self.elements
+            .push(PathElement::CurveTo(cp1x, cp1y, cp2x, cp2y, x, y));
         self.current_point = Some((x, y));
         self.has_open_subpath = true;
     }
@@ -226,9 +227,7 @@ impl Default for PathBuilder {
 impl PathBuilder {
     /// Create a new path builder.
     pub fn new() -> Self {
-        PathBuilder {
-            path: Path::new(),
-        }
+        PathBuilder { path: Path::new() }
     }
 
     /// Begin a new path.
@@ -250,7 +249,15 @@ impl PathBuilder {
     }
 
     /// Add a cubic Bézier curve.
-    pub fn curve_to(&mut self, cp1x: f64, cp1y: f64, cp2x: f64, cp2y: f64, x: f64, y: f64) -> &mut Self {
+    pub fn curve_to(
+        &mut self,
+        cp1x: f64,
+        cp1y: f64,
+        cp2x: f64,
+        cp2y: f64,
+        x: f64,
+        y: f64,
+    ) -> &mut Self {
         self.path.curve_to(cp1x, cp1y, cp2x, cp2y, x, y);
         self
     }

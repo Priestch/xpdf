@@ -7,17 +7,17 @@
 //! - Path construction and rendering
 //! - Text rendering support
 
+pub mod context;
 pub mod device;
 pub mod graphics_state;
-pub mod context;
 pub mod path;
 
 // Re-export key types
+pub use context::RenderingContext;
 pub use device::{Device, ImageData, Paint, PathDrawMode, TestDevice};
 pub use graphics_state::{
-    Color, FillRule, GraphicsState, LineCap, LineJoin, StrokeProps, TextRenderingMode
+    Color, FillRule, GraphicsState, LineCap, LineJoin, StrokeProps, TextRenderingMode,
 };
-pub use context::RenderingContext;
 pub use path::{Path, PathBuilder, PathElement};
 
 #[cfg(feature = "rendering")]
@@ -25,6 +25,9 @@ pub mod skia_device;
 
 #[cfg(feature = "rendering")]
 pub mod font;
+
+#[cfg(feature = "rendering")]
+pub mod type1_font;
 
 #[cfg(feature = "rendering")]
 pub use skia_device::SkiaDevice;

@@ -24,7 +24,10 @@ startxref\n0\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
     // Should handle gracefully - either return error or minimal valid PDF
-    assert!(result.is_err() || result.is_ok(), "Should not panic on invalid xref");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should not panic on invalid xref"
+    );
 }
 
 #[test]
@@ -36,10 +39,13 @@ xref\n\
 0 1\n\
 0000000000 65535 f\n\
 trailer\n\
-%%EOF";  // Missing startxref
+%%EOF"; // Missing startxref
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle truncated xref without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle truncated xref without panic"
+    );
 }
 
 #[test]
@@ -55,7 +61,10 @@ trailer\n<< /Size 2 /Root 1 0 R >>\n\
 startxref\n50\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle corrupted offset without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle corrupted offset without panic"
+    );
 }
 
 // ============================================================================
@@ -77,7 +86,10 @@ trailer\n<< /Size 3 /Root 1 0 R >>\n\
 startxref\n70\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle malformed dict without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle malformed dict without panic"
+    );
 }
 
 #[test]
@@ -94,7 +106,10 @@ trailer\n<< /Size 2 >>\n\
 startxref\n40\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle unmatched bracket without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle unmatched bracket without panic"
+    );
 }
 
 #[test]
@@ -111,7 +126,10 @@ trailer\n<< /Size 2 >>\n\
 startxref\n30\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle invalid hex string without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle invalid hex string without panic"
+    );
 }
 
 #[test]
@@ -128,7 +146,10 @@ trailer\n<< /Size 2 >>\n\
 startxref\n40\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle invalid escape without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle invalid escape without panic"
+    );
 }
 
 // ============================================================================
@@ -152,7 +173,10 @@ trailer\n<< /Size 2 >>\n\
 startxref\n70\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle truncated stream without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle truncated stream without panic"
+    );
 }
 
 #[test]
@@ -170,7 +194,10 @@ trailer\n<< /Size 2 >>\n\
 startxref\n50\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle missing stream keywords without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle missing stream keywords without panic"
+    );
 }
 
 #[test]
@@ -190,7 +217,10 @@ trailer\n<< /Size 2 >>\n\
 startxref\n80\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle unknown filter gracefully");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle unknown filter gracefully"
+    );
 }
 
 // ============================================================================
@@ -229,7 +259,10 @@ startxref\n50\n%%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
     // Should handle gracefully - may reject or attempt to parse
-    assert!(result.is_err() || result.is_ok(), "Should handle future version without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle future version without panic"
+    );
 }
 
 #[test]
@@ -242,10 +275,13 @@ xref\n\
 0000000000 65535 f\n\
 0000000020 00000 n\n\
 startxref\n50\n\
-%%EOF";  // No trailer
+%%EOF"; // No trailer
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle missing trailer without panic");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle missing trailer without panic"
+    );
 }
 
 #[test]
@@ -282,7 +318,10 @@ startxref\n95\n\
 
     let result = PDFDocument::open(pdf_data.to_vec());
     // Circular reference should be detected or handled
-    assert!(result.is_ok() || result.is_err(), "Should handle circular reference without panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Should handle circular reference without panic"
+    );
 }
 
 // ============================================================================
@@ -305,7 +344,10 @@ startxref\n20\n\
 
     let result = PDFDocument::open(pdf_data.to_vec());
     // Empty object should be handled
-    assert!(result.is_ok() || result.is_err(), "Should handle empty object");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Should handle empty object"
+    );
 }
 
 #[test]
@@ -322,7 +364,10 @@ startxref\n60\n\
 %%EOF";
 
     let result = PDFDocument::open(pdf_data.to_vec());
-    assert!(result.is_err() || result.is_ok(), "Should handle object number mismatch");
+    assert!(
+        result.is_err() || result.is_ok(),
+        "Should handle object number mismatch"
+    );
 }
 
 // ============================================================================
@@ -339,7 +384,10 @@ fn test_bad_xref_pdf_loading() {
 
     let result = assert_pdf_loads("bad-xref.pdf");
     // The bad-xref.pdf has an invalid startxref, so it should fail gracefully
-    assert!(result.is_err(), "bad-xref.pdf should fail to load but not panic");
+    assert!(
+        result.is_err(),
+        "bad-xref.pdf should fail to load but not panic"
+    );
 }
 
 // ============================================================================
@@ -367,5 +415,8 @@ fn test_extremely_deep_nesting() {
 
     let result = PDFDocument::open(pdf.as_bytes().to_vec());
     // Should handle deep nesting without stack overflow
-    assert!(result.is_ok() || result.is_err(), "Should handle deep nesting without panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Should handle deep nesting without panic"
+    );
 }

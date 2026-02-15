@@ -5,9 +5,9 @@
 //!
 //! Outlines provide a hierarchical table of contents for navigating PDF documents.
 
+use crate::core::PDFDocument;
 use crate::core::error::{PDFError, PDFResult};
 use crate::core::parser::{PDFObject, Ref};
-use crate::core::PDFDocument;
 use std::collections::{HashMap, HashSet};
 
 /// Decodes a PDF string to a Rust String, handling various encodings.
@@ -31,18 +31,22 @@ fn decode_pdf_string(bytes: &[u8]) -> String {
             if bytes.len() % 2 != 0 {
                 // Remove trailing byte if odd length
                 let data = &bytes[..bytes.len() - 1];
-                return decode_utf16be(data).unwrap_or_else(|_| String::from_utf8_lossy(data).to_string());
+                return decode_utf16be(data)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(data).to_string());
             }
-            return decode_utf16be(bytes).unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string());
+            return decode_utf16be(bytes)
+                .unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string());
         }
 
         // UTF-16LE BOM
         if bytes[0] == 0xFF && bytes[1] == 0xFE {
             if bytes.len() % 2 != 0 {
                 let data = &bytes[..bytes.len() - 1];
-                return decode_utf16le(data).unwrap_or_else(|_| String::from_utf8_lossy(data).to_string());
+                return decode_utf16le(data)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(data).to_string());
             }
-            return decode_utf16le(bytes).unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string());
+            return decode_utf16le(bytes)
+                .unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string());
         }
     }
 
@@ -75,10 +79,7 @@ fn decode_pdf_string(bytes: &[u8]) -> String {
 
     // Last resort: treat as PDFDocEncoding (Latin-1)
     // PDFDocEncoding is similar to Latin-1 but with some differences
-    let decoded: String = bytes
-        .iter()
-        .map(|&b| b as char)
-        .collect();
+    let decoded: String = bytes.iter().map(|&b| b as char).collect();
 
     remove_escape_sequences(decoded)
 }
@@ -298,13 +299,18 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
         let (num, generation) = ref_num_gen;
 
         // Fetch the outline dictionary
-        let outline_dict = match doc.xref_mut().fetch_if_ref(&PDFObject::Ref(Ref::new(num, generation))) {
+        let outline_dict = match doc
+            .xref_mut()
+            .fetch_if_ref(&PDFObject::Ref(Ref::new(num, generation)))
+        {
             Ok(PDFObject::Dictionary(dict)) => dict,
             Ok(_) => continue, // Not a dictionary, skip
-            Err(PDFError::DataMissing { .. }) => return Err(PDFError::DataMissing {
-                position: 0,
-                length: 0,
-            }),
+            Err(PDFError::DataMissing { .. }) => {
+                return Err(PDFError::DataMissing {
+                    position: 0,
+                    length: 0,
+                });
+            }
             Err(_) => continue,
         };
 
@@ -439,12 +445,10 @@ fn parse_dest_entry(dest_obj: &PDFObject, doc: &mut PDFDocument) -> PDFResult<Ou
 
             // Try to resolve the named destination
             match doc.resolve_named_destination(&name) {
-                Ok(Some((page_index, dest_type))) => {
-                    Ok(OutlineDestination::Explicit {
-                        page_index,
-                        dest_type,
-                    })
-                }
+                Ok(Some((page_index, dest_type))) => Ok(OutlineDestination::Explicit {
+                    page_index,
+                    dest_type,
+                }),
                 _ => {
                     // Could not resolve, keep as named destination
                     Ok(OutlineDestination::Named(name))
@@ -461,12 +465,10 @@ fn parse_dest_entry(dest_obj: &PDFObject, doc: &mut PDFDocument) -> PDFResult<Ou
             };
 
             match doc.resolve_named_destination(clean_name) {
-                Ok(Some((page_index, dest_type))) => {
-                    Ok(OutlineDestination::Explicit {
-                        page_index,
-                        dest_type,
-                    })
-                }
+                Ok(Some((page_index, dest_type))) => Ok(OutlineDestination::Explicit {
+                    page_index,
+                    dest_type,
+                }),
                 _ => {
                     // Could not resolve, keep as named destination
                     Ok(OutlineDestination::Named(name.clone()))
@@ -511,9 +513,7 @@ fn parse_action_destination(
         "GoToR" => {
             // GoToR (remote PDF)
             let url = match action_dict.get("F") {
-                Some(PDFObject::String(bytes)) => {
-                    String::from_utf8_lossy(bytes).to_string()
-                }
+                Some(PDFObject::String(bytes)) => String::from_utf8_lossy(bytes).to_string(),
                 _ => String::new(),
             };
 
@@ -542,12 +542,10 @@ pub fn parse_destination_type(
     params: &[Box<PDFObject>],
 ) -> PDFResult<DestinationType> {
     let get_num = |idx: usize| -> Option<f64> {
-        params
-            .get(idx)
-            .and_then(|p| match &**p {
-                PDFObject::Number(n) => Some(*n),
-                _ => None,
-            })
+        params.get(idx).and_then(|p| match &**p {
+            PDFObject::Number(n) => Some(*n),
+            _ => None,
+        })
     };
 
     Ok(match type_name {

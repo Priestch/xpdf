@@ -326,7 +326,7 @@ mod tests {
         manager.on_receive_data(2, vec![2u8; 100]).unwrap();
 
         assert!(!manager.is_chunk_cached(0)); // Evicted from cache
-        assert!(manager.has_chunk(0));        // But still marked as loaded
+        assert!(manager.has_chunk(0)); // But still marked as loaded
         assert!(manager.is_chunk_cached(1));
         assert!(manager.is_chunk_cached(2));
     }

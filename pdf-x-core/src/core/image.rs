@@ -10,7 +10,7 @@
 //! 1. Image metadata extraction (always available) - get image info without full decoding
 //! 2. Complete image decoding (feature-gated) - full image data when requested
 
-use super::error::{PDFResult, PDFError};
+use super::error::{PDFError, PDFResult};
 
 /// Image format types supported by PDF-X.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,9 +42,12 @@ impl ImageFormat {
         }
 
         // JPEG2000 signature boxes
-        if header.len() >= 12 &&
-           header.starts_with(&[0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20]) ||
-           (header.starts_with(&[0xFF, 0x4F]) && header.len() > 4 && header[2..4] == [0xFF, 0x51]) {
+        if header.len() >= 12
+            && header.starts_with(&[0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20])
+            || (header.starts_with(&[0xFF, 0x4F])
+                && header.len() > 4
+                && header[2..4] == [0xFF, 0x51])
+        {
             return ImageFormat::JPEG2000;
         }
 
@@ -199,12 +202,17 @@ impl ImageDecoder {
             ImageColorSpace::Unknown(n) => n,
         };
 
-        let expected_size = (width as usize) * (height as usize) * (channels as usize) * (bits_per_component as usize) / 8;
+        let expected_size = (width as usize)
+            * (height as usize)
+            * (channels as usize)
+            * (bits_per_component as usize)
+            / 8;
 
         if data.len() < expected_size {
             return Err(PDFError::Generic(format!(
                 "Insufficient raw image data: expected at least {} bytes, got {}",
-                expected_size, data.len()
+                expected_size,
+                data.len()
             )));
         }
 
@@ -220,7 +228,11 @@ impl ImageDecoder {
         };
 
         // For raw data, just take the expected amount
-        Ok(DecodedImage::new(metadata, data[..expected_size].to_vec(), channels))
+        Ok(DecodedImage::new(
+            metadata,
+            data[..expected_size].to_vec(),
+            channels,
+        ))
     }
 
     /// Parse color space from PDF object
@@ -266,9 +278,9 @@ impl ImageDecoder {
     fn decode_jpeg(data: &[u8]) -> PDFResult<DecodedImage> {
         #[cfg(feature = "jpeg-decoding")]
         {
-            use zune_jpeg::zune_core::options::DecoderOptions;
-            use zune_jpeg::zune_core::colorspace::ColorSpace;
             use std::io::Cursor;
+            use zune_jpeg::zune_core::colorspace::ColorSpace;
+            use zune_jpeg::zune_core::options::DecoderOptions;
 
             let options = DecoderOptions::default()
                 .set_max_width(u16::MAX as usize)
@@ -277,23 +289,25 @@ impl ImageDecoder {
             let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(data), options);
 
             // Try to decode headers first
-            decoder.decode_headers()
+            decoder
+                .decode_headers()
                 .map_err(|e| PDFError::Generic(format!("JPEG header decode error: {:?}", e)))?;
 
             // Get metadata
-            let info = decoder.info()
+            let info = decoder
+                .info()
                 .ok_or_else(|| PDFError::Generic("Failed to get JPEG info".to_string()))?;
 
             let width = info.width as u32;
             let height = info.height as u32;
 
             // Decode full image
-            let decoded_data = decoder.decode()
+            let decoded_data = decoder
+                .decode()
                 .map_err(|e| PDFError::Generic(format!("JPEG decode error: {:?}", e)))?;
 
             let channels = decoded_data.len() / (width as usize * height as usize);
-            let color_space = decoder.input_colorspace()
-                .unwrap_or(ColorSpace::RGB);
+            let color_space = decoder.input_colorspace().unwrap_or(ColorSpace::RGB);
 
             let metadata = ImageMetadata {
                 name: "JPEG".to_string(),
@@ -312,7 +326,8 @@ impl ImageDecoder {
         #[cfg(not(feature = "jpeg-decoding"))]
         {
             Err(PDFError::Unsupported {
-                feature: "JPEG decoding not enabled. Enable the 'jpeg-decoding' feature.".to_string()
+                feature: "JPEG decoding not enabled. Enable the 'jpeg-decoding' feature."
+                    .to_string(),
             })
         }
     }
@@ -320,13 +335,14 @@ impl ImageDecoder {
     /// Decode JPEG2000 image using hayro-jpeg2000
     #[cfg(feature = "advanced-image-formats")]
     fn decode_jpeg2000(data: &[u8]) -> PDFResult<DecodedImage> {
-        use hayro_jpeg2000::{Image, DecodeSettings};
+        use hayro_jpeg2000::{DecodeSettings, Image};
 
         // Try to create and decode the image
         match Image::new(data, &DecodeSettings::default()) {
             Ok(image) => {
-                let pixel_data = image.decode()
-                    .map_err(|e| PDFError::Generic(format!("JPEG2000 pixel decode error: {:?}", e)))?;
+                let pixel_data = image.decode().map_err(|e| {
+                    PDFError::Generic(format!("JPEG2000 pixel decode error: {:?}", e))
+                })?;
 
                 let metadata = ImageMetadata {
                     name: "JPEG2000".to_string(),
@@ -339,10 +355,11 @@ impl ImageDecoder {
                     data_length: Some(data.len()),
                 };
 
-                let channels = image.color_space().num_channels() + if image.has_alpha() { 1 } else { 0 };
+                let channels =
+                    image.color_space().num_channels() + if image.has_alpha() { 1 } else { 0 };
                 Ok(DecodedImage::new(metadata, pixel_data, channels))
             }
-            Err(e) => Err(PDFError::Generic(format!("JPEG2000 decode error: {:?}", e)))
+            Err(e) => Err(PDFError::Generic(format!("JPEG2000 decode error: {:?}", e))),
         }
     }
 
@@ -379,7 +396,7 @@ impl ImageDecoder {
 
                 Ok(DecodedImage::new(metadata, pixel_data, 1))
             }
-            Err(e) => Err(PDFError::Generic(format!("JBIG2 decode error: {:?}", e)))
+            Err(e) => Err(PDFError::Generic(format!("JBIG2 decode error: {:?}", e))),
         }
     }
 
@@ -400,7 +417,8 @@ impl ImageDecoder {
         let mut image_data = vec![0u8; total_bytes];
 
         // Read image data into buffer
-        decoder.read_image(&mut image_data)
+        decoder
+            .read_image(&mut image_data)
             .map_err(|e| PDFError::Generic(format!("PNG decode error: {:?}", e)))?;
 
         let channels = color_type.channel_count() as u8;
@@ -423,10 +441,9 @@ impl ImageDecoder {
     #[cfg(not(feature = "png-decoding"))]
     fn decode_png(_data: &[u8]) -> PDFResult<DecodedImage> {
         Err(PDFError::Unsupported {
-            feature: "PNG decoding not enabled. Enable the 'jpeg-decoding' feature.".to_string()
+            feature: "PNG decoding not enabled. Enable the 'jpeg-decoding' feature.".to_string(),
         })
     }
-
 }
 
 /// Extension trait for PDF pages to add image extraction capabilities.

@@ -2,8 +2,11 @@
 //!
 //! Tests for the delta layer that tracks PDF document modifications.
 
-use pdf_x_core::core::{DeltaLayer, parser::{PDFObject, Ref}};
 use pdf_x_core::core::delta::{Command, DeltaObject};
+use pdf_x_core::core::{
+    DeltaLayer,
+    parser::{PDFObject, Ref},
+};
 
 // Simple test command that modifies an object
 struct ModifyCommand {

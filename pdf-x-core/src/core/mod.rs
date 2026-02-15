@@ -4,9 +4,10 @@ pub mod chunk_manager;
 pub mod cmap;
 pub mod content_stream;
 pub mod crypto;
-pub mod delta;
 pub mod decode;
+pub mod delta;
 pub mod document;
+pub mod encoding;
 pub mod encryption;
 pub mod error;
 pub mod file_chunked_stream;
@@ -16,6 +17,7 @@ pub mod lexer;
 pub mod outline;
 pub mod page;
 pub mod parser;
+pub mod pdf_writer;
 pub mod retry;
 pub mod stream;
 pub mod sub_stream;
@@ -36,22 +38,24 @@ pub use chunk_manager::{ChunkLoader, ChunkManager};
 pub use cmap::CMap;
 pub use content_stream::{ContentStreamEvaluator, OpCode, Operation, TextItem};
 pub use crypto::{
-    calculate_md5, calculate_sha256, calculate_sha384, calculate_sha512, ARC4Cipher, AES128Cipher,
-    AES256Cipher, PDF17, PDF20, PDFPasswordAlgorithm,
+    AES128Cipher, AES256Cipher, ARC4Cipher, PDF17, PDF20, PDFPasswordAlgorithm, calculate_md5,
+    calculate_sha256, calculate_sha384, calculate_sha512,
 };
-pub use delta::{Command, DeltaLayer, DeltaObject};
+pub use delta::{Command, DeltaLayer, DeltaObject, RotatePageCommand};
 pub use document::{LinearizedInfo, PDFDocument};
-pub use encryption::{
-    EncryptDict, EncryptionAlgorithm, EncryptionVersion, PDFPermissions,
-};
+pub use encoding::Encoding;
+pub use encryption::{EncryptDict, EncryptionAlgorithm, EncryptionVersion, PDFPermissions};
 pub use error::PDFError;
 pub use file_chunked_stream::FileChunkedStream;
 pub use font::{Font, FontDict, FontType};
-pub use image::{DecodedImage, ImageColorSpace, ImageDecoder, ImageExtraction, ImageFormat, ImageMetadata};
+pub use image::{
+    DecodedImage, ImageColorSpace, ImageDecoder, ImageExtraction, ImageFormat, ImageMetadata,
+};
 pub use lexer::{Lexer, Token};
 pub use outline::{DestinationType, OutlineDestination, OutlineItem};
 pub use page::{Page, PageTreeCache};
 pub use parser::{PDFObject, Parser, Ref};
+pub use pdf_writer::PDFWriter;
 pub use stream::Stream;
 pub use sub_stream::SubStream;
 pub use xref::{XRef, XRefEntry};

@@ -8,8 +8,6 @@
 //!
 //! Based on PDF.js src/core/crypto.js and test/unit/crypto_spec.js.
 
-use crate::core::error::{PDFError, PDFResult};
-
 // ============================================================================
 // MD5 Implementation (RFC 1321)
 // ============================================================================
@@ -117,7 +115,8 @@ impl MD5Context {
 
         macro_rules! ff {
             ($a:expr, $b:expr, $c:expr, $d:expr, $x:expr, $s:expr, $ac:expr) => {
-                $a = $a.wrapping_add($b & $c | !$b & $d)
+                $a = $a
+                    .wrapping_add($b & $c | !$b & $d)
                     .wrapping_add($x)
                     .wrapping_add($ac);
                 $a = $a.rotate_left($s);
@@ -127,7 +126,8 @@ impl MD5Context {
 
         macro_rules! gg {
             ($a:expr, $b:expr, $c:expr, $d:expr, $x:expr, $s:expr, $ac:expr) => {
-                $a = $a.wrapping_add($d & $b | !$d & $c)
+                $a = $a
+                    .wrapping_add($d & $b | !$d & $c)
                     .wrapping_add($x)
                     .wrapping_add($ac);
                 $a = $a.rotate_left($s);
@@ -137,7 +137,8 @@ impl MD5Context {
 
         macro_rules! hh {
             ($a:expr, $b:expr, $c:expr, $d:expr, $x:expr, $s:expr, $ac:expr) => {
-                $a = $a.wrapping_add($b ^ $c ^ $d)
+                $a = $a
+                    .wrapping_add($b ^ $c ^ $d)
                     .wrapping_add($x)
                     .wrapping_add($ac);
                 $a = $a.rotate_left($s);
@@ -147,7 +148,8 @@ impl MD5Context {
 
         macro_rules! ii {
             ($a:expr, $b:expr, $c:expr, $d:expr, $x:expr, $s:expr, $ac:expr) => {
-                $a = $a.wrapping_add($c ^ ($b | !$d))
+                $a = $a
+                    .wrapping_add($c ^ ($b | !$d))
                     .wrapping_add($x)
                     .wrapping_add($ac);
                 $a = $a.rotate_left($s);
@@ -403,7 +405,8 @@ impl ARC4Cipher {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[self.i as usize]);
             self.s.swap(self.i as usize, self.j as usize);
-            let k = self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
+            let k =
+                self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
             output.push(byte ^ k);
         }
 
@@ -732,7 +735,11 @@ impl<const KEY_SIZE: usize, const ROUNDS: usize> AESCipher<KEY_SIZE, ROUNDS> {
         let mut current_iv = *iv;
 
         // Data must be a multiple of 16 bytes for no-padding mode
-        assert_eq!(data.len() % 16, 0, "data length must be a multiple of 16 for no-padding mode");
+        assert_eq!(
+            data.len() % 16,
+            0,
+            "data length must be a multiple of 16 for no-padding mode"
+        );
 
         for chunk in data.chunks(16) {
             let mut block = [0_u8; 16];
@@ -976,8 +983,12 @@ pub trait PDFPasswordAlgorithm {
     ///
     /// # Returns
     /// The 32-byte file encryption key
-    fn get_user_key(&self, password: &[u8], user_key_salt: &[u8], user_encryption: &[u8])
-        -> Vec<u8>;
+    fn get_user_key(
+        &self,
+        password: &[u8],
+        user_key_salt: &[u8],
+        user_encryption: &[u8],
+    ) -> Vec<u8>;
 
     /// Derives the file encryption key from the owner password.
     ///
@@ -1052,7 +1063,12 @@ impl PDFPasswordAlgorithm for PDF17 {
         result == owner_password
     }
 
-    fn get_user_key(&self, password: &[u8], user_key_salt: &[u8], user_encryption: &[u8]) -> Vec<u8> {
+    fn get_user_key(
+        &self,
+        password: &[u8],
+        user_key_salt: &[u8],
+        user_encryption: &[u8],
+    ) -> Vec<u8> {
         let mut hash_data = Vec::with_capacity(password.len() + 8);
         hash_data.extend_from_slice(password);
         hash_data.extend_from_slice(user_key_salt);
@@ -1195,7 +1211,12 @@ impl PDFPasswordAlgorithm for PDF20 {
         result == owner_password
     }
 
-    fn get_user_key(&self, password: &[u8], user_key_salt: &[u8], user_encryption: &[u8]) -> Vec<u8> {
+    fn get_user_key(
+        &self,
+        password: &[u8],
+        user_key_salt: &[u8],
+        user_encryption: &[u8],
+    ) -> Vec<u8> {
         let mut hash_data = Vec::with_capacity(password.len() + 8);
         hash_data.extend_from_slice(password);
         hash_data.extend_from_slice(user_key_salt);
@@ -1304,7 +1325,8 @@ mod tests {
 
     #[test]
     fn test_md5_rfc1321_7() {
-        let input = b"12345678901234567890123456789012345678901234567890123456789012345678901234567890";
+        let input =
+            b"12345678901234567890123456789012345678901234567890123456789012345678901234567890";
         let result = calculate_md5(input);
         let expected = hex_to_bytes("57edf4a22be3c955ac49da2e2107b67a");
         assert_eq!(&result[..], &expected[..]);
@@ -1380,7 +1402,7 @@ mod tests {
              10101010101010101010101010101010101010101010101010101010101010101010\
              10101010101010101010101010101010101010101010101010101010101010101010\
              10101010101010101010101010101010101010101010101010101010101010101010\
-             101010101010101010101"
+             101010101010101010101",
         );
         let mut cipher = ARC4Cipher::new(&key);
         let result = cipher.encrypt_block(&input);
@@ -1400,7 +1422,7 @@ mod tests {
              aed59d4e0fd7f379586b4b7ff684ed6a189f7486d49b9c4bad9ba24b96abf924372c\
              8a8fffb10d55354900a77a3db5f205e1b99fcd8660863a159ad4abe40fa48934163d\
              dde542a6585540fd683cbfd8c00f12129a284deacc4cdefe58be7137541c047126c8\
-             d49e2755ab181ab7e940b0c0"
+             d49e2755ab181ab7e940b0c0",
         );
         assert_eq!(result, expected);
     }
@@ -1411,14 +1433,14 @@ mod tests {
         let input = hex_to_bytes(
             "aaaa0300000008004500004e661a00008011be640a0001220af\
              fffff00890089003a000080a601100001000000000000204543454a4548454346434\
-             550464545494546464343414341434143414341414100002000011bd0b604"
+             550464545494546464343414341434143414341414100002000011bd0b604",
         );
         let mut cipher = ARC4Cipher::new(&key);
         let result = cipher.encrypt_block(&input);
         let expected = hex_to_bytes(
             "f69c5806bd6ce84626bcbefb9474650aad1f7909b0f64d5f\
              58a503a258b7ed22eb0ea64930d3a056a55742fcce141d485f8aa836dea18df42c53\
-             80805ad0c61a5d6f58f41040b24b7d1a693856ed0d4398e7aee3bf0e2a2ca8f7"
+             80805ad0c61a5d6f58f41040b24b7d1a693856ed0d4398e7aee3bf0e2a2ca8f7",
         );
         assert_eq!(result, expected);
     }
@@ -1433,9 +1455,8 @@ mod tests {
         hasher.update(input);
         let result = hasher.finalize();
 
-        let expected = hex_to_bytes(
-            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD",
-        );
+        let expected =
+            hex_to_bytes("BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD");
 
         assert_eq!(&result[..], &expected[..]);
     }
@@ -1449,9 +1470,8 @@ mod tests {
         hasher.update(input);
         let result = hasher.finalize();
 
-        let expected = hex_to_bytes(
-            "248D6A61D20638B8E5C026930C3E6039A33CE45964FF2167F6ECEDD419DB06C1",
-        );
+        let expected =
+            hex_to_bytes("248D6A61D20638B8E5C026930C3E6039A33CE45964FF2167F6ECEDD419DB06C1");
 
         assert_eq!(&result[..], &expected[..]);
     }
@@ -1468,7 +1488,7 @@ mod tests {
 
         let expected = hex_to_bytes(
             "09330C33F71147E83D192FC782CD1B4753111B173B3B05D2\
-             2FA08086E3B0F712FCC7C71A557E2DB966C3E9FA91746039"
+             2FA08086E3B0F712FCC7C71A557E2DB966C3E9FA91746039",
         );
 
         assert_eq!(&result[..], &expected[..]);
@@ -1487,7 +1507,7 @@ mod tests {
         let expected = hex_to_bytes(
             "8E959B75DAE313DA8CF4F72814FC143F8F7779C6EB9F7FA1\
              7299AEADB6889018501D289E4900F7E4331B99DEC4B5433A\
-             C7D329EEB6DD26545E96E55B874BE909"
+             C7D329EEB6DD26545E96E55B874BE909",
         );
 
         assert_eq!(&result[..], &expected[..]);
@@ -1551,9 +1571,8 @@ mod tests {
     #[test]
     fn test_aes128_decrypt_block() {
         // TODO: Re-enable when AES implementation is fixed
-        let input = hex_to_bytes(
-            "0000000000000000000000000000000069c4e0d86a7b0430d8cdb78070b4c55a",
-        );
+        let input =
+            hex_to_bytes("0000000000000000000000000000000069c4e0d86a7b0430d8cdb78070b4c55a");
         let key = hex_to_bytes("000102030405060708090a0b0c0d0e0f");
         let iv = hex_to_bytes("00000000000000000000000000000000");
 
@@ -1570,9 +1589,7 @@ mod tests {
     fn test_aes256_encrypt_block() {
         // TODO: Re-enable when AES implementation is fixed
         let input = hex_to_bytes("00112233445566778899aabbccddeeff");
-        let key = hex_to_bytes(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let key = hex_to_bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let iv = hex_to_bytes("00000000000000000000000000000000");
 
         let cipher = AES256Cipher::new(&key.try_into().unwrap());
@@ -1587,9 +1604,7 @@ mod tests {
     fn test_aes256_decrypt_block_with_iv() {
         // TODO: Re-enable when AES implementation is fixed
         let input = hex_to_bytes("8ea2b7ca516745bfeafc49904b496089");
-        let key = hex_to_bytes(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let key = hex_to_bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let iv = hex_to_bytes("00000000000000000000000000000000");
 
         let cipher = AES256Cipher::new(&key.try_into().unwrap());
@@ -1603,12 +1618,9 @@ mod tests {
     #[test]
     fn test_aes256_decrypt_block_with_iv_in_stream() {
         // TODO: Re-enable when AES implementation is fixed
-        let input = hex_to_bytes(
-            "000000000000000000000000000000008ea2b7ca516745bfeafc49904b496089",
-        );
-        let key = hex_to_bytes(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let input =
+            hex_to_bytes("000000000000000000000000000000008ea2b7ca516745bfeafc49904b496089");
+        let key = hex_to_bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let iv = hex_to_bytes("00000000000000000000000000000000");
 
         let cipher = AES256Cipher::new(&key.try_into().unwrap());
@@ -1684,8 +1696,8 @@ mod tests {
 
         let result = alg.get_user_key(password, user_key_salt, user_encryption);
         let expected = &[
-            63, 114, 136, 209, 87, 61, 12, 30, 249, 1, 186, 144, 254, 248, 163, 153, 151, 51,
-            133, 10, 80, 152, 206, 15, 72, 187, 231, 33, 224, 239, 13, 213,
+            63, 114, 136, 209, 87, 61, 12, 30, 249, 1, 186, 144, 254, 248, 163, 153, 151, 51, 133,
+            10, 80, 152, 206, 15, 72, 187, 231, 33, 224, 239, 13, 213,
         ];
         assert_eq!(result, expected);
     }
@@ -1708,8 +1720,8 @@ mod tests {
 
         let result = alg.get_owner_key(password, owner_key_salt, u_bytes, owner_encryption);
         let expected = &[
-            63, 114, 136, 209, 87, 61, 12, 30, 249, 1, 186, 144, 254, 248, 163, 153, 151, 51,
-            133, 10, 80, 152, 206, 15, 72, 187, 231, 33, 224, 239, 13, 213,
+            63, 114, 136, 209, 87, 61, 12, 30, 249, 1, 186, 144, 254, 248, 163, 153, 151, 51, 133,
+            10, 80, 152, 206, 15, 72, 187, 231, 33, 224, 239, 13, 213,
         ];
         assert_eq!(result, expected);
     }
@@ -1742,8 +1754,8 @@ mod tests {
         ];
         let u_bytes = &[
             94, 230, 205, 75, 166, 99, 250, 76, 219, 128, 17, 85, 57, 17, 33, 164, 150, 46, 103,
-            176, 160, 156, 187, 233, 166, 223, 163, 253, 147, 235, 95, 184, 83, 245, 146, 101,
-            198, 247, 34, 198, 191, 11, 16, 94, 237, 216, 20, 175,
+            176, 160, 156, 187, 233, 166, 223, 163, 253, 147, 235, 95, 184, 83, 245, 146, 101, 198,
+            247, 34, 198, 191, 11, 16, 94, 237, 216, 20, 175,
         ];
 
         let result = alg.check_owner_password(password, owner_validation, u_bytes, owner_password);
@@ -1781,8 +1793,8 @@ mod tests {
         ];
         let u_bytes = &[
             94, 230, 205, 75, 166, 99, 250, 76, 219, 128, 17, 85, 57, 17, 33, 164, 150, 46, 103,
-            176, 160, 156, 187, 233, 166, 223, 163, 253, 147, 235, 95, 184, 83, 245, 146, 101,
-            198, 247, 34, 198, 191, 11, 16, 94, 237, 216, 20, 175,
+            176, 160, 156, 187, 233, 166, 223, 163, 253, 147, 235, 95, 184, 83, 245, 146, 101, 198,
+            247, 34, 198, 191, 11, 16, 94, 237, 216, 20, 175,
         ];
 
         let result = alg.get_owner_key(password, owner_key_salt, u_bytes, owner_encryption);

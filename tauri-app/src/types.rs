@@ -95,3 +95,16 @@ impl serde::Serialize for AppError {
 
 /// Result type for Tauri commands
 pub type AppResult<T> = Result<T, AppError>;
+
+/// Rendered page result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderedPage {
+    /// Page index
+    pub page: usize,
+    /// Image width in pixels
+    pub width: u32,
+    /// Image height in pixels
+    pub height: u32,
+    /// PNG image data as base64 string
+    pub image_data: String,
+}

@@ -172,9 +172,7 @@ impl PDFDocument {
 
         // Position at xref table and parse with progressive loading retry loop
         xref.set_stream_pos(startxref)?;
-        crate::retry_on_data_missing!(xref.stream_mut(), {
-            xref.parse()
-        })?;
+        crate::retry_on_data_missing!(xref.stream_mut(), { xref.parse() })?;
 
         // Load the catalog
         let catalog = Some(xref.catalog()?);
@@ -319,11 +317,7 @@ impl PDFDocument {
 
         let catalog_dict = match catalog {
             PDFObject::Dictionary(dict) => dict,
-            _ => {
-                return Err(PDFError::Generic(
-                    "Catalog is not a dictionary".to_string(),
-                ))
-            }
+            _ => return Err(PDFError::Generic("Catalog is not a dictionary".to_string())),
         };
 
         let pages_ref = catalog_dict
@@ -339,11 +333,7 @@ impl PDFDocument {
 
         let pages_dict = match pages_dict {
             PDFObject::Dictionary(dict) => dict,
-            _ => {
-                return Err(PDFError::Generic(
-                    "/Pages is not a dictionary".to_string(),
-                ))
-            }
+            _ => return Err(PDFError::Generic("/Pages is not a dictionary".to_string())),
         };
 
         let count = pages_dict
@@ -421,9 +411,9 @@ impl PDFDocument {
             }
 
             // This is an intermediate Pages node - traverse its Kids
-            let kids = dict.get("Kids").ok_or_else(|| {
-                PDFError::Generic("Pages node missing Kids array".to_string())
-            })?;
+            let kids = dict
+                .get("Kids")
+                .ok_or_else(|| PDFError::Generic("Pages node missing Kids array".to_string()))?;
 
             // Get the kids array (either directly or by resolving a reference)
             let kids_array = match kids {
@@ -436,14 +426,14 @@ impl PDFDocument {
                         _ => {
                             return Err(PDFError::Generic(
                                 "Kids reference doesn't point to array".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
                 _ => {
                     return Err(PDFError::Generic(
                         "Kids is not an array or reference".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -544,9 +534,9 @@ impl PDFDocument {
             }
 
             // This is an intermediate Pages node - traverse its Kids
-            let kids = dict.get("Kids").ok_or_else(|| {
-                PDFError::Generic("Pages node missing Kids array".to_string())
-            })?;
+            let kids = dict
+                .get("Kids")
+                .ok_or_else(|| PDFError::Generic("Pages node missing Kids array".to_string()))?;
 
             // Get the kids array (either directly or by resolving a reference)
             let kids_array = match kids {
@@ -559,14 +549,14 @@ impl PDFDocument {
                         _ => {
                             return Err(PDFError::Generic(
                                 "Kids reference doesn't point to array".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
                 _ => {
                     return Err(PDFError::Generic(
                         "Kids is not an array or reference".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -638,7 +628,10 @@ impl PDFDocument {
     ///     println!("Text: {} at {:?}", item.text, item.position);
     /// }
     /// ```
-    pub fn extract_text_from_page(&mut self, page_index: usize) -> PDFResult<Vec<crate::core::content_stream::TextItem>> {
+    pub fn extract_text_from_page(
+        &mut self,
+        page_index: usize,
+    ) -> PDFResult<Vec<crate::core::content_stream::TextItem>> {
         let page = self.get_page(page_index)?;
         page.extract_text(&mut self.xref)
     }
@@ -655,6 +648,120 @@ impl PDFDocument {
     pub fn extract_text_from_page_as_string(&mut self, page_index: usize) -> PDFResult<String> {
         let page = self.get_page(page_index)?;
         page.extract_text_as_string(&mut self.xref)
+    }
+
+    /// Render a page to RGBA pixel data.
+    ///
+    /// This method renders the specified page and returns the raw RGBA pixel data.
+    /// The pixels are organized as [R, G, B, A, R, G, B, A, ...] row by row from top to bottom.
+    ///
+    /// # Arguments
+    /// * `page_index` - The zero-based page index to render
+    /// * `scale` - Optional scale factor (default is 1.0)
+    ///
+    /// # Returns
+    /// A tuple of (width, height, pixels) where:
+    /// - `width` is the image width in pixels
+    /// - `height` is the image height in pixels
+    /// - `pixels` is a Vec<u8> containing RGBA pixel data
+    ///
+    /// # Example
+    /// ```no_run
+    /// use pdf_x_core::PDFDocument;
+    ///
+    /// let pdf_data = std::fs::read("document.pdf").unwrap();
+    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
+    ///
+    /// // Render first page at 2x scale
+    /// let (width, height, pixels) = doc.render_page_to_image(0, Some(2.0)).unwrap();
+    ///
+    /// println!("Rendered {}x{} image ({} bytes)", width, height, pixels.len());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[cfg(feature = "rendering")]
+    pub fn render_page_to_image(
+        &mut self,
+        page_index: usize,
+        scale: Option<f32>,
+    ) -> PDFResult<(u32, u32, Vec<u8>)> {
+        use crate::rendering::{Device, SkiaDevice};
+        use tiny_skia::Pixmap;
+
+        // Get the page
+        let page = self.get_page(page_index)?;
+
+        // Reference: pdf.js/src/core/document.js - Page.view and Page.rotate
+        let [x0, y0, x1, y1] = page.resolve_view_box_for_rendering(&mut self.xref);
+        let rotation = page.resolve_rotate_for_rendering(&mut self.xref);
+
+        let page_width = x1 - x0;
+        let page_height = y1 - y0;
+
+        // Apply scale
+        let scale = scale.unwrap_or(1.0);
+        let (width, height) = if rotation % 180 == 0 {
+            (
+                (page_width as f32 * scale).ceil() as u32,
+                (page_height as f32 * scale).ceil() as u32,
+            )
+        } else {
+            (
+                (page_height as f32 * scale).ceil() as u32,
+                (page_width as f32 * scale).ceil() as u32,
+            )
+        };
+
+        // Create a white pixmap
+        let mut pixmap = Pixmap::new(width, height).ok_or_else(|| {
+            PDFError::Generic(format!("Failed to create {}x{} pixmap", width, height))
+        })?;
+
+        // Fill with white background
+        pixmap.fill(tiny_skia::Color::WHITE);
+
+        // Create rendering device
+        let mut device = SkiaDevice::new(pixmap.as_mut());
+
+        // Apply PDF.js-like viewport transform.
+        // Reference: pdf.js/src/display/display_utils.js - PageViewport
+        let center_x = (x0 + x1) / 2.0;
+        let center_y = (y0 + y1) / 2.0;
+
+        let (rotate_a, rotate_b, rotate_c, rotate_d) = match rotation {
+            90 => (0.0, 1.0, 1.0, 0.0),
+            180 => (-1.0, 0.0, 0.0, 1.0),
+            270 => (0.0, -1.0, -1.0, 0.0),
+            _ => (1.0, 0.0, 0.0, -1.0),
+        };
+
+        let offset_canvas_x;
+        let offset_canvas_y;
+        if rotate_a == 0.0 {
+            offset_canvas_x = (center_y - y0).abs() * scale as f64;
+            offset_canvas_y = (center_x - x0).abs() * scale as f64;
+        } else {
+            offset_canvas_x = (center_x - x0).abs() * scale as f64;
+            offset_canvas_y = (center_y - y0).abs() * scale as f64;
+        }
+
+        device.set_matrix(&[
+            rotate_a * scale as f64,
+            rotate_b * scale as f64,
+            rotate_c * scale as f64,
+            rotate_d * scale as f64,
+            offset_canvas_x - rotate_a * scale as f64 * center_x
+                - rotate_c * scale as f64 * center_y,
+            offset_canvas_y - rotate_b * scale as f64 * center_x
+                - rotate_d * scale as f64 * center_y,
+        ]);
+
+        // Render the page
+        page.render(&mut self.xref, &mut device)?;
+
+        // Extract pixel data
+        let pixels = pixmap.data().to_vec();
+
+        Ok((width, height, pixels))
     }
 
     /// Gets an inheritable property from a page dictionary.
@@ -819,57 +926,69 @@ impl PDFDocument {
         };
 
         // Extract linearized information
-        let file_size = dict.get("L")
+        let file_size = dict
+            .get("L")
             .and_then(|obj| match obj {
                 PDFObject::Number(n) => Some(*n as u64),
                 _ => None,
             })
-            .ok_or_else(|| PDFError::Generic("Linearized PDF missing /L (file size)".to_string()))?;
+            .ok_or_else(|| {
+                PDFError::Generic("Linearized PDF missing /L (file size)".to_string())
+            })?;
 
-        let primary_hint_offset = dict.get("H")
+        let primary_hint_offset = dict
+            .get("H")
             .and_then(|obj| match obj {
-                PDFObject::Array(arr) if arr.len() >= 2 => {
-                    match &*arr[0] {
-                        PDFObject::Number(n) => Some(*n as u64),
-                        _ => None,
-                    }
-                }
+                PDFObject::Array(arr) if arr.len() >= 2 => match &*arr[0] {
+                    PDFObject::Number(n) => Some(*n as u64),
+                    _ => None,
+                },
                 _ => None,
             })
             .unwrap_or(0);
 
-        let primary_hint_length = dict.get("H")
+        let primary_hint_length = dict
+            .get("H")
             .and_then(|obj| match obj {
-                PDFObject::Array(arr) if arr.len() >= 2 => {
-                    match &*arr[1] {
-                        PDFObject::Number(n) => Some(*n as u64),
-                        _ => None,
-                    }
-                }
+                PDFObject::Array(arr) if arr.len() >= 2 => match &*arr[1] {
+                    PDFObject::Number(n) => Some(*n as u64),
+                    _ => None,
+                },
                 _ => None,
             })
             .unwrap_or(0);
 
-        let first_page_offset = dict.get("O")
+        let first_page_offset = dict
+            .get("O")
             .and_then(|obj| match obj {
                 PDFObject::Number(n) => Some(*n as u64),
                 _ => None,
             })
-            .ok_or_else(|| PDFError::Generic("Linearized PDF missing /O (first page offset)".to_string()))?;
+            .ok_or_else(|| {
+                PDFError::Generic("Linearized PDF missing /O (first page offset)".to_string())
+            })?;
 
-        let first_page_obj_num = dict.get("P")
+        let first_page_obj_num = dict
+            .get("P")
             .and_then(|obj| match obj {
                 PDFObject::Number(n) => Some(*n as u32),
                 _ => None,
             })
-            .ok_or_else(|| PDFError::Generic("Linearized PDF missing /P (first page object number)".to_string()))?;
+            .ok_or_else(|| {
+                PDFError::Generic(
+                    "Linearized PDF missing /P (first page object number)".to_string(),
+                )
+            })?;
 
-        let page_count = dict.get("N")
+        let page_count = dict
+            .get("N")
             .and_then(|obj| match obj {
                 PDFObject::Number(n) => Some(*n as u32),
                 _ => None,
             })
-            .ok_or_else(|| PDFError::Generic("Linearized PDF missing /N (page count)".to_string()))?;
+            .ok_or_else(|| {
+                PDFError::Generic("Linearized PDF missing /N (page count)".to_string())
+            })?;
 
         Ok(Some(LinearizedInfo {
             file_size,
@@ -959,8 +1078,10 @@ impl PDFDocument {
             // Try to get file ID from trailer for V=1,2,4
             let file_id = self.xref.file_id()?;
 
-            if matches!(encrypt_dict.encryption_version(),
-                EncryptionVersion::V5R5 | EncryptionVersion::V5R6) {
+            if matches!(
+                encrypt_dict.encryption_version(),
+                EncryptionVersion::V5R5 | EncryptionVersion::V5R6
+            ) {
                 // PDF 2.0 doesn't need file ID
                 Ok(encrypt_dict.check_user_password(password))
             } else {
@@ -1046,7 +1167,9 @@ impl PDFDocument {
             return Ok(version.to_string());
         }
 
-        Err(PDFError::Generic("PDF version not found in header".to_string()))
+        Err(PDFError::Generic(
+            "PDF version not found in header".to_string(),
+        ))
     }
 
     /// Gets the document info dictionary.
@@ -1112,7 +1235,9 @@ impl PDFDocument {
     ///
     /// # Returns
     /// `Some(Vec<OutlineItem>)` with hierarchical bookmark structure, or `None` if not present.
-    pub fn document_outline_items(&mut self) -> PDFResult<Option<Vec<crate::core::outline::OutlineItem>>> {
+    pub fn document_outline_items(
+        &mut self,
+    ) -> PDFResult<Option<Vec<crate::core::outline::OutlineItem>>> {
         crate::core::outline::parse_document_outline(self)
     }
 
@@ -1231,7 +1356,9 @@ impl PDFDocument {
                                     let page_ref = &arr[0];
                                     let page_index = match &**page_ref {
                                         PDFObject::Ref(ref_obj) => {
-                                            match self.resolve_page_index(ref_obj.num, ref_obj.generation) {
+                                            match self
+                                                .resolve_page_index(ref_obj.num, ref_obj.generation)
+                                            {
                                                 Some(idx) => idx,
                                                 None => return Ok(None),
                                             }
@@ -1580,10 +1707,7 @@ mod tests {
         // Verify it's a page dictionary
         match page.dict() {
             PDFObject::Dictionary(dict) => {
-                assert_eq!(
-                    dict.get("Type"),
-                    Some(&PDFObject::Name("Page".to_string()))
-                );
+                assert_eq!(dict.get("Type"), Some(&PDFObject::Name("Page".to_string())));
                 assert!(dict.contains_key("Parent"));
             }
             _ => panic!("Expected page dict to be a dictionary"),
@@ -1830,10 +1954,7 @@ startxref
             // Verify it's a page
             match page.dict() {
                 PDFObject::Dictionary(dict) => {
-                    assert_eq!(
-                        dict.get("Type"),
-                        Some(&PDFObject::Name("Page".to_string()))
-                    );
+                    assert_eq!(dict.get("Type"), Some(&PDFObject::Name("Page".to_string())));
                 }
                 _ => panic!("Expected page dict to be a dictionary"),
             }

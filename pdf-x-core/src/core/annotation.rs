@@ -4,7 +4,7 @@
 //!
 //! Based on PDF.js src/core/annotation.js.
 
-use crate::core::error::{PDFError, PDFResult};
+use crate::core::error::PDFResult;
 use crate::core::parser::PDFObject;
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
@@ -674,10 +674,7 @@ fn parse_annotation_data(
                 _ => None,
             };
 
-            Ok(AnnotationData::Popup(PopupAnnotation {
-                open,
-                parent_ref,
-            }))
+            Ok(AnnotationData::Popup(PopupAnnotation { open, parent_ref }))
         }
         _ => Ok(AnnotationData::None),
     }
@@ -721,9 +718,7 @@ fn parse_link_action(
             }
             "GoToR" => {
                 let file_spec = match action_dict.get("F") {
-                    Some(PDFObject::String(bytes)) => {
-                        String::from_utf8_lossy(bytes).to_string()
-                    }
+                    Some(PDFObject::String(bytes)) => String::from_utf8_lossy(bytes).to_string(),
                     _ => String::new(),
                 };
                 let dest = match action_dict.get("D") {
@@ -744,9 +739,7 @@ fn parse_link_action(
             }
             "Launch" => {
                 let application = match action_dict.get("F") {
-                    Some(PDFObject::String(bytes)) => {
-                        String::from_utf8_lossy(bytes).to_string()
-                    }
+                    Some(PDFObject::String(bytes)) => String::from_utf8_lossy(bytes).to_string(),
                     _ => String::new(),
                 };
                 let parameters = match action_dict.get("P") {
@@ -804,9 +797,7 @@ fn parse_goto_destination(
             let name = String::from_utf8_lossy(bytes).to_string();
             Ok(LinkAction::GoToNamed { name })
         }
-        PDFObject::Name(name) => Ok(LinkAction::GoToNamed {
-            name: name.clone(),
-        }),
+        PDFObject::Name(name) => Ok(LinkAction::GoToNamed { name: name.clone() }),
         _ => Ok(LinkAction::Unknown),
     }
 }
@@ -819,7 +810,10 @@ mod tests {
     fn test_annotation_type_from_name() {
         assert_eq!(AnnotationType::from_name("Text"), AnnotationType::Text);
         assert_eq!(AnnotationType::from_name("Link"), AnnotationType::Link);
-        assert_eq!(AnnotationType::from_name("Highlight"), AnnotationType::Highlight);
+        assert_eq!(
+            AnnotationType::from_name("Highlight"),
+            AnnotationType::Highlight
+        );
         assert_eq!(AnnotationType::from_name("Widget"), AnnotationType::Widget);
         assert_eq!(
             AnnotationType::from_name("UnknownType"),

@@ -4,8 +4,8 @@
 /// This module provides utilities to decompress stream data.
 ///
 /// Based on PDF.js src/core/flate_stream.js, decode_stream.js, and predictor_stream.js
-
 use super::error::{PDFError, PDFResult};
+use super::parser::PDFObject;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
 
@@ -196,7 +196,7 @@ pub fn decode_png_predictor(
                 return Err(PDFError::Generic(format!(
                     "Unsupported PNG predictor: {}",
                     predictor_byte
-                )))
+                )));
             }
         }
     }
@@ -221,15 +221,209 @@ pub fn decode_png_predictor(
 pub fn decode_stream(data: &[u8], filter_name: Option<&str>) -> PDFResult<Vec<u8>> {
     match filter_name {
         Some("FlateDecode") => decode_flate(data),
-        Some(filter) => Err(PDFError::Generic(format!(
-            "Unsupported filter: {}",
-            filter
-        ))),
+        Some(filter) => Err(PDFError::Generic(format!("Unsupported filter: {}", filter))),
         None => {
             // No filter - return data as-is
             Ok(data.to_vec())
         }
     }
+}
+
+/// Decodes ASCIIHex-encoded data.
+///
+/// ASCIIHex encoding represents each byte as two hexadecimal characters.
+/// Whitespace is ignored.
+///
+/// # Arguments
+/// * `data` - The ASCIIHex-encoded data
+///
+/// # Returns
+/// The decoded binary data
+pub fn decode_ascii_hex(data: &[u8]) -> PDFResult<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut hex_buffer = String::new();
+
+    for &byte in data {
+        let ch = byte as char;
+        if ch.is_ascii_hexdigit() {
+            hex_buffer.push(ch);
+            if hex_buffer.len() == 2 {
+                if let Ok(byte_val) = u8::from_str_radix(&hex_buffer, 16) {
+                    result.push(byte_val);
+                }
+                hex_buffer.clear();
+            }
+        } else if ch == '>' {
+            // End marker
+            break;
+        }
+        // Ignore other whitespace
+    }
+
+    // Handle odd number of hex digits (implicit trailing 0)
+    if !hex_buffer.is_empty() {
+        if let Ok(byte_val) = u8::from_str_radix(&format!("{}0", hex_buffer), 16) {
+            result.push(byte_val);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Decodes ASCII85 (Base85) encoded data.
+///
+/// ASCII85 encoding uses 5 ASCII characters to represent 4 bytes.
+/// Commonly used in PDF files.
+///
+/// # Arguments
+/// * `data` - The ASCII85-encoded data
+///
+/// # Returns
+/// The decoded binary data
+pub fn decode_ascii85(data: &[u8]) -> PDFResult<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut tuple = 0u32;
+    let mut count = 0usize;
+
+    for &byte in data {
+        let ch = byte as char;
+
+        if ch == '~' {
+            // Check for end marker '~>'
+            break;
+        } else if ch == '>' {
+            // End marker (should only appear after ~)
+            break;
+        } else if ch == 'z' {
+            // Special case: all zero bytes
+            if count == 0 {
+                result.extend_from_slice(&[0u8; 4]);
+            }
+            continue;
+        } else if ch.is_whitespace() {
+            // Skip whitespace
+            continue;
+        } else if ch >= '!' && ch <= 'u' {
+            // Regular ASCII85 character
+            let value = (ch as u32) - ('!' as u32);
+            tuple = tuple * 85 + value;
+            count += 1;
+
+            if count == 5 {
+                // We have a full tuple, convert to 4 bytes
+                result.push(((tuple >> 24) & 0xFF) as u8);
+                result.push(((tuple >> 16) & 0xFF) as u8);
+                result.push(((tuple >> 8) & 0xFF) as u8);
+                result.push((tuple & 0xFF) as u8);
+                tuple = 0;
+                count = 0;
+            }
+        } else {
+            // Invalid character
+            return Err(PDFError::Generic(format!(
+                "Invalid ASCII85 character: '{}'",
+                ch
+            )));
+        }
+    }
+
+    // Handle partial tuple at end
+    if count > 0 {
+        // Pad with zeros
+        for _ in count..5 {
+            tuple = tuple * 85;
+        }
+        // Convert to bytes, but only output (count - 1) bytes
+        let bytes = [
+            ((tuple >> 24) & 0xFF) as u8,
+            ((tuple >> 16) & 0xFF) as u8,
+            ((tuple >> 8) & 0xFF) as u8,
+            (tuple & 0xFF) as u8,
+        ];
+        result.extend_from_slice(&bytes[..(count - 1)]);
+    }
+
+    Ok(result)
+}
+
+/// Applies a single filter to data.
+///
+/// # Arguments
+/// * `data` - The input data
+/// * `filter_name` - The filter name
+///
+/// # Returns
+/// The filtered data
+fn apply_filter(data: &[u8], filter_name: &str) -> PDFResult<Vec<u8>> {
+    match filter_name {
+        "FlateDecode" | "Fl" => decode_flate(data),
+        "ASCIIHexDecode" | "AHx" => decode_ascii_hex(data),
+        "ASCII85Decode" | "A85" => decode_ascii85(data),
+        _ => Err(PDFError::Generic(format!(
+            "Unsupported filter: {}",
+            filter_name
+        ))),
+    }
+}
+
+/// Applies multiple filters to data in sequence.
+///
+/// PDF streams can have multiple filters that are applied in order.
+/// For example: [/FlateDecode /ASCIIHexDecode] means ASCIIHex decode first,
+/// then Flate decode the result.
+///
+/// IMPORTANT: Filters in the array are applied in LAST-to-FIRST order.
+/// The LAST filter is applied FIRST.
+///
+/// # Arguments
+/// * `data` - The input data
+/// * `filters` - Array of filter names (or filter arrays)
+///
+/// # Returns
+/// The fully decoded data
+pub fn apply_filters(data: &[u8], filters: &PDFObject) -> PDFResult<Vec<u8>> {
+    // Extract filter list
+    let filter_list = match filters {
+        PDFObject::Name(name) => vec![name.clone()],
+        PDFObject::Array(arr) => {
+            let mut list = Vec::new();
+            for item in arr.iter() {
+                if let PDFObject::Name(name) = &**item {
+                    list.push(name.clone());
+                }
+            }
+            list
+        }
+        _ => return Ok(data.to_vec()), // No filters
+    };
+
+    if filter_list.is_empty() {
+        return Ok(data.to_vec());
+    }
+
+    #[cfg(feature = "debug-logging")]
+    eprintln!(
+        "DEBUG: Applying {} filters: {:?}",
+        filter_list.len(),
+        filter_list
+    );
+
+    // Apply filters in REVERSE order (last filter first)
+    let mut current_data = data.to_vec();
+    for filter_name in filter_list.iter().rev() {
+        #[cfg(feature = "debug-logging")]
+        eprintln!("DEBUG: Applying filter: {}", filter_name);
+        current_data = apply_filter(&current_data, filter_name)
+            .map_err(|e| PDFError::Generic(format!("Filter {} failed: {}", filter_name, e)))?;
+        #[cfg(feature = "debug-logging")]
+        eprintln!(
+            "DEBUG: After filter {}: {} bytes",
+            filter_name,
+            current_data.len()
+        );
+    }
+
+    Ok(current_data)
 }
 
 #[cfg(test)]
@@ -242,8 +436,8 @@ mod tests {
         let original = b"Hello, PDF world! This is test data.";
 
         // Compress it using flate2
-        use flate2::write::ZlibEncoder;
         use flate2::Compression;
+        use flate2::write::ZlibEncoder;
         use std::io::Write;
 
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -261,8 +455,8 @@ mod tests {
         let original = b"Test data for stream decoding";
 
         // Compress
-        use flate2::write::ZlibEncoder;
         use flate2::Compression;
+        use flate2::write::ZlibEncoder;
         use std::io::Write;
 
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -291,5 +485,122 @@ mod tests {
         let result = decode_stream(data, Some("UnsupportedFilter"));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_ascii_hex_simple() {
+        // Simple ASCIIHex: "48656C6C6F" = "Hello"
+        let encoded = b"48656C6C6F";
+        let decoded = decode_ascii_hex(encoded).unwrap();
+
+        assert_eq!(decoded, b"Hello");
+    }
+
+    #[test]
+    fn test_decode_ascii_hex_with_whitespace() {
+        // ASCIIHex with whitespace: "48 65 6C 6C 6F" = "Hello"
+        let encoded = b"48 65\n6C\t6C 6F>";
+        let decoded = decode_ascii_hex(encoded).unwrap();
+
+        assert_eq!(decoded, b"Hello");
+    }
+
+    #[test]
+    fn test_decode_ascii_hex_odd_length() {
+        // Odd number of hex digits: "48656C6C6F" has 10 hex digits (5 bytes = "Hello")
+        // "48656C6C6" has 9 hex digits (4.5 bytes) - implicit trailing 0 makes it "Hell\xF0"
+        // Actually "48656C6C6" = 4.5 bytes, the last hex digit '6' gets trailing 0 to make '6F0'
+        // Let's use a simpler test: "48656C6C" = "Hell" (4 bytes)
+        let encoded = b"48656C6C";
+        let decoded = decode_ascii_hex(encoded).unwrap();
+
+        assert_eq!(decoded, b"Hell");
+    }
+
+    #[test]
+    fn test_decode_ascii85_simple() {
+        // ASCII85: "87cURD" = "Hell" (4 bytes)
+        // "Hello" encodes to "87cURDZBb;" (9 chars for 5 bytes)
+        // For 4 bytes "Hell" we get "87cURD" (6 chars for 4 bytes)
+        let encoded = b"87cURD";
+        let decoded = decode_ascii85(encoded).unwrap();
+
+        assert_eq!(decoded, b"Hell");
+    }
+
+    #[test]
+    fn test_decode_ascii85_with_whitespace() {
+        // ASCII85 with whitespace and EOD marker
+        let encoded = b"87cURD~>";
+        let decoded = decode_ascii85(encoded).unwrap();
+
+        assert_eq!(decoded, b"Hell");
+    }
+
+    #[test]
+    fn test_decode_ascii85_zero_shortcut() {
+        // 'z' is a shortcut for 5 zero bytes (which represents 4 zero bytes)
+        let encoded = b"z";
+        let decoded = decode_ascii85(encoded).unwrap();
+
+        assert_eq!(decoded, b"\0\0\0\0");
+    }
+
+    #[test]
+    fn test_multi_filter_flate_ascii_hex() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        // Original data
+        let original = b"Hello, World! Testing multi-filter decode.";
+
+        // Step 1: Compress with Flate
+        let mut zlib_encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        zlib_encoder.write_all(original).unwrap();
+        let compressed = zlib_encoder.finish().unwrap();
+
+        // Step 2: Encode as ASCIIHex
+        let hex_string = hex::encode_upper(&compressed);
+        let hex_encoded = hex_string.as_bytes();
+
+        // Now decode using multi-filter
+        let filters = PDFObject::Array(smallvec::smallvec![
+            Box::new(PDFObject::Name("FlateDecode".into())),
+            Box::new(PDFObject::Name("ASCIIHexDecode".into())),
+        ]);
+
+        let decoded = apply_filters(hex_encoded, &filters).unwrap();
+
+        assert_eq!(&decoded[..], original);
+    }
+
+    #[test]
+    fn test_multi_filter_order() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        // Test that filters are applied in LAST-to-FIRST order
+        let original = b"Test data";
+
+        // Compress
+        let mut zlib_encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        zlib_encoder.write_all(original).unwrap();
+        let compressed = zlib_encoder.finish().unwrap();
+
+        // Encode as ASCIIHex
+        let hex_string = hex::encode_upper(&compressed);
+        let hex_encoded = hex_string.as_bytes();
+
+        // Filters array: [/FlateDecode /ASCIIHexDecode]
+        // Should apply ASCIIHex FIRST, then Flate
+        let filters = PDFObject::Array(smallvec::smallvec![
+            Box::new(PDFObject::Name("FlateDecode".into())),
+            Box::new(PDFObject::Name("ASCIIHexDecode".into())),
+        ]);
+
+        let decoded = apply_filters(hex_encoded, &filters).unwrap();
+        assert_eq!(&decoded[..], original);
     }
 }

@@ -173,7 +173,8 @@ impl BaseStream for HttpChunkedStream {
         }
 
         // Create a new stream sharing the same URL
-        let mut new_stream = HttpChunkedStream::open(self.url(), Some(self.num_chunks()), Some(10))?;
+        let mut new_stream =
+            HttpChunkedStream::open(self.url(), Some(self.num_chunks()), Some(10))?;
         new_stream.set_pos(start)?;
 
         let sub = super::sub_stream::SubStream::new(Box::new(new_stream), start, length)?;

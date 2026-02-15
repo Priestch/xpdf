@@ -13,6 +13,7 @@
 
 use crate::core::cmap::CMap;
 use crate::core::decode;
+use crate::core::encoding::Encoding;
 use crate::core::error::{PDFError, PDFResult};
 use crate::core::parser::PDFObject;
 use rustc_hash::FxHashMap;
@@ -184,6 +185,9 @@ pub struct Font {
     /// ToUnicode CMap for character encoding
     pub cmap: Option<CMap>,
 
+    /// Font encoding (Standard, WinAnsi, MacRoman, or custom)
+    pub encoding: Encoding,
+
     /// Character width cache (CID -> width in glyph space units)
     pub width_cache: FxHashMap<u16, f64>,
 
@@ -200,18 +204,30 @@ impl Font {
     pub fn new(font_dict: PDFObject, xref: &mut crate::core::xref::XRef) -> PDFResult<Self> {
         let dict = FontDict::from_pdf_object(&font_dict)?;
 
+        // Parse encoding from the font dictionary
+        let encoding = if let Some(enc_obj) = &dict.encoding {
+            Encoding::from_pdf_object(enc_obj).unwrap_or(Encoding::Standard) // Default to StandardEncoding
+        } else {
+            // No encoding specified - default to StandardEncoding for simple fonts
+            Encoding::Standard
+        };
+
         // Parse ToUnicode CMap if present
         let cmap = if let Some(to_unicode_ref) = &dict.to_unicode {
             match xref.fetch_if_ref(to_unicode_ref)? {
-                PDFObject::Stream { dict: stream_dict, data } => {
+                PDFObject::Stream {
+                    dict: stream_dict,
+                    data,
+                } => {
                     // Decompress the stream
                     let filter_name = stream_dict.get("Filter").and_then(|f| match f {
                         PDFObject::Name(name) => Some(name.as_str()),
                         _ => None,
                     });
 
-                    let decompressed = decode::decode_stream(&data, filter_name)
-                        .map_err(|e| PDFError::Generic(format!("ToUnicode stream decode error: {}", e)))?;
+                    let decompressed = decode::decode_stream(&data, filter_name).map_err(|e| {
+                        PDFError::Generic(format!("ToUnicode stream decode error: {}", e))
+                    })?;
 
                     // Parse CMap
                     Some(CMap::parse(&decompressed)?)
@@ -241,6 +257,7 @@ impl Font {
         Ok(Font {
             dict,
             cmap,
+            encoding,
             width_cache,
             embedded_font,
         })
@@ -309,16 +326,35 @@ impl Font {
     /// Maps a character code (CID) to Unicode using the ToUnicode CMap.
     ///
     /// Falls back to the character code itself if no mapping exists.
-    #[inline(always)]  // Hot path during text extraction
+    #[inline(always)] // Hot path during text extraction
     pub fn to_unicode(&self, cid: u16) -> char {
+        self.char_code_to_unicode(cid)
+    }
+
+    /// Maps a character code to Unicode using the proper fallback chain.
+    ///
+    /// The fallback chain is:
+    /// 1. ToUnicode CMap (if available)
+    /// 2. Font encoding (Standard/WinAnsi/MacRoman/custom)
+    /// 3. Direct mapping (code as-is if valid Unicode, else replacement char)
+    ///
+    /// This method implements the PDF spec's text decoding algorithm.
+    #[inline(always)] // Hot path during text extraction
+    pub fn char_code_to_unicode(&self, code: u16) -> char {
+        // First, try the ToUnicode CMap (most reliable)
         if let Some(ref cmap) = self.cmap {
-            if let Some(unicode_char) = cmap.to_unicode(cid) {
+            if let Some(unicode_char) = cmap.to_unicode(code) {
                 return unicode_char;
             }
         }
 
-        // Fallback: use the CID as-is if it's a valid Unicode code point
-        char::from_u32(cid as u32).unwrap_or('�') // � = replacement character
+        // Next, try the font encoding (for simple fonts with 1-byte codes)
+        if code <= 255 {
+            return self.encoding.char_to_unicode(code as u8);
+        }
+
+        // Fallback: use the code as-is if it's a valid Unicode code point
+        char::from_u32(code as u32).unwrap_or('\u{FFFD}') // U+FFFD = replacement character
     }
 
     /// Gets the width of a character in glyph space units (typically 1/1000 em).
@@ -328,7 +364,7 @@ impl Font {
     ///
     /// # Returns
     /// Character width in glyph space units, or default width if not found
-    #[inline(always)]  // Hot path during text extraction
+    #[inline(always)] // Hot path during text extraction
     pub fn get_char_width(&self, cid: u16) -> f64 {
         self.width_cache
             .get(&cid)
@@ -396,14 +432,8 @@ mod tests {
     #[test]
     fn test_font_dict_from_simple_font() {
         let mut dict = std::collections::HashMap::new();
-        dict.insert(
-            "Type".to_string(),
-            PDFObject::Name("Font".to_string()),
-        );
-        dict.insert(
-            "Subtype".to_string(),
-            PDFObject::Name("Type1".to_string()),
-        );
+        dict.insert("Type".to_string(), PDFObject::Name("Font".to_string()));
+        dict.insert("Subtype".to_string(), PDFObject::Name("Type1".to_string()));
         dict.insert(
             "BaseFont".to_string(),
             PDFObject::Name("Helvetica".to_string()),
@@ -420,22 +450,13 @@ mod tests {
     #[test]
     fn test_font_dict_with_widths() {
         let mut dict = std::collections::HashMap::new();
-        dict.insert(
-            "Subtype".to_string(),
-            PDFObject::Name("Type1".to_string()),
-        );
+        dict.insert("Subtype".to_string(), PDFObject::Name("Type1".to_string()));
         dict.insert(
             "BaseFont".to_string(),
             PDFObject::Name("CustomFont".to_string()),
         );
-        dict.insert(
-            "FirstChar".to_string(),
-            PDFObject::Number(32.0),
-        );
-        dict.insert(
-            "LastChar".to_string(),
-            PDFObject::Number(34.0),
-        );
+        dict.insert("FirstChar".to_string(), PDFObject::Number(32.0));
+        dict.insert("LastChar".to_string(), PDFObject::Number(34.0));
         dict.insert(
             "Widths".to_string(),
             PDFObject::Array(smallvec![
