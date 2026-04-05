@@ -202,7 +202,13 @@ impl Font {
     /// * `font_dict` - The PDF font dictionary object
     /// * `xref` - Cross-reference table for fetching referenced objects
     pub fn new(font_dict: PDFObject, xref: &mut crate::core::xref::XRef) -> PDFResult<Self> {
-        let dict = FontDict::from_pdf_object(&font_dict)?;
+        let mut dict = FontDict::from_pdf_object(&font_dict)?;
+
+        if let Some(descriptor_ref) = &dict.font_descriptor {
+            if let Some(default_width) = Self::extract_missing_width(descriptor_ref, xref) {
+                dict.default_width = default_width;
+            }
+        }
 
         // Parse encoding from the font dictionary
         let encoding = if let Some(enc_obj) = &dict.encoding {
@@ -320,6 +326,22 @@ impl Font {
                 Ok(Some(decompressed))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Extracts /MissingWidth from a font descriptor, if present.
+    fn extract_missing_width(
+        descriptor_ref: &PDFObject,
+        xref: &mut crate::core::xref::XRef,
+    ) -> Option<f64> {
+        let descriptor = xref.fetch_if_ref(descriptor_ref).ok()?;
+
+        match descriptor {
+            PDFObject::Dictionary(dict) => dict.get("MissingWidth").and_then(|value| match value {
+                PDFObject::Number(width) if width.is_finite() && *width >= 0.0 => Some(*width),
+                _ => None,
+            }),
+            _ => None,
         }
     }
 

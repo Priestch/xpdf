@@ -31,6 +31,10 @@ pub struct Type1Font {
     /// Custom PDF encoding: byte code -> glyph name
     /// This maps PDF byte codes to the actual glyph names in the font
     custom_encoding: HashMap<u8, String>,
+    /// Width overrides from PDF /Widths arrays
+    pdf_widths: HashMap<u8, u16>,
+    /// Optional PDF default width for missing codes
+    pdf_default_width: Option<u16>,
 }
 
 impl Type1Font {
@@ -61,6 +65,8 @@ impl Type1Font {
                     variant: FontVariant::CFF(Arc::new(cff_table)),
                     name_to_code: HashMap::new(),
                     custom_encoding: HashMap::new(),
+                    pdf_widths: HashMap::new(),
+                    pdf_default_width: None,
                 });
             }
 
@@ -84,6 +90,8 @@ impl Type1Font {
                 variant: FontVariant::Type1(table),
                 name_to_code,
                 custom_encoding: HashMap::new(),
+                pdf_widths: HashMap::new(),
+                pdf_default_width: None,
             })
         }
 
@@ -281,13 +289,20 @@ impl Type1Font {
     pub fn glyph_width(&self, ch: char) -> u16 {
         #[cfg(feature = "hayro-font")]
         {
-            let code = ch as u8;
+            let default_width = self.pdf_default_width.unwrap_or(500);
+            let code = match u8::try_from(ch as u32) {
+                Ok(code) => code,
+                Err(_) => return default_width,
+            };
+
+            if let Some(width) = self.pdf_widths.get(&code) {
+                return *width;
+            }
 
             match &self.variant {
                 FontVariant::Type1(_table) => {
-                    // Type1 widths would need to be parsed from the font
-                    // For now, use a reasonable default
-                    500
+                    // Type1 widths usually come from the PDF font dictionary.
+                    default_width
                 }
                 FontVariant::CFF(table) => {
                     // For CFF, try to get the glyph width
@@ -298,8 +313,8 @@ impl Type1Font {
                             }
                         }
                     }
-                    // Fallback to default width
-                    500
+                    // Fall back to the PDF/default width
+                    default_width
                 }
             }
         }
@@ -320,6 +335,12 @@ impl Type1Font {
     /// * `encoding` - HashMap mapping byte codes to glyph names
     pub fn set_custom_encoding(&mut self, encoding: HashMap<u8, String>) {
         self.custom_encoding = encoding;
+    }
+
+    /// Set width metrics extracted from the PDF font dictionary.
+    pub fn set_width_metrics(&mut self, widths: HashMap<u8, u16>, default_width: Option<u16>) {
+        self.pdf_widths = widths;
+        self.pdf_default_width = default_width;
     }
 
     /// Get the custom encoding for a byte code, if available.

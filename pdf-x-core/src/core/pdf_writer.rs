@@ -321,8 +321,8 @@ impl PDFWriter {
     fn write_xref_table<W: Write>(
         buffer: &mut W,
         object_offsets: &HashMap<(u32, u32), u64>,
-        original_size: usize,
-        prev_xref_offset: usize,
+        _original_size: usize,
+        _prev_xref_offset: usize,
     ) -> PDFResult<()> {
         buffer
             .write_all(b"xref\n")

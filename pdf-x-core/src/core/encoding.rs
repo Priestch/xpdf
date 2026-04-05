@@ -7,6 +7,7 @@
 //! Based on Adobe Technical Note #5176 and PDF specification.
 
 /// Convert byte values to character codes for const array initialization.
+#[allow(dead_code)]
 const fn byte_to_char(b: u8) -> char {
     b as char
 }

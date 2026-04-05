@@ -59,14 +59,6 @@ pub struct TextItem {
     pub y: f64,
 }
 
-/// Progress event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgressEvent {
-    pub stage: String,
-    pub progress: u32,
-    pub message: String,
-}
-
 /// Error types for the Tauri app
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -79,8 +71,11 @@ pub enum AppError {
     #[error("File not found: {0}")]
     FileNotFound(String),
 
-    #[error("Invalid file path")]
-    InvalidPath,
+    #[error("No document loaded")]
+    NoDocumentLoaded,
+
+    #[error("PNG encoding error: {0}")]
+    PngEncoding(String),
 }
 
 // Convert AppError to a String for Tauri

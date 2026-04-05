@@ -775,7 +775,7 @@ fn parse_link_action(
 /// Parses a GoTo destination.
 fn parse_goto_destination(
     dest_obj: &PDFObject,
-    xref: &mut crate::core::XRef,
+    _xref: &mut crate::core::XRef,
 ) -> PDFResult<LinkAction> {
     match dest_obj {
         PDFObject::Array(arr) => {

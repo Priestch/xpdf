@@ -7,10 +7,19 @@ use pdf_x_core::rendering::graphics_state::{Color, FillRule, StrokeProps};
 use pdf_x_core::rendering::{Device, Paint, PathDrawMode, TestDevice};
 
 #[cfg(feature = "rendering")]
+mod test_utils;
+
+#[cfg(feature = "rendering")]
 use pdf_x_core::rendering::skia_device::SkiaDevice;
 
 #[cfg(feature = "rendering")]
 use tiny_skia::Pixmap;
+
+#[cfg(feature = "rendering")]
+use test_utils::get_test_pdf_path;
+
+#[cfg(feature = "rendering")]
+use pdf_x_core::PDFDocument;
 
 // ============================================================================
 // Basic Drawing Tests
@@ -248,8 +257,12 @@ fn test_draw_text() {
             b"Hello, World!",
             "Helvetica",
             12.0,
+            0.0,
+            0.0,
             &paint,
             &[1.0, 0.0, 0.0, 1.0, 100.0, 700.0],
+            100.0,
+            0.0,
         )
         .unwrap();
 
@@ -267,8 +280,12 @@ fn test_draw_multiple_text_objects() {
             b"First line",
             "Helvetica",
             12.0,
+            0.0,
+            0.0,
             &paint,
             &[1.0, 0.0, 0.0, 1.0, 100.0, 700.0],
+            100.0,
+            0.0,
         )
         .unwrap();
     device
@@ -276,8 +293,12 @@ fn test_draw_multiple_text_objects() {
             b"Second line",
             "Times-Roman",
             14.0,
+            0.0,
+            0.0,
             &paint,
             &[1.0, 0.0, 0.0, 1.0, 100.0, 680.0],
+            100.0,
+            0.0,
         )
         .unwrap();
 
@@ -578,4 +599,324 @@ fn test_a4_page_bounds() {
     let (width, height) = device.page_bounds();
     assert_eq!(width, 595.0);
     assert_eq!(height, 842.0);
+}
+
+#[cfg(feature = "rendering")]
+#[derive(Debug)]
+struct RenderMetrics {
+    width: u32,
+    height: u32,
+    non_white: usize,
+    dark_pixels: usize,
+    rows_with_ink: usize,
+    cols_with_ink: usize,
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+    signature: Vec<u8>,
+}
+
+#[cfg(feature = "rendering")]
+fn analyze_rendered_pixels(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+    let width = width as usize;
+    let height = height as usize;
+    let mut non_white = 0usize;
+    let mut dark_pixels = 0usize;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut rows_with_ink = 0usize;
+
+    for y in 0..height {
+        let mut row_has_ink = false;
+        for x in 0..width {
+            let idx = (y * width + x) * 4;
+            let r = pixels[idx];
+            let g = pixels[idx + 1];
+            let b = pixels[idx + 2];
+            if r != 255 || g != 255 || b != 255 {
+                non_white += 1;
+                row_has_ink = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                if r < 80 && g < 80 && b < 80 {
+                    dark_pixels += 1;
+                }
+            }
+        }
+        if row_has_ink {
+            rows_with_ink += 1;
+        }
+    }
+
+    let cols_with_ink = (0..width)
+        .filter(|&x| {
+            (0..height).any(|y| {
+                let idx = (y * width + x) * 4;
+                pixels[idx] != 255 || pixels[idx + 1] != 255 || pixels[idx + 2] != 255
+            })
+        })
+        .count();
+
+    (
+        non_white,
+        dark_pixels,
+        rows_with_ink,
+        cols_with_ink,
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+    )
+}
+
+#[cfg(feature = "rendering")]
+fn coarse_density_signature(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    cols: usize,
+    rows: usize,
+) -> Vec<u8> {
+    let width = width as usize;
+    let height = height as usize;
+    let mut signature = Vec::with_capacity(cols * rows);
+
+    for row in 0..rows {
+        let y0 = row * height / rows;
+        let y1 = ((row + 1) * height / rows).min(height);
+        for col in 0..cols {
+            let x0 = col * width / cols;
+            let x1 = ((col + 1) * width / cols).min(width);
+            let mut non_white = 0usize;
+            let mut total = 0usize;
+
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = (y * width + x) * 4;
+                    total += 1;
+                    if pixels[idx] != 255 || pixels[idx + 1] != 255 || pixels[idx + 2] != 255 {
+                        non_white += 1;
+                    }
+                }
+            }
+
+            let bucket = ((non_white * 10) / total).min(9) as u8;
+            signature.push(bucket);
+        }
+    }
+
+    signature
+}
+
+#[cfg(feature = "rendering")]
+fn trim_trailing_zeros(signature: &[u8]) -> &[u8] {
+    let mut end = signature.len();
+    while end > 0 && signature[end - 1] == 0 {
+        end -= 1;
+    }
+    &signature[..end]
+}
+
+#[cfg(feature = "rendering")]
+fn render_fixture_metrics(name: &str) -> RenderMetrics {
+    let pdf_path = get_test_pdf_path(name);
+    assert!(pdf_path.exists(), "missing test fixture: {}", pdf_path.display());
+
+    let pdf_bytes = std::fs::read(&pdf_path).expect("should read regression fixture");
+    let mut doc = PDFDocument::open(pdf_bytes).expect("should open regression fixture");
+
+    let (width, height, pixels) = doc
+        .render_page_to_image(0, Some(2.0))
+        .expect("should render regression fixture");
+
+    let (non_white, dark_pixels, rows_with_ink, cols_with_ink, min_x, min_y, max_x, max_y) =
+        analyze_rendered_pixels(width, height, &pixels);
+    let signature = coarse_density_signature(width, height, &pixels, 12, 16);
+
+    RenderMetrics {
+        width,
+        height,
+        non_white,
+        dark_pixels,
+        rows_with_ink,
+        cols_with_ink,
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        signature,
+    }
+}
+
+#[cfg(feature = "rendering")]
+#[test]
+fn test_absw_page2_text_render_regression() {
+    let metrics = render_fixture_metrics("absw-page2-text-regression.pdf");
+    let expected_signature = vec![
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        6, 6, 7, 7, 7, 7, 7, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9,
+        9, 9, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 2, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0,
+        4, 8, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 0, 0, 0, 5, 6, 7, 5, 7,
+        6, 5, 5, 0, 0, 0, 0, 8, 9, 9, 9, 9, 9, 9, 9, 7, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0,
+        0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 8, 0, 0, 0, 7, 5, 4, 5, 5, 5, 5, 4, 3, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    assert_eq!((metrics.width, metrics.height), (1008, 1332));
+    assert!(
+        (580_000..=600_000).contains(&metrics.non_white),
+        "unexpected non-white coverage: {}",
+        metrics.non_white
+    );
+    assert!(
+        (575_000..=590_000).contains(&metrics.dark_pixels),
+        "unexpected dark-pixel coverage: {}",
+        metrics.dark_pixels
+    );
+    assert!(
+        (930..=960).contains(&metrics.rows_with_ink),
+        "text or vector content shifted vertically: {} rows with ink",
+        metrics.rows_with_ink
+    );
+    assert!(
+        (760..=790).contains(&metrics.cols_with_ink),
+        "text or vector content shifted horizontally: {} columns with ink",
+        metrics.cols_with_ink
+    );
+    assert!(
+        (225..=245).contains(&metrics.min_x),
+        "unexpected left ink bound: {}",
+        metrics.min_x
+    );
+    assert!(
+        (175..=190).contains(&metrics.min_y),
+        "unexpected top ink bound: {}",
+        metrics.min_y
+    );
+    assert!(metrics.max_x >= 1000, "unexpected right ink bound: {}", metrics.max_x);
+    assert!(
+        (1180..=1205).contains(&metrics.max_y),
+        "unexpected bottom ink bound: {}",
+        metrics.max_y
+    );
+    assert_eq!(
+        metrics.signature, expected_signature,
+        "coarse render signature drifted for absw page 2"
+    );
+}
+
+#[cfg(feature = "rendering")]
+#[test]
+fn test_absw_page3_text_render_regression() {
+    let metrics = render_fixture_metrics("absw-page3-text-regression.pdf");
+    let expected_signature = vec![
+        0, 0, 0, 8, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 5, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 0, 0, 2, 4, 8, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 1, 7, 9, 9, 9, 8,
+        6, 2, 0, 0, 0, 7, 7, 8, 6, 1, 1, 0, 0, 0, 0, 0, 0, 9, 9, 9, 7, 1, 0, 0, 0, 0, 0, 0, 0,
+        9, 9, 9, 9, 4, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9, 8, 3, 3, 3, 3, 2, 0, 0, 0, 9, 9, 9, 9, 9,
+        9, 9, 9, 7, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 6, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 7, 0,
+        0, 0, 8, 9, 9, 8, 9, 8, 8, 8, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    assert_eq!((metrics.width, metrics.height), (1008, 1332));
+    assert!(
+        (630_000..=645_000).contains(&metrics.non_white),
+        "unexpected non-white coverage: {}",
+        metrics.non_white
+    );
+    assert!(
+        (622_000..=635_000).contains(&metrics.dark_pixels),
+        "unexpected dark-pixel coverage: {}",
+        metrics.dark_pixels
+    );
+    assert!(
+        (1090..=1120).contains(&metrics.rows_with_ink),
+        "text or vector content shifted vertically: {} rows with ink",
+        metrics.rows_with_ink
+    );
+    assert!(
+        (790..=810).contains(&metrics.cols_with_ink),
+        "text or vector content shifted horizontally: {} columns with ink",
+        metrics.cols_with_ink
+    );
+    assert!(
+        (200..=220).contains(&metrics.min_x),
+        "unexpected left ink bound: {}",
+        metrics.min_x
+    );
+    assert!(metrics.min_y <= 5, "unexpected top ink bound: {}", metrics.min_y);
+    assert!(metrics.max_x >= 1000, "unexpected right ink bound: {}", metrics.max_x);
+    assert!(
+        (1095..=1115).contains(&metrics.max_y),
+        "unexpected bottom ink bound: {}",
+        metrics.max_y
+    );
+    assert_eq!(
+        trim_trailing_zeros(&metrics.signature),
+        trim_trailing_zeros(&expected_signature),
+        "coarse render signature drifted for absw page 3"
+    );
+}
+
+#[cfg(feature = "rendering")]
+#[test]
+fn test_absw_page4_text_render_regression() {
+    let metrics = render_fixture_metrics("absw-page4-text-regression.pdf");
+    let expected_signature = vec![
+        0, 0, 0, 0, 0, 0, 8, 9, 9, 9, 9, 3, 0, 0, 0, 0, 0, 0, 1, 4, 4, 4, 4, 0, 0, 0, 0, 4, 0,
+        1, 1, 0, 1, 0, 1, 2, 0, 0, 0, 8, 7, 8, 7, 8, 9, 8, 9, 7, 0, 0, 0, 9, 7, 8, 9, 9, 9, 9,
+        9, 8, 0, 0, 0, 9, 6, 7, 9, 9, 9, 9, 9, 9, 0, 0, 0, 9, 6, 9, 9, 9, 9, 9, 8, 9, 0, 0, 0,
+        9, 7, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 9, 8, 7, 9, 9, 9, 9, 9, 9, 0, 0, 0, 9, 7, 8, 9, 9,
+        9, 9, 9, 9, 0, 0, 0, 9, 7, 7, 9, 9, 9, 9, 9, 9, 0, 0, 0, 9, 7, 8, 9, 9, 9, 9, 9, 9, 0,
+        0, 0, 8, 8, 7, 9, 8, 9, 9, 9, 9, 0, 0, 0, 8, 8, 7, 8, 9, 8, 9, 9, 8, 0, 0, 0, 4, 6, 7,
+        6, 6, 6, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    assert_eq!((metrics.width, metrics.height), (1008, 1332));
+    assert!(
+        (720_000..=740_000).contains(&metrics.non_white),
+        "unexpected non-white coverage: {}",
+        metrics.non_white
+    );
+    assert!(
+        (700_000..=715_000).contains(&metrics.dark_pixels),
+        "unexpected dark-pixel coverage: {}",
+        metrics.dark_pixels
+    );
+    assert!(
+        (1_180..=1_240).contains(&metrics.rows_with_ink),
+        "text or vector content shifted vertically: {} rows with ink",
+        metrics.rows_with_ink
+    );
+    assert!(
+        (750..=780).contains(&metrics.cols_with_ink),
+        "text or vector content shifted horizontally: {} columns with ink",
+        metrics.cols_with_ink
+    );
+    assert!(
+        (235..=255).contains(&metrics.min_x),
+        "unexpected left ink bound: {}",
+        metrics.min_x
+    );
+    assert!(metrics.min_y <= 5, "unexpected top ink bound: {}", metrics.min_y);
+    assert!(metrics.max_x >= 1000, "unexpected right ink bound: {}", metrics.max_x);
+    assert!(
+        (1260..=1285).contains(&metrics.max_y),
+        "unexpected bottom ink bound: {}",
+        metrics.max_y
+    );
+    assert_eq!(
+        metrics.signature, expected_signature,
+        "coarse render signature drifted for absw page 4"
+    );
 }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Test utilities and helpers for PDF-X tests
 //!
 //! This module provides common functionality for testing PDF parsing,
@@ -75,7 +77,7 @@ pub struct TestManifestEntry {
 /// Load and parse the test manifest
 pub fn load_test_manifest() -> Result<Vec<TestManifestEntry>, Box<dyn std::error::Error>> {
     let manifest_path = fixtures_dir().join("test_manifest.json");
-    let content = fs::read_to_string(manifest_path)?;
+    let _content = fs::read_to_string(manifest_path)?;
 
     // Simple JSON parsing - in production, use serde_json
     // For now, return empty vec as placeholder

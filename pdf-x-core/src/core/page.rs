@@ -2,6 +2,9 @@ use super::error::{PDFError, PDFResult};
 use super::parser::PDFObject;
 use rustc_hash::FxHashMap;
 
+#[cfg(feature = "rendering")]
+use crate::rendering::FontWidthMetrics;
+
 /// A single page in a PDF document.
 ///
 /// Pages are loaded lazily - the page dictionary is fetched from the xref table
@@ -291,6 +294,33 @@ impl Page {
     }
 
     #[cfg(feature = "rendering")]
+    fn build_font_width_metrics(pdf_font: &super::font::Font) -> FontWidthMetrics {
+        let mut metrics = FontWidthMetrics::default();
+
+        for (cid, width) in &pdf_font.width_cache {
+            if *cid > u8::MAX as u16 || !width.is_finite() || *width < 0.0 {
+                continue;
+            }
+            metrics.code_widths.insert(
+                *cid as u8,
+                width.round().clamp(0.0, u16::MAX as f64) as u16,
+            );
+        }
+
+        if pdf_font.dict.default_width.is_finite() && pdf_font.dict.default_width >= 0.0 {
+            metrics.default_width = Some(
+                pdf_font
+                    .dict
+                    .default_width
+                    .round()
+                    .clamp(0.0, u16::MAX as f64) as u16,
+            );
+        }
+
+        metrics
+    }
+
+    #[cfg(feature = "rendering")]
     fn load_fonts_for_rendering_with_resources<D: crate::rendering::Device>(
         &self,
         xref: &mut super::xref::XRef,
@@ -320,8 +350,12 @@ impl Page {
         for (font_name, font_ref) in font_dict {
             if let Ok(font_obj) = xref.fetch_if_ref(&font_ref) {
                 if let Ok(pdf_font) = super::font::Font::new(font_obj, xref) {
+                    let width_metrics = Self::build_font_width_metrics(&pdf_font);
                     if let Some(embedded_data) = pdf_font.embedded_font {
-                        if let Err(e) = device.load_font_data(&font_name, embedded_data, None) {
+                        if let Err(e) = device
+                            .load_font_data(&font_name, embedded_data, None)
+                            .and_then(|_| device.set_font_width_metrics(&font_name, &width_metrics))
+                        {
                             if !e.to_string().contains("UnknownMagic") {
                                 eprintln!(
                                     "Warning: Failed to load embedded font '{}': {}",
@@ -330,7 +364,10 @@ impl Page {
                             }
                         }
                     } else if let Some(fallback_data) = Self::get_fallback_font_data(pdf_font.base_font()) {
-                        if let Err(e) = device.load_font_data(&font_name, fallback_data, None) {
+                        if let Err(e) = device
+                            .load_font_data(&font_name, fallback_data, None)
+                            .and_then(|_| device.set_font_width_metrics(&font_name, &width_metrics))
+                        {
                             eprintln!(
                                 "Warning: Failed to load fallback font for '{}': {}",
                                 font_name, e
@@ -788,12 +825,16 @@ impl Page {
                     // Try to create a Font and extract embedded data
                     match super::font::Font::new(font_obj, xref) {
                         Ok(pdf_font) => {
+                            let width_metrics = Self::build_font_width_metrics(&pdf_font);
                             // If we have embedded font data, load it
                             if let Some(embedded_data) = pdf_font.embedded_font {
                                 // Note: page.rs doesn't have access to the encoding dictionary here
                                 // The rendering context will handle encoding properly
-                                if let Err(e) =
-                                    device.load_font_data(&font_name, embedded_data, None)
+                                if let Err(e) = device
+                                    .load_font_data(&font_name, embedded_data, None)
+                                    .and_then(|_| {
+                                        device.set_font_width_metrics(&font_name, &width_metrics)
+                                    })
                                 {
                                     // Only log for non-Type1 fonts (Type1 "UnknownMagic" is expected)
                                     if !e.to_string().contains("UnknownMagic") {
@@ -808,8 +849,12 @@ impl Page {
                                 let base_font = pdf_font.base_font();
                                 if let Some(fallback_data) = Self::get_fallback_font_data(base_font)
                                 {
-                                    if let Err(e) =
-                                        device.load_font_data(&font_name, fallback_data, None)
+                                    if let Err(e) = device
+                                        .load_font_data(&font_name, fallback_data, None)
+                                        .and_then(|_| {
+                                            device
+                                                .set_font_width_metrics(&font_name, &width_metrics)
+                                        })
                                     {
                                         eprintln!(
                                             "Warning: Failed to load fallback font for '{}': {}",

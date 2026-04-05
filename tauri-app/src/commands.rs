@@ -10,15 +10,15 @@ use tauri::State;
 pub async fn open_pdf_file(
     file_path: String,
     state: State<'_, AppState>,
-) -> Result<DocumentMetadata, String> {
+) -> AppResult<DocumentMetadata> {
     // Check file exists
     let path = PathBuf::from(&file_path);
     if !path.exists() {
-        return Err(format!("File not found: {}", file_path));
+        return Err(AppError::FileNotFound(file_path));
     }
 
     // Read PDF file data into memory (for fast access during rendering)
-    let pdf_data = fs::read(&file_path).map_err(|e| e.to_string())?;
+    let pdf_data = fs::read(&file_path)?;
 
     // Cache the file data in state
     {
@@ -27,14 +27,13 @@ pub async fn open_pdf_file(
     }
 
     // Load PDF using progressive loading
-    let mut doc =
-        pdf_x_core::PDFDocument::open_file(&file_path, None, None).map_err(|e| e.to_string())?;
+    let mut doc = pdf_x_core::PDFDocument::open_file(&file_path, None, None)?;
 
     // Get file size
-    let file_size = fs::metadata(&file_path).map_err(|e| e.to_string())?.len();
+    let file_size = fs::metadata(&file_path)?.len();
 
     // Extract basic metadata
-    let page_count = doc.page_count().map_err(|e| e.to_string())?;
+    let page_count = doc.page_count()?;
     let pdf_version = doc.pdf_version().unwrap_or_else(|_| "Unknown".to_string());
     let is_linearized = doc.is_linearized();
 
@@ -76,7 +75,7 @@ pub async fn open_pdf_file(
 
 /// Close the current document
 #[tauri::command]
-pub fn close_document(state: State<'_, AppState>) -> Result<(), String> {
+pub fn close_document(state: State<'_, AppState>) -> AppResult<()> {
     state.inner().clear();
     Ok(())
 }
@@ -86,23 +85,22 @@ pub fn close_document(state: State<'_, AppState>) -> Result<(), String> {
 pub async fn extract_text_from_page(
     page_index: usize,
     state: State<'_, AppState>,
-) -> Result<TextExtractionResult, String> {
+) -> AppResult<TextExtractionResult> {
     // Get file path from state
     let file_path = {
         let path_guard = state.inner().file_path.lock().unwrap();
         path_guard.as_ref().cloned()
     };
 
-    let file_path = file_path.ok_or("No document loaded")?;
+    let file_path = file_path.ok_or(AppError::NoDocumentLoaded)?;
 
     // Reload document
-    let mut doc =
-        pdf_x_core::PDFDocument::open_file(&file_path, None, None).map_err(|e| e.to_string())?;
+    let mut doc = pdf_x_core::PDFDocument::open_file(&file_path, None, None)?;
 
     // Extract text items
     let text_items = doc
         .extract_text_from_page(page_index)
-        .map_err(|e| e.to_string())?;
+        ?;
 
     // Convert core TextItem to Tauri TextItem
     let tauri_items = text_items
@@ -124,26 +122,25 @@ pub async fn extract_text_from_page(
 
 /// Get document outline (bookmarks)
 #[tauri::command]
-pub async fn get_document_outline(state: State<'_, AppState>) -> Result<Vec<OutlineItem>, String> {
+pub async fn get_document_outline(state: State<'_, AppState>) -> AppResult<Vec<OutlineItem>> {
     // Get file path from state
     let file_path = {
         let path_guard = state.inner().file_path.lock().unwrap();
         path_guard.as_ref().cloned()
     };
 
-    let file_path = file_path.ok_or("No document loaded")?;
+    let file_path = file_path.ok_or(AppError::NoDocumentLoaded)?;
 
     // Reload document
-    let mut doc =
-        pdf_x_core::PDFDocument::open_file(&file_path, None, None).map_err(|e| e.to_string())?;
+    let mut doc = pdf_x_core::PDFDocument::open_file(&file_path, None, None)?;
 
-    match doc.document_outline_items().map_err(|e| e.to_string())? {
+    match doc.document_outline_items()? {
         Some(core_items) => {
             // Convert core library OutlineItem to Tauri OutlineItem
             let items = core_items
                 .into_iter()
                 .map(|item| convert_outline_item(item, &mut doc))
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<AppResult<Vec<_>>>()?;
             Ok(items)
         }
         None => Ok(vec![]),
@@ -154,7 +151,7 @@ pub async fn get_document_outline(state: State<'_, AppState>) -> Result<Vec<Outl
 fn convert_outline_item(
     core_item: pdf_x_core::OutlineItem,
     doc: &mut pdf_x_core::PDFDocument,
-) -> Result<OutlineItem, String> {
+) -> AppResult<OutlineItem> {
     // Resolve destination to page number and other info
     let (page, dest_type, url) = match &core_item.dest {
         Some(pdf_x_core::OutlineDestination::Explicit {
@@ -186,7 +183,7 @@ fn convert_outline_item(
         .children
         .into_iter()
         .map(|child| convert_outline_item(child, doc))
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<AppResult<Vec<_>>>()?;
 
     Ok(OutlineItem {
         title: core_item.title,
@@ -203,24 +200,23 @@ fn convert_outline_item(
 
 /// Get page sizes
 #[tauri::command]
-pub async fn get_page_sizes(state: State<'_, AppState>) -> Result<Vec<PageInfo>, String> {
+pub async fn get_page_sizes(state: State<'_, AppState>) -> AppResult<Vec<PageInfo>> {
     // Get file path from state
     let file_path = {
         let path_guard = state.inner().file_path.lock().unwrap();
         path_guard.as_ref().cloned()
     };
 
-    let file_path = file_path.ok_or("No document loaded")?;
+    let file_path = file_path.ok_or(AppError::NoDocumentLoaded)?;
 
     // Reload document
-    let mut doc =
-        pdf_x_core::PDFDocument::open_file(&file_path, None, None).map_err(|e| e.to_string())?;
+    let mut doc = pdf_x_core::PDFDocument::open_file(&file_path, None, None)?;
 
-    let page_count = doc.page_count().map_err(|e| e.to_string())?;
+    let page_count = doc.page_count()?;
     let mut pages = Vec::new();
 
     for i in 0..page_count {
-        let page = doc.get_page(i as usize).map_err(|e| e.to_string())?;
+        let page = doc.get_page(i as usize)?;
 
         // Get media box
         let media_box = page.media_box();
@@ -311,20 +307,23 @@ pub async fn render_page(
     page_index: usize,
     scale: Option<f32>,
     state: State<'_, AppState>,
-) -> Result<RenderedPage, String> {
+) -> AppResult<RenderedPage> {
     // Get the cached PDF data
     let pdf_data = {
         let data_guard = state.inner().pdf_data.lock().unwrap();
-        data_guard.as_ref().cloned().ok_or("No document loaded")?
+        data_guard
+            .as_ref()
+            .cloned()
+            .ok_or(AppError::NoDocumentLoaded)?
     };
 
     // Parse PDF from cached data (much faster than reading from disk)
-    let mut doc = pdf_x_core::PDFDocument::open(pdf_data).map_err(|e| e.to_string())?;
+    let mut doc = pdf_x_core::PDFDocument::open(pdf_data)?;
 
     // Render the page to image (RGBA pixels)
-    let (width, height, mut pixels) = doc
+    let (width, height, pixels) = doc
         .render_page_to_image(page_index, scale)
-        .map_err(|e| e.to_string())?;
+        ?;
 
     // Debug: Check if we got any non-white pixels
     #[cfg(debug_assertions)]
@@ -355,12 +354,12 @@ pub async fn render_page(
 
         let mut writer = encoder
             .write_header()
-            .map_err(|e| format!("PNG write header error: {}", e))?;
+            .map_err(|e| AppError::PngEncoding(e.to_string()))?;
 
         // Write the image data
         writer
             .write_image_data(&pixels)
-            .map_err(|e| format!("PNG write data error: {}", e))?;
+            .map_err(|e| AppError::PngEncoding(e.to_string()))?;
     }
 
     // Encode PNG data to base64

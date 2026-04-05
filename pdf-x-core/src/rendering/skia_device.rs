@@ -1,14 +1,14 @@
 //! A tiny-skia based rendering device.
 
 use crate::core::error::{PDFError, PDFResult};
-use crate::rendering::device::{Device, ImageData, Paint, PathDrawMode};
+use crate::rendering::device::{Device, FontWidthMetrics, ImageData, Paint, PathDrawMode};
 use crate::rendering::type1_font::Type1Font;
 use crate::rendering::{Color, FillRule, LineCap, LineJoin, StrokeProps};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tiny_skia::{
     FillRule as SkiaFillRule, LineCap as SkiaLineCap, LineJoin as SkiaLineJoin, Mask,
-    Paint as SkiaPaint, Path, PathBuilder, Pixmap, PixmapMut, Rect, Stroke, Transform,
+    Paint as SkiaPaint, PathBuilder, Pixmap, PixmapMut, Rect, Stroke, Transform,
 };
 use ttf_parser::OutlineBuilder;
 
@@ -18,7 +18,7 @@ fn to_skia_color(color: Color) -> tiny_skia::Color {
     tiny_skia::Color::from_rgba8(color.r(), color.g(), color.b(), color.a())
 }
 
-fn to_skia_paint(paint: &Paint) -> SkiaPaint {
+fn to_skia_paint(paint: &Paint) -> SkiaPaint<'_> {
     let mut sk_paint = SkiaPaint::default();
     match paint {
         Paint::Solid(color) => {
@@ -148,7 +148,7 @@ impl StoredFont {
     }
 
     /// Get the ttf_parser Face (TrueType only).
-    pub fn face(&self) -> Option<&ttf_parser::Face> {
+    pub fn face(&self) -> Option<&ttf_parser::Face<'_>> {
         match &self.font_type {
             FontType::TrueType { face, .. } => Some(face),
             FontType::Type1 { .. } => None,
@@ -172,6 +172,13 @@ impl StoredFont {
     pub fn set_custom_encoding(&mut self, encoding: std::collections::HashMap<u8, String>) {
         if let FontType::Type1 { font } = &mut self.font_type {
             font.set_custom_encoding(encoding);
+        }
+    }
+
+    /// Set width metrics for Type1/CFF fonts using PDF /Widths data.
+    pub fn set_font_width_metrics(&mut self, metrics: &FontWidthMetrics) {
+        if let FontType::Type1 { font } = &mut self.font_type {
+            font.set_width_metrics(metrics.code_widths.clone(), metrics.default_width);
         }
     }
 }
@@ -631,11 +638,6 @@ impl<'a> SkiaDevice<'a> {
         Ok(())
     }
 
-    /// Get a font by name.
-    pub fn get_font(&self, name: &str) -> Option<&StoredFont> {
-        self.font_cache.get(name)
-    }
-
     fn current_state(&self) -> &SkiaGraphicsState {
         self.state_stack.last().unwrap()
     }
@@ -865,7 +867,6 @@ impl<'a> Device for SkiaDevice<'a> {
             matrix[4] as f32,
             matrix[5] as f32,
         );
-        let old_transform = self.current_state().transform;
         // PDF spec: CTM' = M × CTM (multiply on the LEFT)
         let new_transform = self.current_state().transform.pre_concat(transform);
         self.current_state_mut().transform = new_transform;
@@ -898,6 +899,8 @@ impl<'a> Device for SkiaDevice<'a> {
         text_bytes: &[u8],
         font_name: &str,
         font_size: f64,
+        character_spacing: f64,
+        word_spacing: f64,
         paint: &Paint,
         text_matrix: &[f64; 6],
         horizontal_scaling: f64,
@@ -958,7 +961,7 @@ impl<'a> Device for SkiaDevice<'a> {
             let mut current_x = 0.0f32;
             let mut current_y = 0.0f32;
 
-            for (info, pos) in glyph_infos.iter().zip(glyph_positions.iter()) {
+            for (index, (info, pos)) in glyph_infos.iter().zip(glyph_positions.iter()).enumerate() {
                 let mut converter = PathConverter(PathBuilder::new());
                 let transform =
                     Transform::from_scale(scale, scale).post_translate(current_x, current_y);
@@ -976,7 +979,15 @@ impl<'a> Device for SkiaDevice<'a> {
 
                 // Advance in font space (advance * units_per_em / 1000, then scaled by font_size/units_per_em)
                 // Simplifies to: advance * font_size / 1000
-                current_x += pos.x_advance as f32 * font_scale;
+                let byte = text_bytes.get(index).copied().unwrap_or_default();
+                let extra_spacing = character_spacing as f32
+                    + if byte == b' ' {
+                        word_spacing as f32
+                    } else {
+                        0.0
+                    };
+
+                current_x += pos.x_advance as f32 * font_scale + extra_spacing;
                 current_y += pos.y_advance as f32 * font_scale;
             }
 
@@ -1012,11 +1023,11 @@ impl<'a> Device for SkiaDevice<'a> {
                 // Result is the full text transform before CTM
                 let full_text = Transform::from_row(
                     tm_a * font_size_f * h_scale_pct,
-                    tm_b * font_size_f,
-                    tm_c * font_size_f * h_scale_pct,
+                    tm_b * font_size_f * h_scale_pct,
+                    tm_c * font_size_f,
                     tm_d * font_size_f,
-                    tm_e * font_size_f * h_scale_pct + tm_c * rise_f + tm_e,
-                    tm_f * font_size_f * h_scale_pct + tm_d * rise_f + tm_f,
+                    tm_c * rise_f + tm_e,
+                    tm_d * rise_f + tm_f,
                 );
 
                 // Then apply CTM
@@ -1084,6 +1095,16 @@ impl<'a> Device for SkiaDevice<'a> {
             // The font's encoding maps byte codes to glyphs
             let ch = char::from(byte);
 
+            // Always advance by glyph width even if outline extraction fails
+            // (e.g. space/unmapped glyph). This keeps text positioning intact.
+            let glyph_width = type1_font.glyph_width(ch) as f32;
+            let extra_spacing = character_spacing as f32
+                + if byte == b' ' {
+                    word_spacing as f32
+                } else {
+                    0.0
+                };
+
             // Use outline_glyph_char which works for both Type1 and CFF
             if type1_font
                 .outline_glyph_char(ch, &mut glyph_path_builder)
@@ -1102,11 +1123,9 @@ impl<'a> Device for SkiaDevice<'a> {
                         text_path_builder.push_path(&path_transformed);
                     }
                 }
-
-                // Advance using actual glyph width from font metrics
-                let glyph_width = type1_font.glyph_width(ch) as f32;
-                current_x += scale * glyph_width;
             }
+
+            current_x += scale * glyph_width + extra_spacing;
         }
 
         #[cfg(feature = "debug-logging")]
@@ -1150,11 +1169,11 @@ impl<'a> Device for SkiaDevice<'a> {
             // Result is the full text transform before CTM
             let full_text = Transform::from_row(
                 tm_a * font_size_f * h_scale_pct,
-                tm_b * font_size_f,
-                tm_c * font_size_f * h_scale_pct,
+                tm_b * font_size_f * h_scale_pct,
+                tm_c * font_size_f,
                 tm_d * font_size_f,
-                tm_e * font_size_f * h_scale_pct + tm_c * rise_f + tm_e,
-                tm_f * font_size_f * h_scale_pct + tm_d * rise_f + tm_f,
+                tm_c * rise_f + tm_e,
+                tm_d * rise_f + tm_f,
             );
 
             // Then apply CTM
@@ -1196,7 +1215,7 @@ impl<'a> Device for SkiaDevice<'a> {
         // Convert image data to RGBA format if needed
         let pixel_count = (image.width * image.height) as usize;
 
-        let (data, has_alpha) = match (image.bits_per_component, image.data.len()) {
+        let (data, _has_alpha) = match (image.bits_per_component, image.data.len()) {
             // Check for 1-bit black and white images first
             (1, data_len)
                 if data_len >= ((image.width as usize * image.height as usize + 7) / 8) =>
@@ -1424,6 +1443,8 @@ impl<'a> Device for SkiaDevice<'a> {
             "DEBUG: CTM={:?}, image_transform={:?}",
             ctm, image_transform
         );
+        #[cfg(not(feature = "debug-logging"))]
+        let _ = image_transform;
 
         let clip_mask = self.get_clip_mask();
 
@@ -1495,5 +1516,16 @@ impl<'a> Device for SkiaDevice<'a> {
         encoding: Option<&crate::core::parser::PDFObject>,
     ) -> PDFResult<()> {
         self.load_font(name, data, encoding)
+    }
+
+    fn set_font_width_metrics(
+        &mut self,
+        name: &str,
+        metrics: &FontWidthMetrics,
+    ) -> PDFResult<()> {
+        if let Some(font) = self.font_cache.get_mut(name) {
+            font.set_font_width_metrics(metrics);
+        }
+        Ok(())
     }
 }

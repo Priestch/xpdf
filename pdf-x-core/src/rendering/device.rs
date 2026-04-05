@@ -7,6 +7,7 @@
 use super::graphics_state::{Color, FillRule, StrokeProps};
 use crate::core::error::PDFResult;
 use crate::core::parser::PDFObject;
+use std::collections::HashMap;
 
 /// How to draw a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +70,18 @@ pub struct ImageData {
     pub has_alpha: bool,
     /// Bits per component
     pub bits_per_component: u8,
+}
+
+/// Simple-font width metrics from PDF font dictionaries.
+///
+/// Width values are in glyph space units (1/1000 em), keyed by single-byte
+/// character code.
+#[derive(Debug, Clone, Default)]
+pub struct FontWidthMetrics {
+    /// Explicit code -> width mapping from /Widths + /FirstChar.
+    pub code_widths: HashMap<u8, u16>,
+    /// Optional fallback width (typically /MissingWidth or PDF default).
+    pub default_width: Option<u16>,
 }
 
 /// A device that can render PDF drawing operations.
@@ -147,6 +160,8 @@ pub trait Device {
     /// * `text_bytes` - Raw text bytes using the font's encoding (NOT UTF-8)
     /// * `font_name` - Name of the font to use
     /// * `font_size` - Font size in points
+    /// * `character_spacing` - Character spacing in user space units
+    /// * `word_spacing` - Word spacing in user space units
     /// * `paint` - The paint/color to use
     /// * `text_matrix` - Text transformation matrix (for positioning text in user space)
     /// * `horizontal_scaling` - Horizontal text scaling as percentage (default: 100.0)
@@ -159,6 +174,8 @@ pub trait Device {
         text_bytes: &[u8],
         font_name: &str,
         font_size: f64,
+        character_spacing: f64,
+        word_spacing: f64,
         paint: &Paint,
         text_matrix: &[f64; 6],
         horizontal_scaling: f64,
@@ -202,6 +219,20 @@ pub trait Device {
         let _ = encoding;
         Ok(())
     }
+
+    /// Apply width metrics for a loaded simple font.
+    ///
+    /// Devices that support Type1/CFF rendering can use this to improve glyph
+    /// advance accuracy when font programs don't expose widths directly.
+    fn set_font_width_metrics(
+        &mut self,
+        name: &str,
+        metrics: &FontWidthMetrics,
+    ) -> PDFResult<()> {
+        let _ = name;
+        let _ = metrics;
+        Ok(())
+    }
 }
 
 /// A simple CPU-based device implementation for testing.
@@ -224,16 +255,12 @@ pub struct TestDevice {
 #[derive(Debug, Clone)]
 struct TestGraphicsState {
     ctm: [f64; 6],
-    stroke_color: Color,
-    fill_color: Color,
 }
 
 impl Default for TestGraphicsState {
     fn default() -> Self {
         TestGraphicsState {
             ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            stroke_color: Color::black(),
-            fill_color: Color::black(),
         }
     }
 }
@@ -357,6 +384,8 @@ impl Device for TestDevice {
         text_bytes: &[u8],
         font_name: &str,
         font_size: f64,
+        character_spacing: f64,
+        word_spacing: f64,
         _paint: &Paint,
         _text_matrix: &[f64; 6],
         _horizontal_scaling: f64,
@@ -368,7 +397,10 @@ impl Device for TestDevice {
         ));
         // Return approximate width for testing
         let num_chars = text_bytes.len() as f64;
-        let width = (num_chars * 500.0 * font_size) / 1000.0;
+        let num_spaces = text_bytes.iter().filter(|&&byte| byte == b' ').count() as f64;
+        let width = (num_chars * 500.0 * font_size) / 1000.0
+            + num_chars * character_spacing
+            + num_spaces * word_spacing;
         Ok(width)
     }
 

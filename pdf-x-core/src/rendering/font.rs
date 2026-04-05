@@ -22,7 +22,7 @@ impl Font {
         rustybuzz::shape(&self.buzz_face, &[], buffer)
     }
 
-    pub fn face(&self) -> &Face {
+    pub fn face(&self) -> &Face<'_> {
         &self.face
     }
 }

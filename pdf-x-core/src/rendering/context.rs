@@ -6,7 +6,7 @@
 //! - Device for rendering operations
 //! - Processing of content stream operators
 
-use super::device::Device;
+use super::device::{Device, FontWidthMetrics};
 use super::graphics_state::{Color, FillRule, GraphicsState};
 use super::path::Path;
 use super::{Paint, PathDrawMode};
@@ -45,6 +45,7 @@ pub struct RenderingContext<'a, D: Device> {
     resources: Option<&'a PDFObject>,
 
     /// Operation counter for debug logging
+    #[cfg(feature = "debug-logging")]
     operation_count: usize,
 }
 
@@ -62,6 +63,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             in_text_object: false,
             xref: None,
             resources: None,
+            #[cfg(feature = "debug-logging")]
             operation_count: 0,
         }
     }
@@ -441,6 +443,59 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         Ok(())
     }
 
+    fn build_font_width_metrics(
+        font_dict: &crate::core::font::FontDict,
+        xref: &mut XRef,
+    ) -> FontWidthMetrics {
+        let mut metrics = FontWidthMetrics::default();
+
+        if let (Some(widths), Some(first_char)) = (&font_dict.widths, font_dict.first_char) {
+            for (index, width) in widths.iter().enumerate() {
+                let code = first_char + index as u32;
+                if code > u8::MAX as u32 || !width.is_finite() || *width < 0.0 {
+                    continue;
+                }
+                metrics.code_widths.insert(
+                    code as u8,
+                    width.round().clamp(0.0, u16::MAX as f64) as u16,
+                );
+            }
+        }
+
+        let descriptor_default = font_dict
+            .font_descriptor
+            .as_ref()
+            .and_then(|descriptor| xref.fetch_if_ref(descriptor).ok())
+            .and_then(|descriptor| match descriptor {
+                PDFObject::Dictionary(dict) => dict.get("MissingWidth").and_then(|value| match value {
+                    PDFObject::Number(width) if width.is_finite() && *width >= 0.0 => Some(*width),
+                    _ => None,
+                }),
+                _ => None,
+            });
+
+        let default_width = descriptor_default.unwrap_or(font_dict.default_width);
+        if default_width.is_finite() && default_width >= 0.0 {
+            metrics.default_width =
+                Some(default_width.round().clamp(0.0, u16::MAX as f64) as u16);
+        }
+
+        metrics
+    }
+
+    /// Apply a text-space translation by right-multiplying the current text matrix
+    /// with a translation matrix. This matches PDF text-state update semantics.
+    fn translate_text_matrix(&mut self, tx: f64, ty: f64) {
+        let tm = &mut self.current_state_mut().text_matrix;
+        let a = tm[0];
+        let b = tm[1];
+        let c = tm[2];
+        let d = tm[3];
+
+        tm[4] += a * tx + c * ty;
+        tm[5] += b * tx + d * ty;
+    }
+
     // === Text Operators ===
 
     fn show_text(&mut self, args: &[crate::core::parser::PDFObject]) -> PDFResult<()> {
@@ -462,6 +517,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             .clone()
             .unwrap_or_else(|| "Default".to_string());
         let font_size = state.font_size.unwrap_or(12.0);
+        let character_spacing = state.character_spacing;
+        let word_spacing = state.word_spacing;
         let paint = Paint::from_color(state.fill_color.clone());
         let text_matrix = state.text_matrix;
         let horizontal_scaling = state.text_horizontal_scaling;
@@ -474,18 +531,16 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 bytes,
                 &font_name,
                 font_size,
+                character_spacing,
+                word_spacing,
                 &paint,
                 &text_matrix,
                 horizontal_scaling,
                 text_rise,
             )?;
 
-            // CRITICAL: Update text matrix to advance after rendering
-            // According to PDF spec, Tj operator advances text matrix by text width
-            // The rendered_width is in text space units, so we add it directly
-            self.current_state_mut().text_matrix[4] += rendered_width;
-            // Also update the line matrix to match
-            self.current_state_mut().text_line_matrix[4] += rendered_width;
+            // Advance text matrix by right-multiplying a translation.
+            self.translate_text_matrix(rendered_width, 0.0);
         }
 
         Ok(())
@@ -512,6 +567,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             .clone()
             .unwrap_or_else(|| "Default".to_string());
         let font_size = state.font_size.unwrap_or(12.0);
+        let character_spacing = state.character_spacing;
+        let word_spacing = state.word_spacing;
         let paint = Paint::from_color(state.fill_color.clone());
         let horizontal_scaling = state.text_horizontal_scaling;
         let text_rise = state.text_rise;
@@ -541,24 +598,23 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                             bytes,
                             &font_name,
                             font_size,
+                            character_spacing,
+                            word_spacing,
                             &paint,
                             &text_matrix,
                             horizontal_scaling,
                             text_rise,
                         )?;
 
-                        // Advance text matrix by the actual rendered width
-                        // This is critical for correct text positioning in TJ operator
-                        self.current_state_mut().text_matrix[4] += rendered_width;
-                        self.current_state_mut().text_line_matrix[4] += rendered_width;
+                        // Advance text matrix by right-multiplying a translation.
+                        self.translate_text_matrix(rendered_width, 0.0);
                     }
                 }
                 PDFObject::Number(offset) => {
                     // Offset in thousandths of an em (negative = backspace, positive = space)
-                    // Convert to user space: (offset * font_size) / 1000
-                    let adjust = (offset * font_size) / 1000.0;
-                    self.current_state_mut().text_matrix[4] += adjust;
-                    self.current_state_mut().text_line_matrix[4] += adjust;
+                    // TJ adjustment translates in the opposite direction of the number.
+                    let adjust = -(offset * font_size * horizontal_scaling / 100.0) / 1000.0;
+                    self.translate_text_matrix(adjust, 0.0);
                 }
                 PDFObject::Null => {
                     // Explicit null - do nothing
@@ -737,6 +793,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         let font_dict_info = match crate::core::font::FontDict::from_pdf_object(&font_obj) {
             Ok(f) => f,
             Err(e) => {
+                #[cfg(not(feature = "debug-logging"))]
+                let _ = &e;
                 #[cfg(feature = "debug-logging")]
                 #[cfg(feature = "debug-logging")]
                 #[cfg(feature = "debug-logging")]
@@ -755,6 +813,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             "DEBUG: Font '{}' - BaseFont: {}, Type: {:?}",
             font_name, font_dict_info.base_font, font_dict_info.font_type
         );
+
+        let width_metrics = Self::build_font_width_metrics(&font_dict_info, xref);
 
         // Try to get font data
         let font_data = self.extract_font_data(&font_dict_info, xref);
@@ -781,6 +841,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             let encoding_ref = encoding_obj.as_ref();
             match self.device.load_font_data(font_name, data, encoding_ref) {
                 Ok(_) => {
+                    self.device
+                        .set_font_width_metrics(font_name, &width_metrics)?;
                     #[cfg(feature = "debug-logging")]
                     #[cfg(feature = "debug-logging")]
                     eprintln!(
@@ -790,6 +852,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                     return Ok(());
                 }
                 Err(e) => {
+                    #[cfg(not(feature = "debug-logging"))]
+                    let _ = &e;
                     #[cfg(feature = "debug-logging")]
                     #[cfg(feature = "debug-logging")]
                     eprintln!(
@@ -810,7 +874,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
 
         // Try to load as a standard font
         // Pass font_name as the cache key (e.g., "F0") and base_font for system font mapping
-        self.load_standard_font(font_name, &font_dict_info.base_font)?;
+        self.load_standard_font(font_name, &font_dict_info.base_font, &width_metrics)?;
         Ok(())
     }
 
@@ -965,7 +1029,12 @@ impl<'a, D: Device> RenderingContext<'a, D> {
     /// # Arguments
     /// * `cache_key` - The PDF font resource name to use as cache key (e.g., "F0")
     /// * `base_font` - The BaseFont name from the PDF for system font mapping
-    fn load_standard_font(&mut self, cache_key: &str, base_font: &str) -> PDFResult<()> {
+    fn load_standard_font(
+        &mut self,
+        cache_key: &str,
+        base_font: &str,
+        width_metrics: &FontWidthMetrics,
+    ) -> PDFResult<()> {
         #[cfg(feature = "debug-logging")]
         #[cfg(feature = "debug-logging")]
         eprintln!(
@@ -1205,7 +1274,9 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                         #[cfg(feature = "debug-logging")]
                         eprintln!("DEBUG: Loaded font '{}' from {}", cache_key, path);
                         // System fonts don't have custom encodings
-                        return self.device.load_font_data(cache_key, data, None);
+                        self.device.load_font_data(cache_key, data, None)?;
+                        self.device.set_font_width_metrics(cache_key, width_metrics)?;
+                        return Ok(());
                     }
                 }
             }

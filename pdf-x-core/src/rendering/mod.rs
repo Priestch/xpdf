@@ -14,7 +14,7 @@ pub mod path;
 
 // Re-export key types
 pub use context::RenderingContext;
-pub use device::{Device, ImageData, Paint, PathDrawMode, TestDevice};
+pub use device::{Device, FontWidthMetrics, ImageData, Paint, PathDrawMode, TestDevice};
 pub use graphics_state::{
     Color, FillRule, GraphicsState, LineCap, LineJoin, StrokeProps, TextRenderingMode,
 };
