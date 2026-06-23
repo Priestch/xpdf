@@ -684,7 +684,7 @@ impl PDFDocument {
         page_index: usize,
     ) -> PDFResult<Vec<crate::core::content_stream::TextItem>> {
         let page = self.get_page(page_index)?;
-        page.extract_text(&mut self.xref)
+        page.extract_text(&mut self.doc_store_mut())
     }
 
     /// Extracts text from a page as a single string.
@@ -698,7 +698,7 @@ impl PDFDocument {
     /// The extracted text as a single string
     pub fn extract_text_from_page_as_string(&mut self, page_index: usize) -> PDFResult<String> {
         let page = self.get_page(page_index)?;
-        page.extract_text_as_string(&mut self.xref)
+        page.extract_text_as_string(&mut self.doc_store_mut())
     }
 
     /// Render a page to RGBA pixel data.

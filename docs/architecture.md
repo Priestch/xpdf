@@ -351,11 +351,11 @@ Tauri app.
   in normal use because `open_file` preloads the xref region before parsing.
 - ✅ **`DocStore`** (decision B): `delta → base` resolution authority, borrowed over
   `(&mut XRef, &mut DeltaLayer)`. `get_page_dict`, `resolve_page`, and `Page::render`
-  (via `render_page_to_image`) route through it. ⚠️ **The gate is partially enforced**:
-  `Page::render` is delta-aware for `/Contents` (a delta override changes rendered output —
-  tested), but nested resource fetches (fonts/xobjects/ext-gstate) still go through the base
-  `XRef`, so deep `/Resources` overrides aren't yet honored. `extract_text` still bypasses
-  `DocStore` entirely.
+  (via `render_page_to_image`) and `extract_text` (via `extract_text_from_page`) route through
+  it. ⚠️ **The gate is partially enforced**: `Page::render` and `extract_text` are delta-aware
+  for `/Contents` (delta overrides change output — tested), but nested resource fetches
+  (fonts/xobjects/ext-gstate) still go through the base `XRef`, so deep `/Resources` overrides
+  aren't yet honored.
 - 🔄 **Resolve-then-interpret** (decision C): `ResolvedPage` type +
   `DocStore::resolve_page` (delta-aware, tested incl. a delta-override seam proof) + a
   pure-signature `rendering::interpret` stub. ⚠️ The render pipeline is **not** rewired to

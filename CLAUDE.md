@@ -63,9 +63,10 @@ directly from the base `XRef`. Interpretation is a pure function over a `Resolve
 `DocStore`, no `Need`). This is the resolve-then-interpret boundary (decision C); it makes
 interpretation restartable-safe, parallelizable, and WASM-clean.
 
-> **Current state** (see `docs/architecture.md`): `Page::render` is delta-aware for `/Contents`
-> (tested), but nested resource fetches and `extract_text` still bypass `DocStore`. `drive`
-> now has a production caller (`open_file` parses through it). Full purity is in progress.
+> **Current state** (see `docs/architecture.md`): `Page::render` and `extract_text` are
+> delta-aware for `/Contents` (tested); nested resource fetches (fonts/xobjects/ext-gstate)
+> still use the base `XRef`. `drive` now has a production caller (`open_file` parses through
+> it). Full purity is in progress.
 
 ## Development Commands
 

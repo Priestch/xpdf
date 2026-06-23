@@ -400,9 +400,9 @@ impl Page {
     ///     println!("Text: '{}' at {:?}", item.text, item.position);
     /// }
     /// ```
-    pub fn extract_text(
+    pub fn extract_text<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<super::content_stream::TextItem>> {
         use super::decode::decode_flate;
         use super::{ContentStreamEvaluator, Lexer, Stream};
@@ -412,8 +412,8 @@ impl Page {
             None => return Ok(Vec::new()), // No content streams
         };
 
-        // Dereference if it's a reference
-        let contents = xref.fetch_if_ref(contents)?;
+        // Dereference if it's a reference — delta-aware (delta → base) via the resolver.
+        let contents = resolver.resolve_if_ref(contents)?;
 
         let mut all_text_items = Vec::new();
 
@@ -426,7 +426,7 @@ impl Page {
                 // Multiple content streams - fetch each one
                 let mut streams = Vec::new();
                 for content_obj in &arr {
-                    match xref.fetch_if_ref(content_obj)? {
+                    match resolver.resolve_if_ref(content_obj)? {
                         PDFObject::Stream { dict, data } => {
                             streams.push((dict, data));
                         }
@@ -474,7 +474,7 @@ impl Page {
             // Load fonts from page resources (for proper character encoding)
             if let Some(resources) = self.resources() {
                 // Ignore font loading errors - text extraction will still work with fallback encoding
-                let _ = evaluator.load_fonts(resources, xref);
+                let _ = evaluator.load_fonts(resources, resolver.as_xref_mut());
             }
 
             // Extract text from this stream
@@ -503,8 +503,8 @@ impl Page {
     /// let text = page.extract_text_as_string(&mut doc.xref_mut()).unwrap();
     /// println!("Page text:\n{}", text);
     /// ```
-    pub fn extract_text_as_string(&self, xref: &mut super::xref::XRef) -> PDFResult<String> {
-        let mut text_items = self.extract_text(xref)?;
+    pub fn extract_text_as_string<R: PageResolver>(&self, resolver: &mut R) -> PDFResult<String> {
+        let mut text_items = self.extract_text(resolver)?;
 
         // Sort text items by position (top to bottom, left to right)
         // Y-axis in PDF goes bottom to top, so we sort by descending Y, then ascending X

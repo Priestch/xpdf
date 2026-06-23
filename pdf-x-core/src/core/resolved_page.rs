@@ -278,4 +278,43 @@ mod tests {
             "delta override of /Contents must remove the q/Q save-restore pair from render"
         );
     }
+
+    #[test]
+    fn extract_text_honors_delta_override_of_contents() {
+        // extract_text routes through a DocStore (delta-aware), mirroring Page::render's
+        // PageResolver path. Overriding /Contents with a text-showing stream must change
+        // the extracted text. (Font metrics still use the base XRef — same scope limit as
+        // render; the string operand itself extracts without a font resource.)
+        let mut doc = PDFDocument::open(pdf_with_contents()).expect("pdf should parse and open");
+        let page = doc.get_page(0).expect("page 0 should resolve");
+
+        // Baseline: "q Q\n" has no text → empty extraction.
+        let before = {
+            let mut store = doc.doc_store_mut();
+            page.extract_text(&mut store).expect("baseline extract")
+        };
+        assert!(before.is_empty(), "baseline 'q Q' content has no text");
+
+        // Override /Contents (object 4) with a text-showing stream.
+        let txt = b"BT (Hello) Tj ET";
+        let mut dict: HashMap<String, PDFObject> = HashMap::new();
+        dict.insert("Length".to_string(), PDFObject::Number(txt.len() as f64));
+        doc.doc_store_mut().delta_mut().modify_object(
+            Ref::new(4, 0),
+            PDFObject::Stream {
+                dict,
+                data: txt.to_vec(),
+            },
+        );
+
+        let after = {
+            let mut store = doc.doc_store_mut();
+            page.extract_text(&mut store).expect("post-override extract")
+        };
+        assert!(
+            !after.is_empty(),
+            "delta override with a Tj operator must yield text items"
+        );
+        assert_eq!(after[0].text, "Hello", "extracted text reflects the delta override");
+    }
 }
