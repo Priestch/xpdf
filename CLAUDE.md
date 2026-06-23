@@ -522,15 +522,33 @@ The viewer pipeline (layers now expressed as core phases) is implemented end-to-
 - ✅ Chunked data sources (file / HTTP / async HTTP / memory) — the loader machinery exists
 - ✅ Delta scaffolding (`DeltaLayer`, `Command` trait, `RotatePageCommand`, `PDFWriter::write_incremental_update`)
 
-**Architectural gaps to close (Phase 0)** — the foundation work the rest depends on:
-- 🔄 **Delta is not wired into resolution**: `Page::render` reads straight from the base xref; the `delta → base` resolution point (`DocStore`) does not exist yet. The editor layer is standalone scaffolding.
-- 🔄 **Progressive loading uses the legacy exception form**: `DataMissing` is threaded as an error and `&mut XRef` is passed through every call — this must migrate to the pull-based `Need::Range` protocol owned by shells (decision A/C).
-- 🔄 **No resolve-then-interpret boundary**: there is no immutable `ResolvedPage`; interpretation and data access are interleaved, which blocks parallel rendering and WASM cleanliness.
-- 🔄 **Core still feature-flags shell concerns**: rendering (`tiny-skia`) and HTTP (`reqwest`/`tokio`) are pulled into the core; these must move behind traits/adapters for the core to be composable and WASM-clean.
+**Phase 0 progress** (foundation; tracked in `docs/phase-0-foundation-spec.md`):
+- ✅ **Pull-based protocol** (decision A): `Need`, `ByteSource`/`Loadable`, `MemoryByteSource`,
+  `BaseStreamSource`, `drive`, `StepErr` (`DataMissing → Need` boundary). Tested; minimality proven.
+  ⚠️ `drive` has **no production caller yet** — `open_file`'s parse site still uses
+  `retry_on_data_missing!` because `XRef::parse` is not restartable (the migration hung; see
+  the note in `document.rs`). A `MAX_DRIVE_STEPS` cap guards against the hang class.
+- ✅ **`DocStore`** (decision B): `delta → base` resolution authority, borrowed over
+  `(&mut XRef, &mut DeltaLayer)`. `get_page_dict` and `resolve_page` route through it.
+  ⚠️ **The gate is not enforced**: `Page::render` / `extract_text` / `render_page_to_image`
+  still take `&mut XRef` and bypass `DocStore`, so delta edits to `/Resources`/`/Contents`
+  do **not** yet affect rendered output. Enforced routing lands with the render-pipeline rewire.
+- 🔄 **Resolve-then-interpret** (decision C): `ResolvedPage` type + `DocStore::resolve_page`
+  (delta-aware, tested incl. a delta-override seam proof) + a pure-signature
+  `rendering::interpret` stub. ⚠️ The render pipeline is **not** rewired to consume
+  `ResolvedPage` yet (`RenderingContext` still resolves lazily); this is the Step 4a rewire.
+- 🔄 **Progressive loading uses the legacy exception form** on production paths (see above).
+- 🔄 **Core still feature-flags shell concerns**: rendering (`tiny-skia`) and HTTP
+  (`reqwest`/`tokio`) are pulled into the core; these must move behind traits/adapters.
+
+> **Note on decision B wording**: "every object lookup goes through `DocStore`" is the
+> *target*. Today it is true only for page-tree traversal (`get_page_dict`) and
+> `resolve_page`; the render/extract hot paths bypass it until the Step 4a rewire.
 
 **Priorities** (viewer ships first, editor-ready by construction):
 
-1. **Phase 0 — Foundation**: introduce `DocStore`, migrate to `Need::Range`, establish `ResolvedPage`, move runtime/rendering behind traits
+1. **Phase 0 — Foundation**: enforce `DocStore` on the render path (Step 4a rewire),
+   restartable `parse` + migrate `open_file` to `drive`, move runtime/rendering behind traits
 2. **Phase 1 — Viewer Core**: complete interpretation over `ResolvedPage`, fonts/images, text extraction, linearized fast first paint
 3. **Phase 2+ — Editor**: populate the delta (annotations, page ops, forms) once the resolution seam is real
 

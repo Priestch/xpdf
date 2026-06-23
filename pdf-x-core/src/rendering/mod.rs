@@ -13,10 +13,10 @@ pub mod graphics_state;
 pub mod path;
 
 // Re-export key types
-pub use context::RenderingContext;
+pub use context::{is_text_trace_enabled, set_text_trace_enabled, RenderingContext};
 pub use device::{Device, ImageData, Paint, PathDrawMode, TestDevice};
 pub use graphics_state::{
-    Color, FillRule, GraphicsState, LineCap, LineJoin, StrokeProps, TextRenderingMode,
+    BlendMode, Color, FillRule, GraphicsState, LineCap, LineJoin, StrokeProps, TextRenderingMode,
 };
 pub use path::{Path, PathBuilder, PathElement};
 
@@ -34,3 +34,14 @@ pub use skia_device::SkiaDevice;
 
 #[cfg(feature = "rendering")]
 pub use font::Font;
+
+/// Pure interpretation of a [`ResolvedPage`] onto a [`Device`] (decision C).
+///
+/// This is the interpret half of resolve-then-interpret: it takes only an immutable,
+/// fully-resolved page and a device — **no `DocStore`, no `Need`, no I/O** — so it cannot
+/// block or hang a `drive` loop, and a native shell can run it on another thread.
+///
+/// *Step 4b skeleton*: this signature is in place to lock the purity contract, but the
+/// body is a stub. The full content-stream engine moves off `RenderingContext`'s lazy
+/// fetching and onto `ResolvedPage` in the Step 4a rewire.
+pub fn interpret(_page: &crate::core::resolved_page::ResolvedPage, _device: &mut dyn Device) {}

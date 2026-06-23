@@ -110,7 +110,8 @@ pub use core::{
     LinearizedInfo, LinkAction,
     LinkAnnotation, MemoryByteSource, Need, OutlineDestination, OutlineItem, PDFDocument, PDFError,
     PDFObject, Page, Parser,
-    PopupAnnotation, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef, XRefEntry,
+    PopupAnnotation, ResolvedPage, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef,
+    XRefEntry,
 };
 
 // Re-export rendering types

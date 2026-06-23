@@ -337,6 +337,19 @@ impl PDFDocument {
         DocStore::new(&mut self.xref, &mut self.delta)
     }
 
+    /// Resolve a page to an immutable, I/O-free [`ResolvedPage`] (`delta → base`).
+    ///
+    /// Convenience wrapper: fetches the (delta-resolved) page, then resolves its
+    /// `/Resources` and `/Contents` through the [`DocStore`]. See
+    /// [`DocStore::resolve_page`](crate::core::DocStore::resolve_page).
+    ///
+    /// *Step 4b skeleton*: this produces a `ResolvedPage` but the render pipeline is not
+    /// yet rewired to consume it; `render_page_to_image` still uses the legacy path.
+    pub fn resolve_page(&mut self, page_index: usize) -> PDFResult<crate::core::resolved_page::ResolvedPage> {
+        let page = self.get_page(page_index)?;
+        self.doc_store_mut().resolve_page(&page)
+    }
+
     /// Returns an immutable reference to the xref table.
     pub fn xref(&self) -> &XRef {
         &self.xref
