@@ -24,24 +24,28 @@ pub struct Page {
     page_ref: Option<(u32, u32)>, // (obj_num, generation)
 }
 
-/// Object resolver used by [`Page::render`], abstracting over the legacy base-only path
-/// (`&mut XRef`) and the delta-aware path (`&mut DocStore`).
+/// Object resolver used by the render/extract paths, abstracting over the legacy base-only
+/// path (`&mut XRef`) and the delta-aware path (`&mut DocStore`).
 ///
-/// Making `render` generic over `PageResolver` lets the same render body serve both:
-/// legacy callers pass `&mut XRef` (no delta), and `render_page_to_image` passes a
-/// `&mut DocStore` (delta-aware for `/Contents`). `resolve_if_ref` is delta-aware for
-/// `DocStore` (`delta → base`); `as_xref_mut` exposes the base `XRef` for nested fetches
-/// (view-box/resources/fonts) that are not yet delta-aware — a documented Step 4a limit.
+/// `resolve_if_ref` / `resolve_ref` are delta-aware for `DocStore` (`delta → base`), so all
+/// object fetches — page contents AND nested resources (fonts/xobjects/ext-gstate) — honor
+/// delta overrides. `as_xref_mut` exposes the base `XRef` only for operations not expressed
+/// through the resolver (e.g. stream positioning).
 pub trait PageResolver {
     /// Resolve `obj` if it is an indirect reference (delta-aware where supported).
     fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject>;
-    /// Base `XRef` for nested resource fetches (not delta-aware).
+    /// Resolve object `(num, generation)` (delta-aware where supported).
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<PDFObject>;
+    /// Base `XRef` for XRef-specific operations not expressed through the resolver.
     fn as_xref_mut(&mut self) -> &mut super::xref::XRef;
 }
 
 impl PageResolver for super::xref::XRef {
     fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
         self.fetch_if_ref(obj)
+    }
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<PDFObject> {
+        self.fetch(num, generation).map(|r| (*r).clone())
     }
     fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
         self
@@ -51,6 +55,9 @@ impl PageResolver for super::xref::XRef {
 impl<'a> PageResolver for super::doc_store::DocStore<'a> {
     fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
         super::doc_store::DocStore::resolve_if_ref(self, obj)
+    }
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<PDFObject> {
+        super::doc_store::DocStore::resolve_ref(self, num, generation)
     }
     fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
         super::doc_store::DocStore::xref_mut(self)
@@ -716,7 +723,9 @@ impl Page {
             // Note: We need to extend the lifetime of the fetched resources
             // by storing it and passing a reference to the context
             if let Some(ref resources_obj) = resources {
-                ctx.set_xobject_resources(resolver.as_xref_mut(), resources_obj);
+                // Pass the resolver (delta-aware) so font/xobject/ext-gstate fetches
+                // honor delta overrides. Reborrow: resolver is used across iterations.
+                ctx.set_xobject_resources(&mut *resolver, resources_obj);
             }
 
             // Parse and process each operation in the content stream

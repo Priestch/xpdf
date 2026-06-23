@@ -279,6 +279,111 @@ mod tests {
         );
     }
 
+    /// A one-page PDF whose content draws a Form XObject via `Do`. The form is initially
+    /// EMPTY; a delta override can replace it with one that draws, proving nested-resource
+    /// (XObject) fetches through the resolver are delta-aware. Offsets computed at runtime.
+    fn pdf_with_form_xobject() -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+
+        let o1 = buf.len();
+        buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let o2 = buf.len();
+        buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let o3 = buf.len();
+        buf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] \
+/Resources << /XObject << /Fm1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+        );
+
+        // obj 4: an empty Form XObject.
+        let o4 = buf.len();
+        buf.extend_from_slice(
+            b"4 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length 0 >>\nstream\nendstream\nendobj\n",
+        );
+
+        // obj 5: page content that draws the form.
+        let o5 = buf.len();
+        buf.extend_from_slice(b"5 0 obj\n<< /Length 9 >>\nstream\n/Fm1 Do\nendstream\nendobj\n");
+
+        let xref_offset = buf.len();
+        buf.extend_from_slice(b"xref\n0 6\n");
+        buf.extend_from_slice(format!("{:010} 65535 f \r\n", 0).as_bytes());
+        for o in [o1, o2, o3, o4, o5] {
+            buf.extend_from_slice(format!("{:010} 00000 n \r\n", o).as_bytes());
+        }
+        buf.extend_from_slice(b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n");
+        buf.extend_from_slice(format!("{}\n", xref_offset).as_bytes());
+        buf.extend_from_slice(b"%%EOF");
+        buf
+    }
+
+    #[test]
+    fn render_honors_delta_override_of_form_xobject() {
+        // Nested-resource delta-awareness proof: a delta override of the Form XObject
+        // (a nested resource fetched by RenderingContext via the resolver) changes the
+        // rendered output. The baseline form is empty; the override draws a rectangle,
+        // so the override must record more device operations.
+        use crate::rendering::TestDevice;
+
+        let mut doc =
+            PDFDocument::open(pdf_with_form_xobject()).expect("pdf should parse and open");
+        let page = doc.get_page(0).expect("page 0 should resolve");
+
+        let mut baseline = TestDevice::new(200.0, 300.0);
+        {
+            let mut store = doc.doc_store_mut();
+            page.render(&mut store, &mut baseline).expect("baseline render");
+        }
+        let baseline_fills = baseline
+            .operations()
+            .iter()
+            .filter(|op| op.starts_with("draw_path(fill"))
+            .count();
+
+        // Override obj 4 (the Form XObject) with one that draws a filled rectangle.
+        let form_body = b"10 10 50 50 re f";
+        let mut dict: HashMap<String, PDFObject> = HashMap::new();
+        dict.insert("Type".to_string(), PDFObject::Name("XObject".into()));
+        dict.insert("Subtype".to_string(), PDFObject::Name("Form".into()));
+        dict.insert("BBox".to_string(), PDFObject::Array(
+            [10.0, 10.0, 50.0, 50.0]
+                .iter()
+                .map(|n| Box::new(PDFObject::Number(*n)))
+                .collect(),
+        ));
+        dict.insert("Length".to_string(), PDFObject::Number(form_body.len() as f64));
+        let form_override = PDFObject::Stream {
+            dict,
+            data: form_body.to_vec(),
+        };
+        doc.doc_store_mut()
+            .delta_mut()
+            .modify_object(Ref::new(4, 0), form_override);
+
+        let mut after = TestDevice::new(200.0, 300.0);
+        {
+            let mut store = doc.doc_store_mut();
+            page.render(&mut store, &mut after).expect("post-override render");
+        }
+        let after_fills = after
+            .operations()
+            .iter()
+            .filter(|op| op.starts_with("draw_path(fill"))
+            .count();
+
+        assert_eq!(
+            baseline_fills, 0,
+            "baseline empty form should draw no filled paths"
+        );
+        assert!(
+            after_fills > baseline_fills,
+            "delta override of the Form XObject must add a filled path to the render"
+        );
+    }
+
     #[test]
     fn extract_text_honors_delta_override_of_contents() {
         // extract_text routes through a DocStore (delta-aware), mirroring Page::render's

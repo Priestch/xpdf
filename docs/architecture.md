@@ -352,10 +352,11 @@ Tauri app.
 - ✅ **`DocStore`** (decision B): `delta → base` resolution authority, borrowed over
   `(&mut XRef, &mut DeltaLayer)`. `get_page_dict`, `resolve_page`, and `Page::render`
   (via `render_page_to_image`) and `extract_text` (via `extract_text_from_page`) route through
-  it. ⚠️ **The gate is partially enforced**: `Page::render` and `extract_text` are delta-aware
-  for `/Contents` (delta overrides change output — tested), but nested resource fetches
-  (fonts/xobjects/ext-gstate) still go through the base `XRef`, so deep `/Resources` overrides
-  aren't yet honored.
+  it, including nested resources. ✅ `Page::render` and `extract_text` are delta-aware for both
+  `/Contents` and nested resources (fonts/xobjects/ext-gstate) — `RenderingContext` resolves
+  through a `PageResolver`, so a delta override of any resource object is honored (a Form
+  XObject override changes rendered output — tested). Inherited page-tree properties
+  (MediaBox/Rotate/Resources from parent nodes) still resolve through the base `XRef`.
 - 🔄 **Resolve-then-interpret** (decision C): `ResolvedPage` type +
   `DocStore::resolve_page` (delta-aware, tested incl. a delta-override seam proof) + a
   pure-signature `rendering::interpret` stub. ⚠️ The render pipeline is **not** rewired to

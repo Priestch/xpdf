@@ -10,10 +10,32 @@ use super::device::Device;
 use super::graphics_state::{Color, FillRule, GraphicsState};
 use super::path::Path;
 use super::{Paint, PathDrawMode};
+use crate::core::cmap::CMap;
 use crate::core::content_stream::{OpCode, Operation};
 use crate::core::error::{PDFError, PDFResult};
+use crate::core::page::PageResolver;
 use crate::core::parser::PDFObject;
-use crate::core::xref::XRef;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Runtime toggle for verbose text spacing traces (Tw/Tc/TJ/Tj).
+///
+/// This is intentionally global so frontends (like Tauri) can enable tracing
+/// around a render call without rebuilding with special features.
+static TEXT_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable runtime text tracing.
+///
+/// Returns the previous value so callers can restore it after a scoped render.
+pub fn set_text_trace_enabled(enabled: bool) -> bool {
+    TEXT_TRACE_ENABLED.swap(enabled, Ordering::Relaxed)
+}
+
+/// Returns whether runtime text tracing is currently enabled.
+pub fn is_text_trace_enabled() -> bool {
+    TEXT_TRACE_ENABLED.load(Ordering::Relaxed)
+}
 
 /// Rendering context for processing PDF content streams.
 ///
@@ -38,14 +60,26 @@ pub struct RenderingContext<'a, D: Device> {
     /// Whether we're in a text object (BT...ET)
     in_text_object: bool,
 
-    /// XRef table for fetching objects (for XObject rendering)
-    xref: Option<&'a mut XRef>,
+    /// Object resolver for fetching resources (delta-aware when a `DocStore` is supplied).
+    resolver: Option<&'a mut dyn PageResolver>,
 
-    /// Page resources dictionary (for looking up XObjects, fonts, etc.)
-    resources: Option<&'a PDFObject>,
+    /// Active resources dictionary (for looking up XObjects, fonts, etc.).
+    ///
+    /// Stored as an owned object so Form XObjects can temporarily override it
+    /// with their own `/Resources` dictionaries.
+    resources: Option<PDFObject>,
 
     /// Operation counter for debug logging
     operation_count: usize,
+
+    /// Optional /ToUnicode CMaps keyed by active PDF font resource name.
+    font_to_unicode: HashMap<String, CMap>,
+
+    /// Whether a font should be remapped through `/ToUnicode` before drawing.
+    ///
+    /// We only do this for composite/CID-style fonts where raw shown bytes are
+    /// not directly drawable by the simple Type1/TrueType code paths.
+    font_requires_cmap_remap: HashMap<String, bool>,
 }
 
 impl<'a, D: Device> RenderingContext<'a, D> {
@@ -60,20 +94,29 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             current_path: Path::new(),
             clip_stack: Vec::new(),
             in_text_object: false,
-            xref: None,
+            resolver: None,
             resources: None,
             operation_count: 0,
+            font_to_unicode: HashMap::new(),
+            font_requires_cmap_remap: HashMap::new(),
         }
     }
 
-    /// Set the xref table and page resources for XObject rendering.
+    /// Set the object resolver and page resources for XObject/font/ext-gstate rendering.
+    ///
+    /// The resolver is delta-aware when a `DocStore` is supplied, so resource fetches honor
+    /// delta overrides. Pass `&mut XRef` for the legacy base-only path.
     ///
     /// # Arguments
-    /// * `xref` - The cross-reference table for fetching objects
+    /// * `resolver` - The object resolver for fetching resources
     /// * `resources` - The page's resources dictionary
-    pub fn set_xobject_resources(&mut self, xref: &'a mut XRef, resources: &'a PDFObject) {
-        self.xref = Some(xref);
-        self.resources = Some(resources);
+    pub fn set_xobject_resources(
+        &mut self,
+        resolver: &'a mut dyn PageResolver,
+        resources: &'a PDFObject,
+    ) {
+        self.resolver = Some(resolver);
+        self.resources = Some(resources.clone());
     }
 
     /// Get the current graphics state.
@@ -114,6 +157,20 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                     op.args.len()
                 );
                 self.operation_count += 1;
+            }
+        }
+
+        if is_text_trace_enabled() {
+            match op.op {
+                OpCode::SetCharSpacing
+                | OpCode::SetWordSpacing
+                | OpCode::ShowText
+                | OpCode::ShowSpacedText
+                | OpCode::NextLineShowText
+                | OpCode::NextLineSetSpacingShowText => {
+                    eprintln!("[text-trace] op={:?} args={:?}", op.op, op.args);
+                }
+                _ => {}
             }
         }
 
@@ -186,6 +243,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             OpCode::SetLineJoin => self.set_line_join(&op.args)?,
             OpCode::SetMiterLimit => self.set_miter_limit(&op.args)?,
             OpCode::SetDash => self.set_dash(&op.args)?,
+            OpCode::SetGState => self.set_graphics_state(&op.args)?,
 
             // XObject operator
             OpCode::PaintXObject => self.paint_xobject(&op.args)?,
@@ -193,7 +251,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             _ => {
                 // Other operators not yet implemented
                 // Silently skip to avoid spamming logs
-                // These are typically non-critical operators like BeginMarkedContent, SetGState, etc.
+                // These are typically non-critical operators like marked-content tags.
             }
         }
 
@@ -462,30 +520,41 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             .clone()
             .unwrap_or_else(|| "Default".to_string());
         let font_size = state.font_size.unwrap_or(12.0);
-        let paint = Paint::from_color(state.fill_color.clone());
+        let paint = text_paint_for_rendering_mode(state.text_rendering_mode, state.fill_color);
         let text_matrix = state.text_matrix;
         let horizontal_scaling = state.text_horizontal_scaling;
         let text_rise = state.text_rise;
+        let character_spacing = state.character_spacing;
+        let word_spacing = state.word_spacing;
 
-        // Extract text bytes (using font's encoding, NOT UTF-8)
-        if let crate::core::parser::PDFObject::String(bytes) = &args[0] {
+        // Extract text bytes (using font's encoding, NOT UTF-8).
+        // PDF text strings can be literal strings (...) or hex strings <...>.
+        if let Some(bytes) = text_bytes(&args[0]) {
+            let mapped_bytes = self.map_text_bytes_for_device(&font_name, bytes);
             // Draw text and get the actual rendered width
             let rendered_width = self.device.draw_text(
-                bytes,
+                mapped_bytes.as_ref(),
                 &font_name,
                 font_size,
                 &paint,
                 &text_matrix,
                 horizontal_scaling,
                 text_rise,
+                character_spacing,
+                word_spacing,
             )?;
 
-            // CRITICAL: Update text matrix to advance after rendering
-            // According to PDF spec, Tj operator advances text matrix by text width
-            // The rendered_width is in text space units, so we add it directly
-            self.current_state_mut().text_matrix[4] += rendered_width;
-            // Also update the line matrix to match
-            self.current_state_mut().text_line_matrix[4] += rendered_width;
+            if is_text_trace_enabled() {
+                eprintln!(
+                    "[text-trace] Tj bytes={:?} width={} Tc={} Tw={} hscale={}",
+                    bytes, rendered_width, character_spacing, word_spacing, horizontal_scaling
+                );
+            }
+
+            // Advance only the current text matrix (Tm = Tm * T(tx, 0)).
+            // The text line matrix (Tlm) must stay unchanged for T*/' operators.
+            let state = self.current_state_mut();
+            state.text_matrix = post_concat_translate(state.text_matrix, rendered_width, 0.0);
         }
 
         Ok(())
@@ -512,12 +581,17 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             .clone()
             .unwrap_or_else(|| "Default".to_string());
         let font_size = state.font_size.unwrap_or(12.0);
-        let paint = Paint::from_color(state.fill_color.clone());
+        let paint = text_paint_for_rendering_mode(state.text_rendering_mode, state.fill_color);
         let horizontal_scaling = state.text_horizontal_scaling;
         let text_rise = state.text_rise;
+        let character_spacing = state.character_spacing;
+        let word_spacing = state.word_spacing;
 
         #[cfg(feature = "debug-logging")]
-        eprintln!("DEBUG: show_spaced_text: fill_color={:?}, paint={:?}", state.fill_color, paint);
+        eprintln!(
+            "DEBUG: show_spaced_text: fill_color={:?}, paint={:?}",
+            state.fill_color, paint
+        );
         // We'll get text_matrix fresh for each element since it changes as we render
 
         // Extract the array
@@ -533,32 +607,52 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         // Process each element in the array
         for element in array {
             match element.as_ref() {
-                PDFObject::String(bytes) => {
+                PDFObject::String(bytes) | PDFObject::HexString(bytes) => {
                     // Render this text string (using font encoding, NOT UTF-8)
                     if !bytes.is_empty() {
+                        let mapped_bytes = self.map_text_bytes_for_device(&font_name, bytes);
                         let text_matrix = self.current_state().text_matrix;
                         let rendered_width = self.device.draw_text(
-                            bytes,
+                            mapped_bytes.as_ref(),
                             &font_name,
                             font_size,
                             &paint,
                             &text_matrix,
                             horizontal_scaling,
                             text_rise,
+                            character_spacing,
+                            word_spacing,
                         )?;
 
+                        if is_text_trace_enabled() {
+                            eprintln!(
+                                "[text-trace] TJ text bytes={:?} width={} Tc={} Tw={} hscale={}",
+                                bytes,
+                                rendered_width,
+                                character_spacing,
+                                word_spacing,
+                                horizontal_scaling
+                            );
+                        }
+
                         // Advance text matrix by the actual rendered width
-                        // This is critical for correct text positioning in TJ operator
-                        self.current_state_mut().text_matrix[4] += rendered_width;
-                        self.current_state_mut().text_line_matrix[4] += rendered_width;
+                        let state = self.current_state_mut();
+                        state.text_matrix =
+                            post_concat_translate(state.text_matrix, rendered_width, 0.0);
                     }
                 }
                 PDFObject::Number(offset) => {
-                    // Offset in thousandths of an em (negative = backspace, positive = space)
-                    // Convert to user space: (offset * font_size) / 1000
-                    let adjust = (offset * font_size) / 1000.0;
-                    self.current_state_mut().text_matrix[4] += adjust;
-                    self.current_state_mut().text_line_matrix[4] += adjust;
+                    // TJ numbers are spacing adjustments in thousandths of an em.
+                    // Positive numbers tighten spacing, so the translation is negative.
+                    let adjust = -(offset * font_size * (horizontal_scaling / 100.0)) / 1000.0;
+                    if is_text_trace_enabled() {
+                        eprintln!(
+                            "[text-trace] TJ adjust raw={} translated={}",
+                            offset, adjust
+                        );
+                    }
+                    let state = self.current_state_mut();
+                    state.text_matrix = post_concat_translate(state.text_matrix, adjust, 0.0);
                 }
                 PDFObject::Null => {
                     // Explicit null - do nothing
@@ -608,8 +702,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         let ty = extract_number(args, 1)?;
 
         let state = self.current_state_mut();
-        state.text_line_matrix[4] += tx;
-        state.text_line_matrix[5] += ty;
+        state.text_line_matrix = post_concat_translate(state.text_line_matrix, tx, ty);
         state.text_matrix = state.text_line_matrix;
 
         Ok(())
@@ -646,7 +739,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
 
     fn next_line(&mut self) -> PDFResult<()> {
         let state = self.current_state_mut();
-        state.text_line_matrix[5] -= state.text_leading;
+        state.text_line_matrix =
+            post_concat_translate(state.text_line_matrix, 0.0, -state.text_leading);
         state.text_matrix = state.text_line_matrix;
         Ok(())
     }
@@ -663,22 +757,76 @@ impl<'a, D: Device> RenderingContext<'a, D> {
 
             // Try to load the font from resources if not already loaded
             // We only need to load it once per font name
-            // Extract xref and resources to avoid borrow issues
-            let (xref_opt, resources_opt) = (self.xref.take(), self.resources.clone());
-            if let (Some(mut xref), Some(resources)) = (xref_opt, resources_opt) {
+            // Extract resolver and resources to avoid borrow issues
+            let (resolver_opt, resources_opt) = (self.resolver.take(), self.resources.clone());
+            if let (Some(mut resolver), Some(resources)) = (resolver_opt, resources_opt) {
                 // Check if device already has this font (to avoid re-loading)
                 let font_key = name.as_str();
                 // We can't directly check the device's font cache, so we try to load
                 // and let the device handle duplicates
-                let result = self.load_font_from_resources(font_key, &resources, &mut xref);
-                // Restore xref
-                self.xref = Some(xref);
+                let result = self.load_font_from_resources(font_key, &resources, &mut *resolver);
+                // Restore resolver
+                self.resolver = Some(resolver);
                 result?;
             }
         }
 
         self.current_state_mut().font_size = Some(extract_number(args, 1)?);
         Ok(())
+    }
+
+    fn map_text_bytes_for_device<'b>(&self, font_name: &str, bytes: &'b [u8]) -> Cow<'b, [u8]> {
+        if !self
+            .font_requires_cmap_remap
+            .get(font_name)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Cow::Borrowed(bytes);
+        }
+
+        let Some(cmap) = self.font_to_unicode.get(font_name) else {
+            return Cow::Borrowed(bytes);
+        };
+
+        if let Some(mapped) = remap_text_bytes_with_cmap(bytes, cmap) {
+            Cow::Owned(mapped)
+        } else {
+            Cow::Borrowed(bytes)
+        }
+    }
+
+    fn load_to_unicode_cmap(
+        &mut self,
+        font_name: &str,
+        font_dict_info: &crate::core::font::FontDict,
+        resolver: &mut dyn PageResolver,
+    ) {
+        self.font_to_unicode.remove(font_name);
+
+        let Some(to_unicode_obj) = font_dict_info.to_unicode.as_ref() else {
+            return;
+        };
+
+        let fetched = match resolver.resolve_if_ref(to_unicode_obj) {
+            Ok(obj) => obj,
+            Err(_) => return,
+        };
+
+        let (dict, data) = match fetched {
+            PDFObject::Stream { dict, data } => (dict, data),
+            _ => return,
+        };
+
+        let decoded = if let Some(filters) = dict.get("Filter") {
+            crate::core::decode::apply_filters(&data, filters).unwrap_or(data)
+        } else {
+            data
+        };
+
+        if let Ok(cmap) = CMap::parse(&decoded) {
+            self.font_to_unicode.insert(font_name.to_string(), cmap);
+        }
     }
 
     /// Load a font from the page's resources dictionary.
@@ -689,7 +837,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         &mut self,
         font_name: &str,
         resources: &PDFObject,
-        xref: &mut XRef,
+        resolver: &mut dyn PageResolver,
     ) -> PDFResult<()> {
         // Get the Font dictionary from resources
         let resources_dict = match resources {
@@ -707,8 +855,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         let font_dict = match font_dict_value {
             PDFObject::Dictionary(d) => d,
             PDFObject::Ref(ref_obj) => {
-                _fetched_font_dict = xref.fetch(ref_obj.num, ref_obj.generation)?;
-                match &*_fetched_font_dict {
+                _fetched_font_dict = resolver.resolve_ref(ref_obj.num, ref_obj.generation)?;
+                match &_fetched_font_dict {
                     PDFObject::Dictionary(d) => d,
                     _ => return Ok(()),
                 }
@@ -731,7 +879,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
 
         // Fetch the font object (might be a reference)
         let _fetched_font_obj: PDFObject;
-        let font_obj = xref.fetch_if_ref(font_obj_ref)?;
+        let font_obj = resolver.resolve_if_ref(font_obj_ref)?;
 
         // Parse the font dictionary
         let font_dict_info = match crate::core::font::FontDict::from_pdf_object(&font_obj) {
@@ -756,8 +904,19 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             font_name, font_dict_info.base_font, font_dict_info.font_type
         );
 
+        let requires_cmap_remap = font_needs_to_unicode_remap(&font_dict_info);
+        self.font_requires_cmap_remap
+            .insert(font_name.to_string(), requires_cmap_remap);
+        if requires_cmap_remap {
+            // Cache /ToUnicode mapping for composite/CID-like fonts where raw
+            // shown bytes are not directly usable by the drawing backend.
+            self.load_to_unicode_cmap(font_name, &font_dict_info, resolver);
+        } else {
+            self.font_to_unicode.remove(font_name);
+        }
+
         // Try to get font data
-        let font_data = self.extract_font_data(&font_dict_info, xref);
+        let font_data = self.extract_font_data(&font_dict_info, resolver);
 
         if let Some(data) = font_data {
             #[cfg(feature = "debug-logging")]
@@ -771,7 +930,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             // (e.g., CFF fonts can't be parsed by ttf_parser)
             // Dereference encoding if it's a reference
             let encoding_obj = if let Some(enc) = &font_dict_info.encoding {
-                match xref.fetch_if_ref(enc) {
+                match resolver.resolve_if_ref(enc) {
                     Ok(fetched) => Some(fetched),
                     Err(_) => Some(enc.clone()),
                 }
@@ -781,6 +940,17 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             let encoding_ref = encoding_obj.as_ref();
             match self.device.load_font_data(font_name, data, encoding_ref) {
                 Ok(_) => {
+                    if let (Some(first_char), Some(widths)) =
+                        (font_dict_info.first_char, font_dict_info.widths.as_ref())
+                    {
+                        let _ = self.device.set_font_widths(
+                            font_name,
+                            first_char,
+                            widths,
+                            font_dict_info.default_width,
+                        );
+                    }
+
                     #[cfg(feature = "debug-logging")]
                     #[cfg(feature = "debug-logging")]
                     eprintln!(
@@ -811,6 +981,18 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         // Try to load as a standard font
         // Pass font_name as the cache key (e.g., "F0") and base_font for system font mapping
         self.load_standard_font(font_name, &font_dict_info.base_font)?;
+
+        if let (Some(first_char), Some(widths)) =
+            (font_dict_info.first_char, font_dict_info.widths.as_ref())
+        {
+            let _ = self.device.set_font_widths(
+                font_name,
+                first_char,
+                widths,
+                font_dict_info.default_width,
+            );
+        }
+
         Ok(())
     }
 
@@ -820,7 +1002,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
     fn extract_font_data(
         &self,
         font_dict: &crate::core::font::FontDict,
-        xref: &mut XRef,
+        resolver: &mut dyn PageResolver,
     ) -> Option<Vec<u8>> {
         #[cfg(feature = "debug-logging")]
         #[cfg(feature = "debug-logging")]
@@ -836,8 +1018,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             let descriptor = match descriptor_ref {
                 PDFObject::Dictionary(d) => d,
                 PDFObject::Ref(r) => {
-                    _fetched_descriptor = xref.fetch(r.num, r.generation).ok()?;
-                    match &*_fetched_descriptor {
+                    _fetched_descriptor = resolver.resolve_ref(r.num, r.generation).ok()?;
+                    match &_fetched_descriptor {
                         PDFObject::Dictionary(d) => d,
                         _ => return None,
                     }
@@ -888,7 +1070,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                     #[cfg(feature = "debug-logging")]
                     eprintln!("DEBUG: Found font file ref for '{}'", key);
                     // Fetch the font file stream
-                    let font_file_obj = xref.fetch_if_ref(font_file_ref).ok()?;
+                    let font_file_obj = resolver.resolve_if_ref(font_file_ref).ok()?;
                     if let PDFObject::Stream { dict, data } = font_file_obj {
                         #[cfg(feature = "debug-logging")]
                         eprintln!("DEBUG: Font file stream found, data length: {}", data.len());
@@ -1227,7 +1409,11 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             ));
         }
 
-        self.current_state_mut().character_spacing = extract_number(args, 0)?;
+        let value = extract_number(args, 0)?;
+        self.current_state_mut().character_spacing = value;
+        if is_text_trace_enabled() {
+            eprintln!("[text-trace] Tc set to {}", value);
+        }
         Ok(())
     }
 
@@ -1238,7 +1424,11 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             ));
         }
 
-        self.current_state_mut().word_spacing = extract_number(args, 0)?;
+        let value = extract_number(args, 0)?;
+        self.current_state_mut().word_spacing = value;
+        if is_text_trace_enabled() {
+            eprintln!("[text-trace] Tw set to {}", value);
+        }
         Ok(())
     }
 
@@ -1494,6 +1684,72 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         Ok(())
     }
 
+    fn set_graphics_state(&mut self, args: &[crate::core::parser::PDFObject]) -> PDFResult<()> {
+        let Some(PDFObject::Name(gs_name)) = args.first() else {
+            return Ok(());
+        };
+
+        let resources = match self.resources.as_ref() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let resources_dict = match resources {
+            PDFObject::Dictionary(dict) => dict,
+            _ => return Ok(()),
+        };
+
+        let ext_gstate_obj = match resources_dict.get("ExtGState") {
+            Some(obj) => obj,
+            None => return Ok(()),
+        };
+
+        let xref_opt = self.resolver.take();
+        let resolver = match xref_opt {
+            Some(resolver) => resolver,
+            None => return Ok(()),
+        };
+
+        let ext_gstate_dict_obj = match resolver.resolve_if_ref(ext_gstate_obj) {
+            Ok(obj) => obj,
+            Err(_) => {
+                self.resolver = Some(resolver);
+                return Ok(());
+            }
+        };
+
+        let ext_gstate_dict = match ext_gstate_dict_obj {
+            PDFObject::Dictionary(dict) => dict,
+            _ => {
+                self.resolver = Some(resolver);
+                return Ok(());
+            }
+        };
+
+        let Some(gs_obj_ref) = ext_gstate_dict.get(gs_name) else {
+            self.resolver = Some(resolver);
+            return Ok(());
+        };
+
+        let gs_obj = match resolver.resolve_if_ref(gs_obj_ref) {
+            Ok(obj) => obj,
+            Err(_) => {
+                self.resolver = Some(resolver);
+                return Ok(());
+            }
+        };
+
+        if let PDFObject::Dictionary(gs_dict) = gs_obj {
+            if let Some(mode) = gs_dict.get("BM").and_then(parse_blend_mode) {
+                self.current_state_mut().blend_mode = mode;
+                self.device.set_blend_mode(mode);
+            }
+        }
+
+        self.resolver = Some(resolver);
+        Ok(())
+    }
+
     // === XObject Operator ===
 
     fn paint_xobject(&mut self, args: &[crate::core::parser::PDFObject]) -> PDFResult<()> {
@@ -1514,14 +1770,14 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             }
         };
 
-        // Get xref and resources
-        let xref = match &mut self.xref {
-            Some(x) => x,
+        let resources = match self.resources.as_ref() {
+            Some(r) => r,
             None => return Ok(()),
         };
 
-        let resources = match &self.resources {
-            Some(r) => r,
+        // Get resolver and resources
+        let resolver = match &mut self.resolver {
+            Some(x) => x,
             None => return Ok(()),
         };
 
@@ -1543,8 +1799,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         let xobject_dict = match xobject_dict_value {
             PDFObject::Dictionary(d) => d,
             PDFObject::Ref(ref_obj) => {
-                _fetched_xobject_dict = xref.fetch(ref_obj.num, ref_obj.generation)?;
-                match &*_fetched_xobject_dict {
+                _fetched_xobject_dict = resolver.resolve_ref(ref_obj.num, ref_obj.generation)?;
+                match &_fetched_xobject_dict {
                     PDFObject::Dictionary(d) => d,
                     _ => return Ok(()),
                 }
@@ -1558,11 +1814,11 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             None => return Ok(()),
         };
 
-        let xobject = xref.fetch_if_ref(xobject_ref)?;
+        let xobject = resolver.resolve_if_ref(xobject_ref)?;
 
-        // Check if it's an image XObject
-        let xobject_dict = match &xobject {
-            PDFObject::Stream { dict, .. } => dict,
+        // XObjects are always stream objects.
+        let (xobject_dict, xobject_data) = match &xobject {
+            PDFObject::Stream { dict, data } => (dict, data),
             _ => return Ok(()),
         };
 
@@ -1571,8 +1827,12 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             _ => return Ok(()),
         };
 
+        if subtype == "Form" {
+            return self.paint_form_xobject(xobject_name, xobject_dict, xobject_data);
+        }
+
         if subtype != "Image" {
-            return Ok(()); // Only support images for now
+            return Ok(());
         }
 
         // Extract image properties
@@ -1607,10 +1867,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         };
 
         // Get the image data stream
-        let image_data = match &xobject {
-            PDFObject::Stream { data, .. } => data,
-            _ => return Ok(()),
-        };
+        let image_data = xobject_data;
 
         // Decode the image data if needed
         // For JPEG, we also need to update the image metadata
@@ -1788,6 +2045,117 @@ impl<'a, D: Device> RenderingContext<'a, D> {
 
         Ok(())
     }
+
+    fn paint_form_xobject(
+        &mut self,
+        xobject_name: &str,
+        form_dict: &HashMap<String, PDFObject>,
+        form_data: &[u8],
+    ) -> PDFResult<()> {
+        // Decode the form stream if it uses filters.
+        let decoded_data = if let Some(filter) = form_dict.get("Filter") {
+            crate::core::decode::apply_filters(form_data, filter)
+                .unwrap_or_else(|_| form_data.to_vec())
+        } else {
+            form_data.to_vec()
+        };
+
+        // Form XObjects can define their own resource dictionary; otherwise they
+        // inherit the current one.
+        let form_resources = if let Some(resources_obj) = form_dict.get("Resources") {
+            match resources_obj {
+                PDFObject::Ref(_) => {
+                    let fetched = if let Some(resolver) = self.resolver.as_mut() {
+                        resolver.resolve_if_ref(resources_obj).ok()
+                    } else {
+                        None
+                    };
+                    fetched
+                }
+                _ => Some(resources_obj.clone()),
+            }
+        } else {
+            None
+        };
+
+        let matrix = parse_six_number_array(form_dict.get("Matrix"))
+            .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let bbox = parse_four_number_array(form_dict.get("BBox"));
+
+        #[cfg(feature = "debug-logging")]
+        eprintln!(
+            "DEBUG: PaintXObject: Entering form '{}' ({} bytes), matrix={:?}, bbox={:?}",
+            xobject_name,
+            decoded_data.len(),
+            matrix,
+            bbox
+        );
+
+        self.save()?;
+        let previous_resources = self.resources.clone();
+
+        // Keep restore/resource rollback deterministic even on early errors.
+        let result = (|| -> PDFResult<()> {
+            // Apply form matrix to map the form space into the current CTM.
+            self.current_state_mut().concat_matrix(&matrix);
+            self.device.concat_matrix(&matrix);
+
+            // Clip to the form's BBox when provided.
+            if let Some([x0, y0, x1, y1]) = bbox {
+                self.device.begin_path();
+                self.device.move_to(x0, y0);
+                self.device.line_to(x1, y0);
+                self.device.line_to(x1, y1);
+                self.device.line_to(x0, y1);
+                self.device.close_path();
+                self.device.clip_path(FillRule::NonZero)?;
+            }
+
+            if let Some(resources_obj) = form_resources {
+                self.resources = Some(resources_obj);
+            }
+
+            self.process_content_stream_bytes(decoded_data)
+        })();
+
+        self.resources = previous_resources;
+        let restore_result = self.restore();
+
+        if let Err(e) = result {
+            return Err(e);
+        }
+        restore_result
+    }
+
+    fn process_content_stream_bytes(&mut self, decoded_data: Vec<u8>) -> PDFResult<()> {
+        let stream = Box::new(crate::core::Stream::from_bytes(decoded_data))
+            as Box<dyn crate::core::BaseStream>;
+        let lexer = crate::core::Lexer::new(stream)?;
+        let parser = crate::core::Parser::new(lexer)?;
+        let mut evaluator = crate::core::ContentStreamEvaluator::new(parser);
+
+        loop {
+            match evaluator.read_operation() {
+                Ok(Some(op)) => {
+                    if let Err(e) = self.process_operation(&op) {
+                        #[cfg(feature = "debug-logging")]
+                        eprintln!(
+                            "DEBUG: Failed to process form XObject operator {:?}: {}",
+                            op.op, e
+                        );
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    #[cfg(feature = "debug-logging")]
+                    eprintln!("DEBUG: Failed to read form XObject operation: {}", e);
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Helper function to extract a number from a PDFObject.
@@ -1806,11 +2174,218 @@ fn extract_number(args: &[crate::core::parser::PDFObject], index: usize) -> PDFR
     }
 }
 
+fn parse_four_number_array(obj: Option<&PDFObject>) -> Option<[f64; 4]> {
+    let PDFObject::Array(values) = obj? else {
+        return None;
+    };
+    if values.len() < 4 {
+        return None;
+    }
+
+    let mut out = [0.0f64; 4];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let PDFObject::Number(value) = values[i].as_ref() else {
+            return None;
+        };
+        *slot = *value;
+    }
+    Some(out)
+}
+
+fn parse_six_number_array(obj: Option<&PDFObject>) -> Option<[f64; 6]> {
+    let PDFObject::Array(values) = obj? else {
+        return None;
+    };
+    if values.len() < 6 {
+        return None;
+    }
+
+    let mut out = [0.0f64; 6];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let PDFObject::Number(value) = values[i].as_ref() else {
+            return None;
+        };
+        *slot = *value;
+    }
+    Some(out)
+}
+
+fn parse_blend_mode(obj: &PDFObject) -> Option<super::graphics_state::BlendMode> {
+    use super::graphics_state::BlendMode;
+
+    let name = match obj {
+        PDFObject::Name(name) => Some(name.as_str()),
+        PDFObject::Array(items) => items.iter().find_map(|item| match item.as_ref() {
+            PDFObject::Name(name) => Some(name.as_str()),
+            _ => None,
+        }),
+        _ => None,
+    }?;
+
+    match name {
+        "Normal" | "Compatible" => Some(BlendMode::Normal),
+        "Multiply" => Some(BlendMode::Multiply),
+        "Screen" => Some(BlendMode::Screen),
+        "Overlay" => Some(BlendMode::Overlay),
+        "Darken" => Some(BlendMode::Darken),
+        "Lighten" => Some(BlendMode::Lighten),
+        "ColorDodge" => Some(BlendMode::ColorDodge),
+        "ColorBurn" => Some(BlendMode::ColorBurn),
+        "HardLight" => Some(BlendMode::HardLight),
+        "SoftLight" => Some(BlendMode::SoftLight),
+        "Difference" => Some(BlendMode::Difference),
+        "Exclusion" => Some(BlendMode::Exclusion),
+        "Hue" => Some(BlendMode::Hue),
+        "Saturation" => Some(BlendMode::Saturation),
+        "Color" => Some(BlendMode::Color),
+        "Luminosity" => Some(BlendMode::Luminosity),
+        _ => None,
+    }
+}
+
+fn font_needs_to_unicode_remap(font_dict_info: &crate::core::font::FontDict) -> bool {
+    use crate::core::font::FontType;
+
+    if matches!(
+        font_dict_info.font_type,
+        FontType::CIDFontType0 | FontType::CIDFontType2
+    ) {
+        return true;
+    }
+
+    if font_dict_info.descendant_fonts.is_some() {
+        return true;
+    }
+
+    matches!(
+        font_dict_info.encoding.as_ref(),
+        Some(PDFObject::Name(name)) if matches!(name.as_str(), "Identity-H" | "Identity-V")
+    )
+}
+
+/// Returns raw text bytes for PDF text string objects.
+///
+/// PDF content streams represent text with both literal strings `( ... )`
+/// and hexadecimal strings `< ... >`. Both should be rendered as byte sequences.
+fn text_bytes(obj: &PDFObject) -> Option<&[u8]> {
+    match obj {
+        PDFObject::String(bytes) | PDFObject::HexString(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    }
+}
+
+fn text_paint_for_rendering_mode(
+    mode: super::graphics_state::TextRenderingMode,
+    fill_color: Color,
+) -> Paint {
+    use super::graphics_state::TextRenderingMode;
+
+    match mode {
+        // Invisible/clip-only text should not be painted but still advance the text matrix.
+        TextRenderingMode::Invisible | TextRenderingMode::Clip => Paint::Transparent,
+        _ => Paint::from_color(fill_color),
+    }
+}
+
+/// Post-concatenate a translation matrix.
+///
+/// Equivalent to `matrix * translate(tx, ty)` in PDF 2D affine form.
+fn post_concat_translate(matrix: [f64; 6], tx: f64, ty: f64) -> [f64; 6] {
+    post_concat_matrix(matrix, [1.0, 0.0, 0.0, 1.0, tx, ty])
+}
+
+/// Multiply two PDF affine transforms in 6-element form.
+///
+/// Returns `left * right`.
+fn post_concat_matrix(left: [f64; 6], right: [f64; 6]) -> [f64; 6] {
+    let [a1, b1, c1, d1, e1, f1] = left;
+    let [a2, b2, c2, d2, e2, f2] = right;
+
+    [
+        a1 * a2 + c1 * b2,
+        b1 * a2 + d1 * b2,
+        a1 * c2 + c1 * d2,
+        b1 * c2 + d1 * d2,
+        a1 * e2 + c1 * f2 + e1,
+        b1 * e2 + d1 * f2 + f1,
+    ]
+}
+
+fn remap_text_bytes_with_cmap(bytes: &[u8], cmap: &CMap) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let one_byte_codes: Vec<u16> = bytes.iter().map(|&b| b as u16).collect();
+    let one_byte_hits = one_byte_codes
+        .iter()
+        .filter(|&&code| cmap.to_unicode(code).is_some())
+        .count();
+
+    let mut best_codes = one_byte_codes;
+    let mut best_hits = one_byte_hits;
+    let mut best_is_two_byte = false;
+
+    if bytes.len() % 2 == 0 {
+        let two_byte_codes: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        let two_byte_hits = two_byte_codes
+            .iter()
+            .filter(|&&code| cmap.to_unicode(code).is_some())
+            .count();
+
+        if two_byte_hits > best_hits {
+            best_codes = two_byte_codes;
+            best_hits = two_byte_hits;
+            best_is_two_byte = true;
+        }
+    }
+
+    if best_hits == 0 {
+        return None;
+    }
+
+    let mapped_chars: Vec<char> = best_codes
+        .iter()
+        .map(|&code| {
+            cmap.to_unicode(code)
+                .or_else(|| char::from_u32(code as u32))
+                .unwrap_or('\u{FFFD}')
+        })
+        .collect();
+
+    if mapped_chars.iter().all(|&ch| (ch as u32) <= 0xFF) {
+        let mapped_single_byte: Vec<u8> = mapped_chars.iter().map(|&ch| ch as u8).collect();
+        if best_is_two_byte || mapped_single_byte != bytes {
+            return Some(mapped_single_byte);
+        }
+        return None;
+    }
+
+    let mut mapped_utf16be = Vec::new();
+    for unicode_char in mapped_chars {
+        let mut utf16_buf = [0u16; 2];
+        let units = unicode_char.encode_utf16(&mut utf16_buf);
+        for unit in units.iter() {
+            mapped_utf16be.extend_from_slice(&unit.to_be_bytes());
+        }
+    }
+
+    if best_is_two_byte || mapped_utf16be != bytes {
+        Some(mapped_utf16be)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::parser::PDFObject;
     use crate::rendering::device::TestDevice;
+    use smallvec::smallvec;
 
     #[test]
     fn test_context_creation() {
@@ -1847,5 +2422,352 @@ mod tests {
 
         ctx.process_operation(&op).unwrap();
         assert_eq!(ctx.current_path.current_point(), Some((10.0, 20.0)));
+    }
+
+    #[test]
+    fn test_show_text_advances_text_matrix_only() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().text_matrix = [1.0, 0.0, 0.0, 1.0, 10.0, 20.0];
+        ctx.current_state_mut().text_line_matrix = [1.0, 0.0, 0.0, 1.0, 10.0, 20.0];
+
+        let op = Operation::new(OpCode::ShowText, vec![PDFObject::String(vec![b'A', b'B'])]);
+        ctx.process_operation(&op).unwrap();
+
+        assert_eq!(
+            ctx.current_state().text_matrix,
+            [1.0, 0.0, 0.0, 1.0, 22.0, 20.0]
+        );
+        assert_eq!(
+            ctx.current_state().text_line_matrix,
+            [1.0, 0.0, 0.0, 1.0, 10.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn test_show_text_hex_string_advances_text_matrix_only() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().text_matrix = [1.0, 0.0, 0.0, 1.0, 10.0, 20.0];
+        ctx.current_state_mut().text_line_matrix = [1.0, 0.0, 0.0, 1.0, 10.0, 20.0];
+
+        let op = Operation::new(
+            OpCode::ShowText,
+            vec![PDFObject::HexString(vec![b'A', b'B'])],
+        );
+        ctx.process_operation(&op).unwrap();
+
+        assert_eq!(
+            ctx.current_state().text_matrix,
+            [1.0, 0.0, 0.0, 1.0, 22.0, 20.0]
+        );
+        assert_eq!(
+            ctx.current_state().text_line_matrix,
+            [1.0, 0.0, 0.0, 1.0, 10.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn test_show_text_respects_rotated_text_matrix() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().text_matrix = [0.0, 1.0, -1.0, 0.0, 10.0, 20.0];
+        ctx.current_state_mut().text_line_matrix = [0.0, 1.0, -1.0, 0.0, 10.0, 20.0];
+
+        let op = Operation::new(OpCode::ShowText, vec![PDFObject::String(vec![b'A'])]);
+        ctx.process_operation(&op).unwrap();
+
+        assert_eq!(
+            ctx.current_state().text_matrix,
+            [0.0, 1.0, -1.0, 0.0, 10.0, 26.0]
+        );
+    }
+
+    #[test]
+    fn test_show_text_applies_char_and_word_spacing() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().font_size = Some(10.0);
+        ctx.current_state_mut().character_spacing = 0.5;
+        ctx.current_state_mut().word_spacing = 1.0;
+
+        let op = Operation::new(
+            OpCode::ShowText,
+            vec![PDFObject::String(vec![b'A', b' ', b'B'])],
+        );
+        ctx.process_operation(&op).unwrap();
+
+        // Width from TestDevice:
+        // glyphs: (3 * 500 * 10) / 1000 = 15.0
+        // spacing: (Tc * 3) + (Tw * 1) = 2.5
+        // total: 17.5
+        assert!((ctx.current_state().text_matrix[4] - 17.5).abs() < 1e-6);
+        assert_eq!(ctx.current_state().text_line_matrix[4], 0.0);
+    }
+
+    #[test]
+    fn test_show_text_applies_hscale_to_char_and_word_spacing() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().font_size = Some(10.0);
+        ctx.current_state_mut().character_spacing = 0.5;
+        ctx.current_state_mut().word_spacing = 1.0;
+        ctx.current_state_mut().text_horizontal_scaling = 50.0;
+
+        let op = Operation::new(
+            OpCode::ShowText,
+            vec![PDFObject::String(vec![b'A', b' ', b'B'])],
+        );
+        ctx.process_operation(&op).unwrap();
+
+        // Unscaled width: 17.5 (see test above), with 50% horizontal scale => 8.75.
+        assert!((ctx.current_state().text_matrix[4] - 8.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_show_spaced_text_offset_sign_and_scaling() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().font_size = Some(10.0);
+        ctx.current_state_mut().text_horizontal_scaling = 50.0;
+
+        let op = Operation::new(
+            OpCode::ShowSpacedText,
+            vec![PDFObject::Array(smallvec![
+                Box::new(PDFObject::String(vec![b'A'])),
+                Box::new(PDFObject::Number(120.0))
+            ])],
+        );
+
+        ctx.process_operation(&op).unwrap();
+
+        // Width from TestDevice draw_text: ((1 * 500 * 10) / 1000) * 0.5 = 2.5
+        // TJ adjustment: -(120 * 10 * 0.5) / 1000 = -0.6
+        assert!((ctx.current_state().text_matrix[4] - 1.9).abs() < 1e-6);
+        assert_eq!(ctx.current_state().text_line_matrix[4], 0.0);
+    }
+
+    #[test]
+    fn test_show_spaced_text_applies_char_word_spacing_and_tj_adjustment() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().font_size = Some(10.0);
+        ctx.current_state_mut().character_spacing = 0.5;
+        ctx.current_state_mut().word_spacing = 1.0;
+
+        let op = Operation::new(
+            OpCode::ShowSpacedText,
+            vec![PDFObject::Array(smallvec![
+                Box::new(PDFObject::String(vec![b'A', b' ', b'B'])),
+                Box::new(PDFObject::Number(100.0))
+            ])],
+        );
+        ctx.process_operation(&op).unwrap();
+
+        // String width: 17.5 (with Tc/Tw), TJ adjustment: -(100 * 10 * 1.0) / 1000 = -1.0
+        assert!((ctx.current_state().text_matrix[4] - 16.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_show_spaced_text_hex_string_offset_sign_and_scaling() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().font_size = Some(10.0);
+        ctx.current_state_mut().text_horizontal_scaling = 50.0;
+
+        let op = Operation::new(
+            OpCode::ShowSpacedText,
+            vec![PDFObject::Array(smallvec![
+                Box::new(PDFObject::HexString(vec![b'A'])),
+                Box::new(PDFObject::Number(120.0))
+            ])],
+        );
+
+        ctx.process_operation(&op).unwrap();
+
+        // Width from TestDevice draw_text: ((1 * 500 * 10) / 1000) * 0.5 = 2.5
+        // TJ adjustment: -(120 * 10 * 0.5) / 1000 = -0.6
+        assert!((ctx.current_state().text_matrix[4] - 1.9).abs() < 1e-6);
+        assert_eq!(ctx.current_state().text_line_matrix[4], 0.0);
+    }
+
+    #[test]
+    fn test_move_text_post_concats_translation() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().text_line_matrix = [0.0, 1.0, -1.0, 0.0, 10.0, 20.0];
+        ctx.current_state_mut().text_matrix = [0.0, 1.0, -1.0, 0.0, 10.0, 20.0];
+
+        let op = Operation::new(
+            OpCode::MoveText,
+            vec![PDFObject::Number(5.0), PDFObject::Number(3.0)],
+        );
+        ctx.process_operation(&op).unwrap();
+
+        assert_eq!(
+            ctx.current_state().text_matrix,
+            [0.0, 1.0, -1.0, 0.0, 7.0, 25.0]
+        );
+        assert_eq!(
+            ctx.current_state().text_line_matrix,
+            [0.0, 1.0, -1.0, 0.0, 7.0, 25.0]
+        );
+    }
+
+    #[test]
+    fn test_next_line_post_concats_leading() {
+        let mut device = TestDevice::new(612.0, 792.0);
+        let mut ctx = RenderingContext::new(&mut device);
+
+        ctx.begin_text().unwrap();
+        ctx.current_state_mut().text_line_matrix = [0.0, 1.0, -1.0, 0.0, 10.0, 20.0];
+        ctx.current_state_mut().text_matrix = [0.0, 1.0, -1.0, 0.0, 10.0, 20.0];
+        ctx.current_state_mut().text_leading = 4.0;
+
+        ctx.next_line().unwrap();
+
+        assert_eq!(
+            ctx.current_state().text_matrix,
+            [0.0, 1.0, -1.0, 0.0, 14.0, 20.0]
+        );
+        assert_eq!(
+            ctx.current_state().text_line_matrix,
+            [0.0, 1.0, -1.0, 0.0, 14.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn test_remap_text_bytes_with_cmap_shifted_single_byte_codes() {
+        let cmap = CMap::parse(
+            br#"
+4 beginbfchar
+<2A> <0047>
+<44> <0061>
+<50> <006D>
+<48> <0065>
+endbfchar
+"#,
+        )
+        .unwrap();
+
+        let remapped = remap_text_bytes_with_cmap(b"*DPH", &cmap).unwrap();
+        assert_eq!(remapped, b"Game");
+    }
+
+    #[test]
+    fn test_remap_text_bytes_with_cmap_prefers_two_byte_codes() {
+        let cmap = CMap::parse(
+            br#"
+2 beginbfchar
+<0102> <0041>
+<0304> <0042>
+endbfchar
+"#,
+        )
+        .unwrap();
+
+        let remapped = remap_text_bytes_with_cmap(&[0x01, 0x02, 0x03, 0x04], &cmap).unwrap();
+        assert_eq!(remapped, b"AB");
+    }
+
+    #[test]
+    fn test_remap_text_bytes_with_cmap_unchanged_returns_none() {
+        let cmap = CMap::parse(
+            br#"
+1 beginbfchar
+<41> <0041>
+endbfchar
+"#,
+        )
+        .unwrap();
+
+        assert!(remap_text_bytes_with_cmap(b"A", &cmap).is_none());
+    }
+
+    #[test]
+    fn test_font_needs_to_unicode_remap_for_simple_type1_is_false() {
+        let info = crate::core::font::FontDict {
+            font_type: crate::core::font::FontType::Type1,
+            base_font: "Test".to_string(),
+            encoding: Some(PDFObject::Name("WinAnsiEncoding".to_string())),
+            to_unicode: None,
+            font_descriptor: None,
+            widths: None,
+            first_char: None,
+            last_char: None,
+            default_width: 250.0,
+            descendant_fonts: None,
+        };
+
+        assert!(!font_needs_to_unicode_remap(&info));
+    }
+
+    #[test]
+    fn test_font_needs_to_unicode_remap_for_descendant_font_is_true() {
+        let info = crate::core::font::FontDict {
+            font_type: crate::core::font::FontType::Unknown,
+            base_font: "Test".to_string(),
+            encoding: None,
+            to_unicode: None,
+            font_descriptor: None,
+            widths: None,
+            first_char: None,
+            last_char: None,
+            default_width: 250.0,
+            descendant_fonts: Some(PDFObject::Array(smallvec![])),
+        };
+
+        assert!(font_needs_to_unicode_remap(&info));
+    }
+
+    #[test]
+    fn test_parse_blend_mode_from_name() {
+        let mode = parse_blend_mode(&PDFObject::Name("SoftLight".to_string()));
+        assert_eq!(mode, Some(crate::rendering::BlendMode::SoftLight));
+    }
+
+    #[test]
+    fn test_parse_blend_mode_from_array() {
+        let mode = parse_blend_mode(&PDFObject::Array(smallvec![
+            Box::new(PDFObject::Name("Multiply".to_string())),
+            Box::new(PDFObject::Name("Normal".to_string())),
+        ]));
+        assert_eq!(mode, Some(crate::rendering::BlendMode::Multiply));
+    }
+
+    #[test]
+    fn test_text_paint_for_invisible_mode_is_transparent() {
+        let paint = text_paint_for_rendering_mode(
+            crate::rendering::TextRenderingMode::Invisible,
+            Color::RGB(0.0, 0.0, 0.0),
+        );
+        assert!(matches!(paint, Paint::Transparent));
+    }
+
+    #[test]
+    fn test_text_paint_for_fill_mode_uses_fill_color() {
+        let paint = text_paint_for_rendering_mode(
+            crate::rendering::TextRenderingMode::Fill,
+            Color::RGB(1.0, 0.0, 0.0),
+        );
+        assert!(matches!(paint, Paint::Solid(Color::RGB(1.0, 0.0, 0.0))));
     }
 }
