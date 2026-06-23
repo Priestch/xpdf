@@ -64,8 +64,8 @@ directly from the base `XRef`. Interpretation is a pure function over a `Resolve
 interpretation restartable-safe, parallelizable, and WASM-clean.
 
 > **Current state** (see `docs/architecture.md`): `Page::render` is delta-aware for `/Contents`
-> (tested), but nested resource fetches and `extract_text` still bypass `DocStore`. `drive` has
-> no production caller yet (`XRef::parse` isn't restartable). Full purity is in progress.
+> (tested), but nested resource fetches and `extract_text` still bypass `DocStore`. `drive`
+> now has a production caller (`open_file` parses through it). Full purity is in progress.
 
 ## Development Commands
 

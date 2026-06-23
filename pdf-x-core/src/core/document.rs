@@ -181,17 +181,18 @@ impl PDFDocument {
         let boxed_stream = Box::new(stream) as Box<dyn BaseStream>;
         let mut xref = XRef::new(boxed_stream);
 
-        // Position at xref table and parse with progressive loading retry loop.
+        // Position at xref table and parse with the shell-owned progressive-loading loop.
         //
-        // NOTE (Step 3b): this still uses retry_on_data_missing! rather than `drive`.
-        // The migration was reverted because `XRef::parse` is NOT idempotent-restartable:
-        // it does not reset `stream_pos` to `startxref` on re-entry, so `drive`'s retry
-        // re-reads from a mid-parse position and emits an endless sequence of distinct
-        // Needs (a hang). Switching to `drive` here requires making `parse` reset its
-        // stream position per retry. `XRef: Loadable`, `drive`, and `StepErr` are in
-        // place for that follow-up.
-        xref.set_stream_pos(startxref)?;
-        crate::retry_on_data_missing!(xref.stream_mut(), { xref.parse() })?;
+        // `drive` retries on `Need` (adapted from `DataMissing` at the boundary). The op
+        // resets `stream_pos` to `startxref` on EVERY retry: `XRef::parse` reads from the
+        // current stream position, so without the reset a retry would resume mid-stream and
+        // loop forever. With the reset, each retry re-reads from `startxref` and progresses
+        // further as chunks load (xref entries use set-if-None guards, so re-parsing is
+        // idempotent). `XRef: Loadable` provides `ensure_range` for the drive loop.
+        crate::core::byte_source::drive(&mut xref, |x| {
+            x.set_stream_pos(startxref)?;
+            crate::core::byte_source::StepErr::adapt(x.parse())
+        })?;
 
         // Load the catalog
         let catalog = Some(xref.catalog()?);

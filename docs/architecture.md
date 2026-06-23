@@ -343,9 +343,12 @@ Tauri app.
 
 - ✅ **Pull-based protocol** (decision A): `Need`, `ByteSource`/`Loadable`, `MemoryByteSource`,
   `BaseStreamSource`, `drive`, `StepErr` (`DataMissing → Need` boundary). Tested; minimality
-  proven. ⚠️ `drive` has **no production caller yet** — `open_file`'s parse site still uses
-  `retry_on_data_missing!` because `XRef::parse` is not restartable (the migration hung; see
-  the note in `document.rs`). A `MAX_DRIVE_STEPS` cap guards against the hang class.
+  proven. `open_file`'s parse site now drives `XRef::parse` through `drive` (resetting
+  `stream_pos` to `startxref` per retry — `parse` is idempotent under `set-if-None` entry
+  guards). A `MAX_DRIVE_STEPS` cap guards against runaway loops.
+  ⚠️ Known related bug (out of scope, affects the legacy path equally): on a *partially*-loaded
+  stream `XRef::parse`/lexer can loop instead of returning `DataMissing`. It doesn't manifest
+  in normal use because `open_file` preloads the xref region before parsing.
 - ✅ **`DocStore`** (decision B): `delta → base` resolution authority, borrowed over
   `(&mut XRef, &mut DeltaLayer)`. `get_page_dict`, `resolve_page`, and `Page::render`
   (via `render_page_to_image`) route through it. ⚠️ **The gate is partially enforced**:
