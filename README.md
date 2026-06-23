@@ -5,16 +5,21 @@
 [![Documentation](https://docs.rs/pdf-x/badge.svg)](https://docs.rs/pdf-x)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**PDF-X** is a high-performance PDF library for Rust, ported from Mozilla's PDF.js while maintaining architectural fidelity and leveraging Rust's safety guarantees.
+**PDF-X** is a high-performance, **composable PDF core library** for Rust, ported from Mozilla's PDF.js. The core is synchronous, runtime-free, and WASM-clean, and is embedded by native (Tauri), web, and WASM viewer/editor shells.
+
+- **Progressive loading on every source** — bounded memory for local *and* network PDFs, via a pull-based data protocol owned by the shell (no whole-file loads).
+- **Viewer-first, editor-ready by construction** — the `delta → base` object-resolution path is wired in from day one, so editing is added by populating the delta, with no viewer refactor.
+- **Resolve-then-interpret** — the resolver owns all progressive-loading complexity; interpretation is a pure synchronous function over an immutable, `Send + Sync` page model, enabling parallel rendering.
 
 ## 🚀 Features
 
-- **Progressive Loading** - Load PDFs incrementally with chunked data access
-- **Async HTTP Loading** - Load PDFs from URLs with range requests (optional `async` feature)
+- **Composable Core** - One sync, runtime-free library used by native/web/wasm shells
+- **Progressive Loading** - Bounded-memory loading on every source (file, HTTP, memory)
+- **Async HTTP Loading** - Range requests from URLs (optional `async` feature)
 - **Text Extraction** - Extract text with position and font information
 - **Linearized PDF Support** - Fast first-page display for web-optimized PDFs
+- **Editor-Ready** - Delta layer + incremental-update writer built into object resolution
 - **High Performance** - Optimized with LRU caching, FxHashMap, and SmallVec
-- **Robust Error Handling** - Gracefully handles corrupt PDFs (95.9% compatibility rate)
 - **Memory Safe** - Built with Rust's safety guarantees
 - **Cross-Platform** - Works on Windows, macOS, Linux, and WebAssembly
 - **CLI Tool** - Command-line utility for PDF inspection
@@ -76,12 +81,12 @@ cargo run --example error_handling
 
 ## 🏗️ Architecture
 
-PDF-X follows the proven PDF.js four-layer architecture:
+PDF-X is a **composable core + shells** architecture:
 
-1. **Data Source Layer** - Abstract chunked loading from files, HTTP, or memory
-2. **Parser Layer** - Incremental PDF parsing with exception-driven loading
-3. **Document Layer** - Page tree navigation and metadata management
-4. **Content Layer** - Content stream interpretation and text extraction
+- **`pdf-x-core`** (sync, runtime-free, WASM-clean): `DocStore` (single `delta → base` resolution point) → `Resolver` (owns progressive loading) → `Interpreter` over immutable `ResolvedPage` → `Device` trait. No tokio, no threads, no rendering backend baked in.
+- **Shells** (`tauri-app`, future web/wasm): provide I/O, async, threading, and the `Device` backend; drive the pull-based `Need::Range` data protocol.
+
+Core phases (ported from PDF.js): data source → parser → document → content/interpretation, with the delta editor layer wired into object resolution.
 
 ### Progressive Loading
 
@@ -204,8 +209,8 @@ PDF-X is optimized for performance with multiple techniques:
 - **Memory Efficient** - Chunked data processing with LRU caching (1000 object cache)
 - **Fast Hash Maps** - FxHashMap for 30% faster object lookups
 - **Small Vector Optimization** - SmallVec for 50% faster small arrays
-- **Exception-Driven** - Progressive loading with precise error handling
-- **Thread Safe** - Safe concurrent access to PDF data
+- **Pull-Based Loading** - Progressive loading via a `Need::Range` data protocol owned by the shell
+- **Send + Sync** - Core types are owned and thread-safe; shells render snapshots in parallel
 
 Benchmark results on a 10MB PDF:
 

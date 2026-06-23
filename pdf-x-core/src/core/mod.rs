@@ -1,11 +1,13 @@
 pub mod annotation;
 pub mod base_stream;
+pub mod byte_source;
 pub mod chunk_manager;
 pub mod cmap;
 pub mod content_stream;
 pub mod crypto;
 pub mod decode;
 pub mod delta;
+pub mod doc_store;
 pub mod document;
 pub mod encoding;
 pub mod encryption;
@@ -34,6 +36,7 @@ pub use annotation::{
     PopupAnnotation, TextAnnotation, WidgetAnnotation,
 };
 pub use base_stream::BaseStream;
+pub use byte_source::{BaseStreamSource, ByteSource, MemoryByteSource, Need, StepErr, drive};
 pub use chunk_manager::{ChunkLoader, ChunkManager};
 pub use cmap::CMap;
 pub use content_stream::{ContentStreamEvaluator, OpCode, Operation, TextItem};
@@ -42,6 +45,7 @@ pub use crypto::{
     calculate_sha256, calculate_sha384, calculate_sha512,
 };
 pub use delta::{Command, DeltaLayer, DeltaObject, RotatePageCommand};
+pub use doc_store::DocStore;
 pub use document::{LinearizedInfo, PDFDocument};
 pub use encoding::Encoding;
 pub use encryption::{EncryptDict, EncryptionAlgorithm, EncryptionVersion, PDFPermissions};

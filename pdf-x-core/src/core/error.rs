@@ -24,6 +24,9 @@ pub enum PDFError {
     /// Invalid PDF object encountered
     InvalidObject { expected: String, found: String },
 
+    /// Object marked as deleted in the delta layer (resolve: `delta → base`)
+    ObjectDeleted { num: u32, generation: u32 },
+
     /// Parse error with context
     ParseError {
         message: String,
@@ -91,6 +94,9 @@ impl fmt::Display for PDFError {
             }
             PDFError::InvalidObject { expected, found } => {
                 write!(f, "Invalid object: expected {}, found {}", expected, found)
+            }
+            PDFError::ObjectDeleted { num, generation } => {
+                write!(f, "Object {} {} deleted in delta layer", num, generation)
             }
             PDFError::ParseError {
                 message,

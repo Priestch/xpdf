@@ -94,8 +94,8 @@
 //! PDF-X is optimized for performance:
 //! - Lazy loading of pages and content
 //! - Efficient memory usage with caching
-//! - Exception-driven progressive loading
-//! - Thread-safe operations
+//! - Pull-based progressive loading (sync, runtime-free core; shells own I/O)
+//! - Thread-safe owned core types (`Send + Sync`)
 //!
 //! For more detailed examples and advanced usage, see the examples directory.
 
@@ -105,9 +105,11 @@ pub mod rendering;
 // Re-export main types for convenience
 pub use core::{
     Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags, AnnotationRect,
-    AnnotationType, BaseStream, DestinationType, FileAttachmentAnnotation, FileChunkedStream,
-    FormFieldType, ImageDecoder, ImageFormat, Lexer, LinearizedInfo, LinkAction, LinkAnnotation,
-    OutlineDestination, OutlineItem, PDFDocument, PDFError, PDFObject, Page, Parser,
+    AnnotationType, BaseStream, ByteSource, DeltaLayer, DestinationType, DocStore,
+    FileAttachmentAnnotation, FileChunkedStream, FormFieldType, ImageDecoder, ImageFormat, Lexer,
+    LinearizedInfo, LinkAction,
+    LinkAnnotation, MemoryByteSource, Need, OutlineDestination, OutlineItem, PDFDocument, PDFError,
+    PDFObject, Page, Parser,
     PopupAnnotation, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef, XRefEntry,
 };
 

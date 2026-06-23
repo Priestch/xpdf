@@ -1,5 +1,7 @@
 use super::base_stream::BaseStream;
 use super::chunk_manager::ChunkLoader;
+use super::delta::DeltaLayer;
+use super::doc_store::DocStore;
 use super::encryption::{EncryptDict, EncryptionVersion};
 use super::error::{PDFError, PDFResult};
 use super::file_chunked_stream::FileChunkedStream;
@@ -43,6 +45,10 @@ pub struct LinearizedInfo {
 pub struct PDFDocument {
     /// The cross-reference table
     xref: XRef,
+
+    /// Edit delta layered over the base (`delta → base`). Empty in v1; the resolution
+    /// seam is live via [`PDFDocument::doc_store_mut`].
+    delta: DeltaLayer,
 
     /// The document catalog (root dictionary)
     catalog: Option<PDFObject>,
@@ -98,8 +104,13 @@ impl PDFDocument {
         // Check if this is a linearized PDF
         let linearized = Self::check_linearized(&mut xref)?;
 
+        // Delta layer over the base. Sized by the base object count so new objects
+        // (Phase 2+) get fresh object numbers above the base range.
+        let delta = DeltaLayer::new(xref.len() as u32);
+
         Ok(PDFDocument {
             xref,
+            delta,
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
@@ -180,8 +191,13 @@ impl PDFDocument {
         // Check if this is a linearized PDF
         let linearized = Self::check_linearized(&mut xref)?;
 
+        // Delta layer over the base. Sized by the base object count so new objects
+        // (Phase 2+) get fresh object numbers above the base range.
+        let delta = DeltaLayer::new(xref.len() as u32);
+
         Ok(PDFDocument {
             xref,
+            delta,
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
@@ -301,6 +317,16 @@ impl PDFDocument {
     /// Returns a mutable reference to the xref table for fetching objects.
     pub fn xref_mut(&mut self) -> &mut XRef {
         &mut self.xref
+    }
+
+    /// Returns a [`DocStore`] — the single `delta → base` object-resolution authority,
+    /// borrowed over this document's `XRef` and `DeltaLayer`.
+    ///
+    /// All object resolution should go through the returned store (rather than
+    /// [`PDFDocument::xref_mut`]) so that edits are honored. This is the editor-ready
+    /// resolution seam (decision B); the delta is empty in v1.
+    pub fn doc_store_mut(&mut self) -> DocStore<'_> {
+        DocStore::new(&mut self.xref, &mut self.delta)
     }
 
     /// Returns an immutable reference to the xref table.
@@ -484,6 +510,10 @@ impl PDFDocument {
         // Get the root Pages dictionary
         let root_pages = self.pages_dict()?;
 
+        // Resolve page-tree objects through the DocStore (delta → base), so edits to
+        // page-tree nodes are honored. Delta is empty in v1 → behavior-preserving.
+        let mut store = self.doc_store_mut();
+
         // Stack for depth-first traversal: (node, is_reference)
         let mut nodes_to_visit: Vec<(PDFObject, Option<(u32, u32)>)> = vec![(root_pages, None)];
         let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
@@ -503,9 +533,8 @@ impl PDFDocument {
                     }
                     visited_refs.insert(ref_key);
 
-                    // Fetch the object
-                    let fetched = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
-                    let obj = (*fetched).clone();
+                    // Fetch the object via delta → base resolution.
+                    let obj = store.resolve_ref(ref_obj.num, ref_obj.generation)?;
                     (obj, Some(ref_key))
                 }
                 _ => (current_node.clone(), node_ref),
@@ -542,9 +571,9 @@ impl PDFDocument {
             let kids_array = match kids {
                 PDFObject::Array(arr) => arr.clone(),
                 PDFObject::Ref(ref_obj) => {
-                    // Kids is a reference, fetch it
-                    let fetched = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
-                    match &*fetched {
+                    // Kids is a reference, resolve it via delta → base.
+                    let fetched = store.resolve_ref(ref_obj.num, ref_obj.generation)?;
+                    match &fetched {
                         PDFObject::Array(arr) => arr.clone(),
                         _ => {
                             return Err(PDFError::Generic(
@@ -749,9 +778,11 @@ impl PDFDocument {
             rotate_b * scale as f64,
             rotate_c * scale as f64,
             rotate_d * scale as f64,
-            offset_canvas_x - rotate_a * scale as f64 * center_x
+            offset_canvas_x
+                - rotate_a * scale as f64 * center_x
                 - rotate_c * scale as f64 * center_y,
-            offset_canvas_y - rotate_b * scale as f64 * center_x
+            offset_canvas_y
+                - rotate_b * scale as f64 * center_x
                 - rotate_d * scale as f64 * center_y,
         ]);
 

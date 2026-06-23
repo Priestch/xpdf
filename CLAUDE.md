@@ -4,12 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PDF-X is a Rust port of Mozilla's PDF.js library with a hybrid viewer-editor architecture. The goal is to replicate PDF.js's proven architecture and progressive/lazy loading features while leveraging Rust's performance and memory safety, plus add editing capabilities through a delta-based modification layer.
+PDF-X is a Rust port of Mozilla's PDF.js, structured as a **platform-agnostic, composable core library** that is embedded by native, web, and WASM viewer/editor shells.
 
-**Key Design Principles**:
+### Technical Goal (primary, explicitly unbundled)
+
+Earlier drafts fused several goals into one (PDF.js fidelity + progressive loading + immutable viewer + collaborative editor). Those goals constrain each other, so they are unbundled here into one primary objective with explicit positioning:
+
+> **A platform-agnostic, composable PDF core library** that (1) loads **progressively with bounded memory on every source** — local or network, (2) is **WASM-clean** (no baked-in async runtime or threading), and (3) ships as a **viewer first** but is **editor-ready by construction**: the mutation/delta path is wired into object resolution from day one, so adding editing later is a feature, not a refactor.
+
+- **Primary objective**: a fast, faithful, progressive, composable, WASM-clean **viewer core**.
+- **Deferred but architecturally preserved**: concrete editor commands and collaboration. The foundation must not preclude them.
+- **Editor scope is open**: v1 ships viewer-only, but the delta/resolution seam is the foundation, so editor features slot in without refactoring the viewer.
+
+### Key Design Principles
 - Maintain architectural fidelity to PDF.js while implementing idiomatic Rust
-- **Hybrid Architecture**: Immutable progressive viewer + mutable delta layer for editing
-- Preserve the viewer's performance (lazy loading, low memory) while enabling document modifications
+- **Composable core**: one sync, runtime-free library at the bottom; platform shells (native/web/wasm) on top provide I/O, async, threading, and UI
+- **Progressive by default**: bounded memory on every source (local and network) — large local PDFs are NOT loaded whole
+- **Editor-ready, not editor-first**: the `delta → base` object-resolution path is live from day one (delta may be empty), so editing is added by populating the delta
 
 ## PDF.js Reference Submodule
 
@@ -29,59 +40,69 @@ The `pdf.js/` directory contains the original PDF.js codebase as a git submodule
 - `pdf.js/src/display/`: Rendering layer (canvas API, page rendering)
 - `pdf.js/src/shared/`: Shared utilities between worker and main thread
 
-## Architecture Layers
+## Architecture: Composable Core + Shells
 
-The implementation follows a **five-layer hybrid architecture** that combines an efficient viewer with a lightweight editing layer:
-
-### Viewer Core (Immutable, Progressive)
-
-1. **Data Source Layer**: Abstract chunked data loading from multiple sources
-   - Provides uniform chunk-based interface regardless of source
-   - **Network Loader**: HTTP/HTTPS with range request support for progressive loading
-   - **Filesystem Loader**: Local file reading with chunked streaming
-   - **Memory Loader**: In-memory buffers (for testing or embedded data)
-   - All loaders support asynchronous chunk delivery to enable progressive parsing
-
-2. **Parser Layer**: Incremental PDF parsing
-   - Stream-based object parsing (PDF objects parsed as data arrives)
-   - Cross-reference (xref) table processing
-   - Handle linearized PDFs for fast first-page display
-   - Source-agnostic: works with any data source loader
-   - **Immutable by design**: Never modifies the base PDF
-
-3. **Document Structure Layer**: Page tree and metadata management
-   - Build page tree without loading all pages
-   - Catalog and metadata extraction
-   - Resource dictionaries
-   - Lazy page object resolution
-
-4. **Rendering Layer**: Content stream interpretation
-   - On-demand page rendering
-   - Graphics state management
-   - Text and image extraction
-
-### Editor Layer (Mutable, Delta-Based)
-
-5. **Delta Layer**: Document modification tracking
-   - **Modified objects**: Overrides for specific PDF objects (by object number)
-   - **New objects**: Annotations, added pages, form field values
-   - **Deletion markers**: Pages or objects marked for removal
-   - **Command history**: Stack of reversible operations for undo/redo
-   - **Incremental serialization**: Writes changes as PDF incremental updates
-
-**Key Insight**: The viewer layers (1-4) remain completely unchanged and read-only. The delta layer (5) sits on top, intercepting object requests and applying modifications before rendering.
+The project is a **composable core library** (`pdf-x-core`) at the bottom, used by platform shells (`tauri-app`, future web/wasm shells) on top. The dependency direction is strict: the core never depends on a shell concern.
 
 ```
-User/Editor Interface
-        ↓
-   Delta Layer (modifications, command history)
-        ↓ merges with
-   Rendering Engine (applies delta to base objects)
-        ↓
-   Document/Parser Layers (immutable base PDF)
-        ↓
-   Data Source Layer (progressive, chunked loading)
+                  Shells (platform-specific I/O, async, threading, UI)
+        native (tokio / blocking)    web/wasm (fetch, canvas)    tests (Vec<u8>)
+                  \                        |                        /
+                   \   fulfill Need::Range requests + drive loop   /
+                    ╔══════════════════════════════════════════════╗
+                    ║   pdf-x-core  (sync, runtime-free)           ║
+                    ║  DocStore (delta → base) ── Resolver      ║
+                    ║  Parser · XRef · Crypto · Fonts              ║
+                    ║  Interpreter ──> Device trait                ║
+                    ╚══════════════════════════════════════════════╝
+        Device backends as separate crates/adapters: tiny-skia (now), vello/sitro, canvas-2d (wasm)
 ```
+
+### The Three Foundational Decisions
+
+These three decisions are load-bearing and must be respected by all code. They are what make the goal (progressive + WASM-clean + editor-ready) simultaneously achievable.
+
+#### A. The core is pure synchronous Rust; all I/O and async live in shell adapters
+
+The core must not hard-depend on, or internally drive, an async runtime (tokio/async-std/smol), must not `.await`, and must not spawn or assume OS threads. Concretely: **no baked-in runtime or threading.**
+
+- The core defines a **synchronous, pull-based data protocol**: when it needs bytes it does not have, it returns a *value* — `Need::Range(pos, len)` — not a thrown exception and not a future.
+- The **shell owns the load-and-retry loop** and fulfills those requests with platform-appropriate I/O: blocking file read on native, async `fetch` on web, in-memory bytes in tests.
+
+| Concern | Lives in… | Examples |
+|---|---|---|
+| Async runtime, `.await`, tasks | **Shell** | tokio (native), promises (web), none (tests) |
+| Thread spawning, parallelism | **Shell** | parallel page render over snapshots |
+| Blocking I/O, network, filesystem | **Shell** | `fs::read`, `fetch` |
+| Parsing, resolution, interpretation, the `Need::Range` protocol, the doc store, caching | **Core** | plain sync `fn`, owned data |
+
+What this rule does **not** mean:
+- It does **not** forbid multithreading. A native shell may render pages in parallel over immutable `ResolvedPage` snapshots. The core provides thread-safe owned data; the shell orchestrates threads.
+- It does **not** forbid `Send + Sync`. The opposite — core public types should be `Send + Sync` (owned data, no `Rc`/`RefCell` in the public API) so a native shell can move them across threads while the same types also run on single-threaded WASM.
+- It does **not** forbid caching/mutation. The `DocStore` mutates and caches freely — it just does not spawn threads or drive a runtime to do so.
+
+#### B. A central DocStore is the single resolution point: `delta → base`, always
+
+One `DocStore` owns the progressively-loaded base (+ its caches) **and** the `DeltaLayer`. **Every** object lookup — including the viewer's — goes through `store.resolve(ref)` = `delta.or_else(base)`, from day one, even with an empty delta.
+
+- Caches live **inside** the store and are invalidated by delta mutations. Nothing outside the store caches object lookups, so there is no stale-cache class of bugs.
+- The store mutates freely for caching and editing. Because WASM is single-threaded and native shells serialize store access, there is no aliasing problem — no `BaseObjectFetcher` function-pointer dodge, no `&mut XRef` threaded through every render call.
+- Bonus: a delta override is *local*, so `delta → base` resolution skips a remote fetch for overridden objects. Editing and progressive loading cooperate rather than fight.
+
+This is what "editor-ready by construction" means: the resolution seam **is** the foundation, so the editor is added by populating the delta with zero viewer refactor.
+
+#### C. Resolve-then-interpret: the progressive contract is owned by the resolver, never seen by the interpreter
+
+Progressive loading is a hard requirement on every source, but the complexity is quarantined to one phase:
+
+- **Resolve phase**: walks a page's object graph on demand, emits `Need::Range` requests, may suspend/resume. It owns **all** the progressive-loading complexity. Resolution is naturally idempotent (re-walking a graph), so it is safe to retry.
+- **Interpret phase**: content-stream → `Device` operations, a **pure synchronous function over a fully-resolved, immutable `ResolvedPage`**. It never blocks, never sees missing data, and never needs to be restartable.
+
+This deletes the old "interpretation may fail mid-stream and must cleanly restart" invariant — an undeclared, easy-to-violate hazard. Only the resolver can fail on missing data; interpretation is a pure function: testable, parallelizable, WASM-safe.
+
+`ResolvedPage` is immutable, self-contained, `Send + Sync + 'static`. So native shells render pages in parallel off snapshots, while the single-threaded store keeps being edited. Edits mutate the store; the next render resolves a fresh snapshot. This snapshot model is also the natural basis for future collaboration (a snapshot ≈ a diff against base).
+
+**Fast first paint is preserved**: for a linearized PDF, page 1's object graph sits at the front of the file, so the resolver fetches just those objects and the interpreter renders page 1 before the rest downloads. Linearization is what makes resolve-then-interpret give progressive display — the two belong together.
 
 ## Development Commands
 
@@ -196,44 +217,45 @@ The Data Source Layer must provide a trait/interface that all loaders implement,
 
 Reference `pdf.js/src/core/stream.js` and `pdf.js/src/core/chunked_stream.js` for implementation patterns.
 
-### **CRITICAL RULE: Exception-Driven Progressive Loading**
+### **CRITICAL RULE: Progressive Loading via a Pull-Based Protocol**
 
 This is a **NON-NEGOTIABLE** architectural principle that MUST be followed in all code:
 
-**Load as little PDF data as possible. Operations should attempt to proceed with available data and raise exceptions when data is missing. The caller catches these exceptions, loads the required chunks, and retries the operation.**
+**Load as little PDF data as possible. The core never blocks for data and never loads the whole file. When data is missing, the core returns a `Need::Range(pos, len)` value; the shell fulfills it and re-drives the operation.**
 
-This follows PDF.js's exception-driven data loading pattern:
+This is the value-returning refinement of PDF.js's exception-driven loading. The earlier formulation — a `PDFError::DataMissing` exception permeating every layer, with `&mut XRef` threaded through every call — violates the goals of extensibility, performance, and correctness (it is not WASM-clean, not parallelizable, and rests on an undeclared "every layer must be restartable" invariant). The **goal** (progressive, bounded memory, on every source) is unchanged; only the **mechanism** is replaced, per the resolve-then-interpret decision (C above).
 
 ```rust
-// ✅ CORRECT APPROACH - Exception-driven loading
+// ✅ CORRECT — core returns a data *request*; shell owns the load+retry loop
 loop {
-    match parser.parse_xref() {
-        Ok(result) => break result,
-        Err(PDFError::DataMissing { position, length }) => {
-            // Load the missing chunk
-            stream.ensure_range(position, length)?;
-            // Retry the operation - it will now succeed or fail with a different missing range
-            continue;
-        }
-        Err(e) => return Err(e), // Other errors propagate
+    match resolver.step() {
+        Ok(resolved) => break resolved,                 // fully-resolved, in-memory model
+        Need::Range(pos, len) => provider.fill(pos, len)?, // shell: blocking read / fetch / Vec
     }
 }
+// Interpretation then runs as a pure sync fn over `resolved` — never sees missing data.
 ```
 
 ```rust
-// ❌ WRONG APPROACH - Loading all data upfront (NEVER DO THIS)
+// ❌ WRONG — loading all data upfront (NEVER DO THIS)
 let all_data = stream.get_all_bytes()?; // Violates progressive loading
 parser.parse_xref(&all_data)?;
 ```
 
+```rust
+// ❌ WRONG — interpretation that can fail mid-stream on missing data
+// Interpretation must run over a fully-resolved page (decision C). Only the resolver may
+// emit Need::Range; the interpreter must be a pure function that never blocks.
+```
+
 **Implementation Requirements:**
 
-1. **Never preload data**: Don't use methods like `read_all()`, `load_complete()`, or similar patterns
-2. **Define DataMissing error**: Create a `PDFError::DataMissing { position: usize, length: usize }` variant
-3. **Throw on missing data**: When a read operation would require unavailable data, immediately throw `DataMissing`
-4. **Retry loops at call sites**: Callers implement retry loops that load chunks and retry operations
-5. **Minimal chunk requests**: Request only the specific byte range needed, not arbitrary large chunks
-6. **No buffering layers**: Don't add caching/buffering that hides the progressive nature from upper layers
+1. **Never preload data**: no `read_all()`, `load_complete()`, or whole-file patterns
+2. **Express missing data as a value**: core operations return `Need::Range { position, length }` (or the legacy `PDFError::DataMissing` in paths not yet migrated), not a future and not a thrown exception that callers must `.await`
+3. **Quarantine the contract to the resolver**: only the resolve phase may request data; the interpret phase is pure and never blocks
+4. **Shell owns the loop**: retry/load loops live in shell adapters, never in the core
+5. **Minimal chunk requests**: request only the specific byte range needed
+6. **No buffering layers that hide progressivity**: caches belong inside the `DocStore`, not scattered across layers
 
 **When Evaluating External Crates:**
 
@@ -302,34 +324,35 @@ If a feature cannot be implemented with progressive loading, it should be redesi
 
 ## Delta Layer Architecture
 
-The **Delta Layer** is PDF-X's innovation that enables editing capabilities without sacrificing the viewer's performance. It implements a **command pattern** with **incremental updates** to track and persist document changes.
+The **Delta Layer** enables editing while keeping the base PDF untouched, and is **wired into object resolution from day one** (decision B). v1 ships with an empty delta; editor features are added by populating it.
 
 ### Core Design Principles
 
-1. **Immutable Base, Mutable Delta**: The base PDF loaded by the viewer is never modified. All changes are tracked in a separate delta structure.
-2. **Override Resolution**: When requesting an object, check delta first (modifications override base), then fall back to viewer.
-3. **Command Pattern**: All edits are executed as reversible commands, enabling natural undo/redo.
-4. **Incremental Persistence**: Changes are saved as PDF incremental updates (appended to original file, per PDF specification).
+1. **Single resolution point**: object lookup always goes through `DocStore::resolve(ref)` = `delta → base`. The delta is checked first (cheap, local) and may even *avoid* a remote fetch for overridden objects.
+2. **State-diff ≠ undo-log**: the `DeltaLayer` stores the **mergeable, serializable object-level state diff** (modified / new / deleted objects). The **command/undo history is a separate, local-only layer** — it is never serialized, merged, or transported. Conflating the two (as an earlier draft did) makes collaboration and session-resume ill-defined.
+3. **Command Pattern (local only)**: edits are executed as reversible commands for natural undo/redo within one session; they are not the unit of merge or persistence.
+4. **Incremental Persistence**: changes are saved as PDF incremental updates (appended to the original file, per PDF spec §7.5.6).
+5. **Reference-graph awareness** *(open design point)*: deleting or renumbering an object must fix up dangling `Ref`s elsewhere; the data model must account for this, not just a `HashSet` of deleted ids.
 
 ### Delta Layer Structure
 
 ```rust
+/// The mergeable, serializable state diff. This is what persists and what
+/// collaboration would merge. It contains NO command history.
 pub struct DeltaLayer {
-    // Object modifications: object_number -> replacement object
-    modified_objects: HashMap<ObjectId, PDFObject>,
-
-    // New objects added to the document (annotations, pages, etc.)
-    new_objects: Vec<PDFObject>,
-
-    // Objects/pages marked for deletion
-    deleted_objects: HashSet<ObjectId>,
-
-    // Command history for undo/redo
-    command_history: Vec<Box<dyn Command>>,
-    undo_stack: Vec<Box<dyn Command>>,
+    modified_objects: HashMap<ObjectId, PDFObject>, // overrides base
+    new_objects: Vec<DeltaObject>,                  // annotations, pages, form values
+    deleted_objects: HashSet<ObjectId>,             // marked for removal
+    next_obj_num: u32,
 }
 
-// All edits are reversible commands
+/// Local-only undo/redo log. Lives in the session/editor, NOT in the delta.
+/// Never serialized, never merged across users.
+pub struct CommandHistory {
+    undo_stack: Vec<Box<dyn Command>>,
+    redo_stack: Vec<Box<dyn Command>>,
+}
+
 pub trait Command {
     fn execute(&mut self, delta: &mut DeltaLayer) -> Result<(), PDFError>;
     fn undo(&mut self, delta: &mut DeltaLayer) -> Result<(), PDFError>;
@@ -337,24 +360,23 @@ pub trait Command {
 }
 ```
 
-### Object Resolution with Deltas
+### Object Resolution (in the DocStore)
 
-The rendering engine queries objects through a resolution function that merges base and delta:
+The `DocStore` is the only place object resolution happens; both viewer and editor go through it:
 
 ```rust
-fn resolve_object(object_number: ObjectId) -> Result<PDFObject, PDFError> {
-    // 1. Check delta layer first (modifications override base)
-    if let Some(obj) = delta_layer.get_modified(object_number) {
-        return Ok(obj.clone());
+impl DocStore {
+    fn resolve(&mut self, id: ObjectId) -> PDFResult<PDFObject> {
+        // 1. Delta override first (local, may avoid a remote fetch)
+        if let Some(obj) = self.delta.get_modified(id) {
+            return Ok(obj.clone());
+        }
+        if self.delta.is_deleted(id) {
+            return Err(PDFError::ObjectDeleted(id));
+        }
+        // 2. Fall back to base (progressive loading, may emit Need::Range)
+        self.base.get_object(id)
     }
-
-    // 2. Check if deleted
-    if delta_layer.is_deleted(object_number) {
-        return Err(PDFError::ObjectDeleted(object_number));
-    }
-
-    // 3. Fall back to base PDF (progressive loading)
-    viewer.get_object(object_number)  // Existing viewer code
 }
 ```
 
@@ -423,21 +445,19 @@ let command = AddAnnotationCommand {
     annotation: Annotation::highlight(100, 200, 300, 50, Color::Yellow),
 };
 
-// Execute command
-command.execute(&mut delta_layer)?;
+// Execute against the store's delta (local undo log records it)
+command.execute(store.delta_mut())?;
 
-// Delta layer now contains:
+// The delta now contains:
 // 1. New annotation object (e.g., 123 0 obj)
 // 2. Modified page object: /Annots [ ... 123 0 R ]
-// 3. Command in history for undo
 
-// When rendering page 5:
-let base_page = viewer.load_page(5)?;  // Progressive load
-let modified_page = delta_layer.apply_to_page(base_page)?;
-renderer.render(modified_page);
+// Rendering page 5 — resolve-then-interpret (decisions B + C):
+let resolved: ResolvedPage = store.resolve_page(5)?; // delta → base; may emit Need::Range
+interpreter.render(&resolved, &mut device)?;         // pure sync fn over immutable model
 
-// User can undo
-command.undo(&mut delta_layer)?;
+// Undo (local session only)
+command.undo(store.delta_mut())?;
 ```
 
 ### Advantages Over Traditional Editor
@@ -453,84 +473,75 @@ command.undo(&mut delta_layer)?;
 
 ### Collaboration Potential
 
-The delta layer architecture naturally supports collaborative editing:
+Because the **mergeable state-diff is separated from the local undo-log**, collaboration is well-defined:
 
-- Deltas can be serialized independently from base PDF
-- Multiple users' changes can be merged (like Git branches)
-- Conflict resolution for overlapping edits
-- Operational transformation or CRDT patterns applicable
+- The object-level `DeltaLayer` (state diff) is serializable and mergeable — this is the unit transported and merged across users.
+- The command/undo history is **local-only** and never merged; undo stacks are expected to diverge after a merge, which is correct.
+- Snapshots of `ResolvedPage` against the base double as natural diff points (snapshot ≈ diff against base).
+- Conflict resolution / CRDT patterns apply to the state diff, not to commands.
 
 ### Implementation Roadmap
 
-**Phase 1: Delta Foundation**
-- Core `DeltaLayer` struct with modification tracking
-- Object resolution with override logic
-- Basic serialization to incremental PDF format
+**Phase 0: Architectural Foundation (current focus)**
+- Introduce `DocStore` as the single `delta → base` resolution point
+- Migrate progressive loading to the pull-based `Need::Range` protocol owned by shells
+- Establish resolve-then-interpret: `ResolvedPage` as the immutable, `Send + Sync` render model
+- Move runtime/threading/rendering-backend concerns out of the core behind traits
 
-**Phase 2: Command Infrastructure**
-- Command trait and common commands
-- Undo/redo stacks
-- Command history serialization
+**Phase 1: Viewer Core (ships first)**
+- Complete content-stream interpretation over `ResolvedPage`
+- Font and image handling; text extraction
+- Linearized-PDF fast first paint through the resolver
 
-**Phase 3: Editing Operations**
-- Annotation commands (highlight, note, drawing)
-- Page manipulation (rotate, delete, reorder)
-- Form field value storage
+**Phase 2: Delta Foundation (already scaffolded; wire it in)**
+- `DeltaLayer` state diff populated through the store's resolution path
+- Basic incremental PDF writer (exists)
+- Reference-graph fix-up on delete/renumber
+
+**Phase 3: Editor Features (populate the delta)**
+- Annotation commands; page rotate/delete/reorder; form field values
+- Local command/undo history
 
 **Phase 4: Advanced Operations**
-- Content stream modification
-- Image replacement
-- Redaction tools
+- Content-stream modification, image replacement, redaction
 
 **Phase 5: Collaboration** (Future)
-- Delta serialization format
-- Merge algorithms
-- Conflict resolution
+- Delta serialization format, merge algorithms, conflict resolution over the state diff
 
 
 
 ## Current Project Status
 
-The project has **core viewer infrastructure** implemented with progressive loading support. Current capabilities include:
+The viewer pipeline (layers now expressed as core phases) is implemented end-to-end: `PDFDocument::open` → xref/parser → `Page::render` → `ContentStreamEvaluator` → `RenderingContext` → `SkiaDevice` → RGBA pixels, exposed through the Tauri app.
 
 **Implemented**:
 - ✅ Core PDF parsing (document structure, xref, objects)
-- ✅ Encryption/decryption support
-- ✅ Basic annotation parsing
-- ✅ Outline (bookmark) extraction with page indices
-- ✅ Inspector GUI for document exploration
-- ✅ Tauri-based desktop application framework
+- ✅ Encryption/decryption (RC4, AES-128, AES-256)
+- ✅ Annotation parsing, outline extraction with page indices
+- ✅ Content-stream interpretation + tiny-skia rendering (`render_page_to_image`)
+- ✅ Chunked data sources (file / HTTP / async HTTP / memory) — the loader machinery exists
+- ✅ Delta scaffolding (`DeltaLayer`, `Command` trait, `RotatePageCommand`, `PDFWriter::write_incremental_update`)
 
-**In Development**:
-- 🔄 Complete progressive/lazy loading (exception-driven data fetching)
-- 🔄 Content stream parsing and rendering
-- 🔄 Text extraction and search
-- 🔄 Delta layer foundation (next major milestone)
+**Architectural gaps to close (Phase 0)** — the foundation work the rest depends on:
+- 🔄 **Delta is not wired into resolution**: `Page::render` reads straight from the base xref; the `delta → base` resolution point (`DocStore`) does not exist yet. The editor layer is standalone scaffolding.
+- 🔄 **Progressive loading uses the legacy exception form**: `DataMissing` is threaded as an error and `&mut XRef` is passed through every call — this must migrate to the pull-based `Need::Range` protocol owned by shells (decision A/C).
+- 🔄 **No resolve-then-interpret boundary**: there is no immutable `ResolvedPage`; interpretation and data access are interleaved, which blocks parallel rendering and WASM cleanliness.
+- 🔄 **Core still feature-flags shell concerns**: rendering (`tiny-skia`) and HTTP (`reqwest`/`tokio`) are pulled into the core; these must move behind traits/adapters for the core to be composable and WASM-clean.
 
-**Priorities**:
+**Priorities** (viewer ships first, editor-ready by construction):
 
-1. **Complete Viewer Core**: Finish progressive rendering pipeline
-   - Content stream interpretation (graphics operators)
-   - Font and image handling
-   - Text extraction for search
-
-2. **Delta Layer Foundation**: Begin hybrid architecture implementation
-   - Core `DeltaLayer` struct with modification tracking
-   - Object resolution with override logic
-   - Basic incremental PDF writer
-   - Command pattern infrastructure
-
-3. **Initial Editing Features**: Low-hanging fruit for delta layer
-   - Annotation rendering and creation
-   - Page rotation
-   - Form field display and filling
+1. **Phase 0 — Foundation**: introduce `DocStore`, migrate to `Need::Range`, establish `ResolvedPage`, move runtime/rendering behind traits
+2. **Phase 1 — Viewer Core**: complete interpretation over `ResolvedPage`, fonts/images, text extraction, linearized fast first paint
+3. **Phase 2+ — Editor**: populate the delta (annotations, page ops, forms) once the resolution seam is real
 
 **Development Guidelines**:
 - Reference PDF.js implementations before writing new components
 - Follow Rust idioms (no direct translation of JavaScript patterns)
-- Maintain strict separation: viewer core remains immutable, all mutations through delta layer
-- Test progressive loading with network resources (not just local files)
-- Incremental updates should be the default save mechanism
+- Keep the core sync, runtime-free, and `Send + Sync`; put I/O/async/threading/rendering backends in shells and adapters
+- Resolution always goes through the `DocStore` (`delta → base`) — never read objects directly from the base xref
+- Interpretation runs only over a fully-resolved `ResolvedPage`; only the resolver may emit `Need::Range`
+- Test progressive loading with network resources (not just local files) and with a sync in-memory driver
+- Incremental updates are the default save mechanism
 
 ## Key PDF Concepts
 
