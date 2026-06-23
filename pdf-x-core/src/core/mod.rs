@@ -36,7 +36,7 @@ pub use annotation::{
     PopupAnnotation, TextAnnotation, WidgetAnnotation,
 };
 pub use base_stream::BaseStream;
-pub use byte_source::{BaseStreamSource, ByteSource, MemoryByteSource, Need, StepErr, drive};
+pub use byte_source::{BaseStreamSource, ByteSource, Loadable, MemoryByteSource, Need, StepErr, drive};
 pub use chunk_manager::{ChunkLoader, ChunkManager};
 pub use cmap::CMap;
 pub use content_stream::{ContentStreamEvaluator, OpCode, Operation, TextItem};

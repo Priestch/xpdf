@@ -1,4 +1,5 @@
 use super::base_stream::BaseStream;
+use super::byte_source::Loadable;
 use super::decode;
 use super::error::{PDFError, PDFResult};
 use super::lexer::Lexer;
@@ -62,6 +63,36 @@ pub struct XRef {
 
     /// Stream to read PDF data from
     stream: Box<dyn BaseStream>,
+}
+
+/// `XRef` participates in the pull-based [`drive`](crate::core::byte_source::drive) loop:
+/// its backing stream is the loadable data, and operations like `parse`/`fetch` may emit
+/// `DataMissing` (adapted to [`Need`](crate::core::byte_source::Need) at the drive
+/// boundary via [`StepErr::adapt`](crate::core::byte_source::StepErr::adapt)).
+///
+/// Only `ensure_range` + `len` are needed (drive never probes bytes through `get`), so
+/// `XRef` implements [`Loadable`], not the full [`ByteSource`](crate::core::byte_source::ByteSource).
+impl Loadable for XRef {
+    fn ensure_range(&mut self, pos: u64, len: usize) -> PDFResult<()> {
+        let pos = usize::try_from(pos)
+            .map_err(|_| PDFError::Generic(format!("ensure_range position {pos} overflows usize")))?;
+        self.stream.ensure_range(pos, len)
+    }
+
+    /// Stream length in bytes.
+    ///
+    /// Note: `XRef` also has an inherent [`XRef::len`](struct.XRef.html#method.len) that
+    /// returns the **entry count**. That inherent method shadows this trait method on
+    /// direct `xref.len()` calls, so `is_empty` is overridden below to reference the
+    /// trait explicitly. `drive` does not call `len`, so the dual naming is harmless for
+    /// the protocol.
+    fn len(&self) -> u64 {
+        self.stream.length() as u64
+    }
+
+    fn is_empty(&self) -> bool {
+        Loadable::len(self) == 0
+    }
 }
 
 impl XRef {

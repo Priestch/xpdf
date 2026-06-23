@@ -64,27 +64,18 @@ impl Need {
     }
 }
 
-/// Shell-provided byte access behind the pull-based protocol.
+/// Minimum a [`drive`] source must provide: the ability to load a byte range and report
+/// total length.
 ///
-/// `get` is a **cheap, non-blocking probe**: it returns the range if it is already
-/// available locally, or `Err(Need::Range)` to ask the shell to load it first. `get`
-/// MUST NOT block. Blocking/async loading happens in [`ByteSource::ensure_range`]
-/// (native: blocks; web/wasm: driven by an async shell loop around the same `op`).
-///
-/// Positions are `u64` to support large files on 32-bit/WASM targets where `usize`
-/// would cap at 4 GiB. The Step 3 bridge casts to/from the existing `usize` positions.
-pub trait ByteSource {
-    /// Return `[pos, pos+len)` if the *entire* range is available locally;
-    /// otherwise `Err(Need::Range { pos, len })`.
-    ///
-    /// Callers should bound-check against [`ByteSource::len`] before requesting:
-    /// a range beyond EOF also yields `Err(Need::Range)`, which [`drive`] converts
-    /// into a no-progress error rather than spinning.
-    fn get(&mut self, pos: u64, len: usize) -> Result<&[u8], Need>;
-
+/// [`drive`] only ever calls [`Loadable::ensure_range`] (never a byte *read*) — the
+/// driven `op` performs its own reads through whatever it owns. Splitting this out from
+/// [`ByteSource`] lets types that own their bytes but aren't random-access probes (e.g.
+/// [`crate::core::XRef`], which reads sequentially through its stream) participate in
+/// `drive` without implementing a `get` probe they don't need.
+pub trait Loadable {
     /// Make `[pos, pos+len)` available locally. Cheap/no-op for fully-loaded sources;
-    /// performs I/O for progressive ones. Returns an error if loading fails or the
-    /// range is beyond EOF.
+    /// performs I/O for progressive ones. Returns an error if loading fails or the range
+    /// is beyond EOF.
     fn ensure_range(&mut self, pos: u64, len: usize) -> PDFResult<()>;
 
     /// Total length of the underlying data, in bytes.
@@ -94,6 +85,25 @@ pub trait ByteSource {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Shell-provided byte access behind the pull-based protocol.
+///
+/// `get` is a **cheap, non-blocking probe**: it returns the range if it is already
+/// available locally, or `Err(Need::Range)` to ask the shell to load it first. `get`
+/// MUST NOT block. Blocking/async loading happens in [`Loadable::ensure_range`]
+/// (native: blocks; web/wasm: driven by an async shell loop around the same `op`).
+///
+/// Positions are `u64` to support large files on 32-bit/WASM targets where `usize`
+/// would cap at 4 GiB. The Step 3 bridge casts to/from the existing `usize` positions.
+pub trait ByteSource: Loadable {
+    /// Return `[pos, pos+len)` if the *entire* range is available locally;
+    /// otherwise `Err(Need::Range { pos, len })`.
+    ///
+    /// Callers should bound-check against [`Loadable::len`] before requesting:
+    /// a range beyond EOF also yields `Err(Need::Range)`, which [`drive`] converts
+    /// into a no-progress error rather than spinning.
+    fn get(&mut self, pos: u64, len: usize) -> Result<&[u8], Need>;
 }
 
 /// In-memory [`ByteSource`] over an owned byte buffer.
@@ -120,6 +130,17 @@ impl MemoryByteSource {
     }
 }
 
+impl Loadable for MemoryByteSource {
+    fn ensure_range(&mut self, _pos: u64, _len: usize) -> PDFResult<()> {
+        // All in-bounds data is already present.
+        Ok(())
+    }
+
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+
 impl ByteSource for MemoryByteSource {
     fn get(&mut self, pos: u64, len: usize) -> Result<&[u8], Need> {
         let start = usize::try_from(pos).map_err(|_| Need::range(pos, len))?;
@@ -130,15 +151,6 @@ impl ByteSource for MemoryByteSource {
             return Err(Need::range(pos, len));
         }
         Ok(&self.data[start..end])
-    }
-
-    fn ensure_range(&mut self, _pos: u64, _len: usize) -> PDFResult<()> {
-        // All in-bounds data is already present.
-        Ok(())
-    }
-
-    fn len(&self) -> u64 {
-        self.data.len() as u64
     }
 }
 
@@ -165,6 +177,19 @@ impl<'a> BaseStreamSource<'a> {
     }
 }
 
+impl Loadable for BaseStreamSource<'_> {
+    fn ensure_range(&mut self, pos: u64, len: usize) -> PDFResult<()> {
+        let pos = usize::try_from(pos).map_err(|_| {
+            PDFError::Generic(format!("ensure_range position {pos} overflows usize"))
+        })?;
+        self.stream.ensure_range(pos, len)
+    }
+
+    fn len(&self) -> u64 {
+        self.stream.length() as u64
+    }
+}
+
 impl ByteSource for BaseStreamSource<'_> {
     fn get(&mut self, pos: u64, len: usize) -> Result<&[u8], Need> {
         let start = usize::try_from(pos).map_err(|_| Need::range(pos, len))?;
@@ -182,17 +207,6 @@ impl ByteSource for BaseStreamSource<'_> {
             // error rather than spinning.
             Err(_) => Err(Need::range(pos, len)),
         }
-    }
-
-    fn ensure_range(&mut self, pos: u64, len: usize) -> PDFResult<()> {
-        let pos = usize::try_from(pos).map_err(|_| {
-            PDFError::Generic(format!("ensure_range position {pos} overflows usize"))
-        })?;
-        self.stream.ensure_range(pos, len)
-    }
-
-    fn len(&self) -> u64 {
-        self.stream.length() as u64
     }
 }
 
@@ -253,11 +267,25 @@ impl From<PDFError> for StepErr {
 /// equivalent async loop around the same `op` (the core contains no runtime).
 pub fn drive<S, T, O>(source: &mut S, mut op: O) -> PDFResult<T>
 where
-    S: ByteSource,
+    S: Loadable,
     O: FnMut(&mut S) -> Result<T, StepErr>,
 {
+    // Safety cap: the no-progress guard only catches *consecutive identical* Needs. A
+    // non-restartable op can emit an endless sequence of *distinct* Needs (re-reading
+    // from a mid-stream position each retry), which would loop forever. This generous
+    // bound turns that into an error instead of a hang. Legitimate progressive loads of
+    // very large documents stay well under this.
+    const MAX_DRIVE_STEPS: usize = 65_536;
+
     let mut last: Option<Need> = None;
+    let mut steps = 0usize;
     loop {
+        steps += 1;
+        if steps > MAX_DRIVE_STEPS {
+            return Err(PDFError::Generic(format!(
+                "drive: exceeded {MAX_DRIVE_STEPS} steps (op is likely not restartable)"
+            )));
+        }
         match op(source) {
             Ok(value) => return Ok(value),
             Err(StepErr::Fatal(err)) => return Err(err),
@@ -344,21 +372,7 @@ mod tests {
         }
     }
 
-    impl ByteSource for LazySource {
-        fn get(&mut self, pos: u64, len: usize) -> Result<&[u8], Need> {
-            let start = usize::try_from(pos).map_err(|_| Need::range(pos, len))?;
-            let end = start
-                .checked_add(len)
-                .ok_or_else(|| Need::range(pos, len))?;
-            if end > self.data.len() {
-                return Err(Need::range(pos, len));
-            }
-            if !(start..end).all(|i| self.loaded[i]) {
-                return Err(Need::range(pos, len));
-            }
-            Ok(&self.data[start..end])
-        }
-
+    impl Loadable for LazySource {
         fn ensure_range(&mut self, pos: u64, len: usize) -> PDFResult<()> {
             let start = usize::try_from(pos).map_err(|_| {
                 PDFError::Generic(format!("ensure_range position {pos} overflows usize"))
@@ -380,6 +394,22 @@ mod tests {
 
         fn len(&self) -> u64 {
             self.data.len() as u64
+        }
+    }
+
+    impl ByteSource for LazySource {
+        fn get(&mut self, pos: u64, len: usize) -> Result<&[u8], Need> {
+            let start = usize::try_from(pos).map_err(|_| Need::range(pos, len))?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| Need::range(pos, len))?;
+            if end > self.data.len() {
+                return Err(Need::range(pos, len));
+            }
+            if !(start..end).all(|i| self.loaded[i]) {
+                return Err(Need::range(pos, len));
+            }
+            Ok(&self.data[start..end])
         }
     }
 
@@ -436,16 +466,19 @@ mod tests {
         }
     }
 
-    impl<S: ByteSource> ByteSource for RecordingSource<S> {
-        fn get(&mut self, pos: u64, len: usize) -> Result<&[u8], Need> {
-            self.requested.push((pos, len));
-            self.inner.get(pos, len)
-        }
+    impl<S: ByteSource> Loadable for RecordingSource<S> {
         fn ensure_range(&mut self, pos: u64, len: usize) -> PDFResult<()> {
             self.inner.ensure_range(pos, len)
         }
         fn len(&self) -> u64 {
             self.inner.len()
+        }
+    }
+
+    impl<S: ByteSource> ByteSource for RecordingSource<S> {
+        fn get(&mut self, pos: u64, len: usize) -> Result<&[u8], Need> {
+            self.requested.push((pos, len));
+            self.inner.get(pos, len)
         }
     }
 
@@ -562,5 +595,22 @@ mod tests {
         assert_eq!(src.len() as usize, data.len());
         // In-memory base stream is fully loaded, so ensure_range is a no-op.
         src.ensure_range(0, 5).expect("ensure_range is a no-op on a loaded base stream");
+    }
+
+    #[test]
+    fn xref_is_loadable_over_its_backing_stream() {
+        use crate::core::stream::Stream;
+        use crate::core::xref::XRef;
+        let data = classic_pdf();
+        let stream = Box::new(Stream::from_bytes(data.clone())) as Box<dyn BaseStream>;
+        let mut xref = XRef::new(stream);
+
+        // Loadable::len is the backing stream length (NOT the inherent XRef::len, which
+        // is the entry count).
+        assert_eq!(Loadable::len(&xref), data.len() as u64);
+        // In-memory backing stream is fully loaded → ensure_range delegates as a no-op.
+        xref
+            .ensure_range(0, 5)
+            .expect("ensure_range delegates as a no-op on a loaded backing stream");
     }
 }
