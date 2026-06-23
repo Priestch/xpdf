@@ -529,10 +529,12 @@ The viewer pipeline (layers now expressed as core phases) is implemented end-to-
   `retry_on_data_missing!` because `XRef::parse` is not restartable (the migration hung; see
   the note in `document.rs`). A `MAX_DRIVE_STEPS` cap guards against the hang class.
 - ✅ **`DocStore`** (decision B): `delta → base` resolution authority, borrowed over
-  `(&mut XRef, &mut DeltaLayer)`. `get_page_dict` and `resolve_page` route through it.
-  ⚠️ **The gate is not enforced**: `Page::render` / `extract_text` / `render_page_to_image`
-  still take `&mut XRef` and bypass `DocStore`, so delta edits to `/Resources`/`/Contents`
-  do **not** yet affect rendered output. Enforced routing lands with the render-pipeline rewire.
+  `(&mut XRef, &mut DeltaLayer)`. `get_page_dict`, `resolve_page`, and `Page::render`
+  (via `render_page_to_image`) route through it.
+  ⚠️ **The gate is partially enforced**: `Page::render` is delta-aware for `/Contents`
+  (a delta override changes rendered output — tested), but nested resource fetches
+  (fonts/xobjects/ext-gstate) still go through the base `XRef`, so deep `/Resources`
+  overrides aren't yet honored. `extract_text` still bypasses `DocStore` entirely.
 - 🔄 **Resolve-then-interpret** (decision C): `ResolvedPage` type + `DocStore::resolve_page`
   (delta-aware, tested incl. a delta-override seam proof) + a pure-signature
   `rendering::interpret` stub. ⚠️ The render pipeline is **not** rewired to consume

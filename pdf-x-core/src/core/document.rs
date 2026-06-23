@@ -737,12 +737,14 @@ impl PDFDocument {
         use crate::rendering::{Device, SkiaDevice};
         use tiny_skia::Pixmap;
 
-        // Get the page
+        // Get the page and a DocStore (delta → base). The whole render resolves through
+        // the store so delta overrides of /Contents (and page-level data) are honored.
         let page = self.get_page(page_index)?;
+        let mut store = self.doc_store_mut();
 
         // Reference: pdf.js/src/core/document.js - Page.view and Page.rotate
-        let [x0, y0, x1, y1] = page.resolve_view_box_for_rendering(&mut self.xref);
-        let rotation = page.resolve_rotate_for_rendering(&mut self.xref);
+        let [x0, y0, x1, y1] = page.resolve_view_box_for_rendering(store.xref_mut());
+        let rotation = page.resolve_rotate_for_rendering(store.xref_mut());
 
         let page_width = x1 - x0;
         let page_height = y1 - y0;
@@ -807,8 +809,8 @@ impl PDFDocument {
                 - rotate_d * scale as f64 * center_y,
         ]);
 
-        // Render the page
-        page.render(&mut self.xref, &mut device)?;
+        // Render the page through the DocStore (delta-aware).
+        page.render(&mut store, &mut device)?;
 
         // Extract pixel data
         let pixels = pixmap.data().to_vec();

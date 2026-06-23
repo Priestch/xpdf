@@ -24,6 +24,39 @@ pub struct Page {
     page_ref: Option<(u32, u32)>, // (obj_num, generation)
 }
 
+/// Object resolver used by [`Page::render`], abstracting over the legacy base-only path
+/// (`&mut XRef`) and the delta-aware path (`&mut DocStore`).
+///
+/// Making `render` generic over `PageResolver` lets the same render body serve both:
+/// legacy callers pass `&mut XRef` (no delta), and `render_page_to_image` passes a
+/// `&mut DocStore` (delta-aware for `/Contents`). `resolve_if_ref` is delta-aware for
+/// `DocStore` (`delta → base`); `as_xref_mut` exposes the base `XRef` for nested fetches
+/// (view-box/resources/fonts) that are not yet delta-aware — a documented Step 4a limit.
+pub trait PageResolver {
+    /// Resolve `obj` if it is an indirect reference (delta-aware where supported).
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject>;
+    /// Base `XRef` for nested resource fetches (not delta-aware).
+    fn as_xref_mut(&mut self) -> &mut super::xref::XRef;
+}
+
+impl PageResolver for super::xref::XRef {
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
+        self.fetch_if_ref(obj)
+    }
+    fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
+        self
+    }
+}
+
+impl<'a> PageResolver for super::doc_store::DocStore<'a> {
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
+        super::doc_store::DocStore::resolve_if_ref(self, obj)
+    }
+    fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
+        super::doc_store::DocStore::xref_mut(self)
+    }
+}
+
 impl Page {
     /// Creates a new Page from a page dictionary.
     ///
@@ -107,7 +140,8 @@ impl Page {
         stop_when_found: bool,
     ) -> PDFResult<Option<PDFObject>> {
         let mut current = self.page_dict.clone();
-        let mut visited_refs: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let mut visited_refs: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::new();
         let mut values: Vec<PDFObject> = Vec::new();
 
         loop {
@@ -201,10 +235,7 @@ impl Page {
         Some([min_x, min_y, max_x, max_y])
     }
 
-    pub(crate) fn resolve_view_box_for_rendering(
-        &self,
-        xref: &mut super::xref::XRef,
-    ) -> [f64; 4] {
+    pub(crate) fn resolve_view_box_for_rendering(&self, xref: &mut super::xref::XRef) -> [f64; 4] {
         // Reference: pdf.js/src/core/document.js - Page.view
         let media_box = self
             .get_inheritable_property(xref, "MediaBox", false)
@@ -237,10 +268,12 @@ impl Page {
         let mut rotate = self
             .get_inheritable_property(xref, "Rotate", false)
             .ok()
-            .and_then(|value| value.as_ref().and_then(|obj| match obj {
-                PDFObject::Number(n) => Some(*n as i32),
-                _ => None,
-            }))
+            .and_then(|value| {
+                value.as_ref().and_then(|obj| match obj {
+                    PDFObject::Number(n) => Some(*n as i32),
+                    _ => None,
+                })
+            })
             .unwrap_or(0);
 
         if rotate % 90 != 0 {
@@ -329,7 +362,9 @@ impl Page {
                                 );
                             }
                         }
-                    } else if let Some(fallback_data) = Self::get_fallback_font_data(pdf_font.base_font()) {
+                    } else if let Some(fallback_data) =
+                        Self::get_fallback_font_data(pdf_font.base_font())
+                    {
                         if let Err(e) = device.load_font_data(&font_name, fallback_data, None) {
                             eprintln!(
                                 "Warning: Failed to load fallback font for '{}': {}",
@@ -551,24 +586,24 @@ impl Page {
     /// // Save the result
     /// pixmap.save_png("page1.png").unwrap();
     /// ```
-    pub fn render<D: crate::rendering::Device>(
+    pub fn render<D: crate::rendering::Device, R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         device: &mut D,
     ) -> PDFResult<()> {
         use super::{Lexer, Parser, Stream};
         use crate::rendering::RenderingContext;
 
         // Reference: pdf.js/src/core/document.js - Page.view (MediaBox/CropBox handling)
-        let view_box = self.resolve_view_box_for_rendering(xref);
+        let view_box = self.resolve_view_box_for_rendering(resolver.as_xref_mut());
 
         let contents = match self.contents() {
             Some(contents) => contents,
             None => return Ok(()), // No content streams to render
         };
 
-        // Dereference if it's a reference
-        let contents = xref.fetch_if_ref(contents)?;
+        // Dereference if it's a reference — delta-aware (delta → base) via the resolver.
+        let contents = resolver.resolve_if_ref(contents)?;
 
         // Handle single content stream or array of streams
         let content_streams = match contents {
@@ -596,7 +631,7 @@ impl Page {
                     }
                     seen_streams.insert(obj_key);
 
-                    match xref.fetch_if_ref(content_obj)? {
+                    match resolver.resolve_if_ref(content_obj)? {
                         PDFObject::Stream { dict, data } => {
                             streams.push((dict, data));
                         }
@@ -627,7 +662,7 @@ impl Page {
 
         // Resolve inheritable page resources once (fonts, XObjects, etc.)
         // Reference: pdf.js/src/core/document.js - #getInheritableProperty("Resources")
-        let page_resources = self.get_inheritable_resources(xref)?;
+        let page_resources = self.get_inheritable_resources(resolver.as_xref_mut())?;
 
         // Process each content stream
         let mut total_operations = 0;
@@ -667,11 +702,12 @@ impl Page {
 
             // Merge any stream-level Resources with page-level Resources.
             // Reference: pdf.js/src/core/document.js - #getMergedResources
-            let resources = self.merge_stream_resources(xref, dict.get("Resources"), &page_resources)?;
+            let resources =
+                self.merge_stream_resources(resolver.as_xref_mut(), dict.get("Resources"), &page_resources)?;
 
             // Load fonts from merged resources (for proper text rendering)
             #[cfg(feature = "rendering")]
-            self.load_fonts_for_rendering_with_resources(xref, device, resources.as_ref())?;
+            self.load_fonts_for_rendering_with_resources(resolver.as_xref_mut(), device, resources.as_ref())?;
 
             // Create a rendering context to process operations
             let mut ctx = RenderingContext::new(device);
@@ -680,7 +716,7 @@ impl Page {
             // Note: We need to extend the lifetime of the fetched resources
             // by storing it and passing a reference to the context
             if let Some(ref resources_obj) = resources {
-                ctx.set_xobject_resources(xref, resources_obj);
+                ctx.set_xobject_resources(resolver.as_xref_mut(), resources_obj);
             }
 
             // Parse and process each operation in the content stream

@@ -232,4 +232,50 @@ mod tests {
         let mut device = TestDevice::new(10.0, 10.0);
         interpret(&page, &mut device);
     }
+
+    #[test]
+    fn render_honors_delta_override_of_contents() {
+        // Step 4a proof: rendering through a DocStore honors a delta override of /Contents.
+        // The page's /Contents is "q Q\n" (save/restore). Overriding it with empty content
+        // must remove the save_state/restore_state operations from the rendered output.
+        use crate::rendering::TestDevice;
+
+        let mut doc = PDFDocument::open(pdf_with_contents()).expect("pdf should parse and open");
+        let page = doc.get_page(0).expect("page 0 should resolve");
+
+        // Baseline render: "q Q\n" → the q/Q pair becomes save_state + restore_state on
+        // top of render's own per-stream save/restore and the view-box clip.
+        let mut baseline = TestDevice::new(200.0, 300.0);
+        {
+            let mut store = doc.doc_store_mut();
+            page.render(&mut store, &mut baseline).expect("baseline render");
+        }
+        let baseline_len = baseline.operations().len();
+
+        // Override /Contents (object 4) with an EMPTY stream.
+        let mut dict: HashMap<String, PDFObject> = HashMap::new();
+        dict.insert("Length".to_string(), PDFObject::Number(0.0));
+        let empty_stream = PDFObject::Stream {
+            dict,
+            data: Vec::new(),
+        };
+        doc.doc_store_mut()
+            .delta_mut()
+            .modify_object(Ref::new(4, 0), empty_stream);
+
+        // Render again: empty content → the q/Q pair is gone.
+        let mut after = TestDevice::new(200.0, 300.0);
+        {
+            let mut store = doc.doc_store_mut();
+            page.render(&mut store, &mut after).expect("post-override render");
+        }
+
+        // The delta override changed rendered output: the q (save_state) + Q (restore_state)
+        // from the original content are no longer emitted — exactly two fewer device ops.
+        assert_eq!(
+            baseline_len,
+            after.operations().len() + 2,
+            "delta override of /Contents must remove the q/Q save-restore pair from render"
+        );
+    }
 }
