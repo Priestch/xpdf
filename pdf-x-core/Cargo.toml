@@ -49,6 +49,9 @@ tempfile = "3.14"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.5"
 hex = "0.4"
+# Isolated PNG codec for the golden render-output regression harness.
+# Acceptable per CLAUDE.md (isolated-operation codec; no full-file PDF dependency).
+png = "0.17"
 
 [[bench]]
 name = "parsing"
@@ -72,6 +75,11 @@ required-features = ["rendering"]
 [[test]]
 name = "image_rendering_test"
 path = "tests/image_rendering_test.rs"
+required-features = ["rendering"]
+
+[[test]]
+name = "render_golden"
+path = "tests/render_golden.rs"
 required-features = ["rendering"]
 
 [[example]]
