@@ -26,7 +26,7 @@
 use super::decode;
 use super::doc_store::DocStore;
 use super::error::{PDFError, PDFResult};
-use super::page::Page;
+use super::page::{Page, PageResolver};
 use super::parser::PDFObject;
 
 /// A fully-resolved, immutable, self-contained page model.
@@ -44,6 +44,11 @@ pub struct ResolvedPage {
     pub resources: PDFObject,
     /// Decoded content-stream bytes (all content streams concatenated, filters applied).
     pub contents: Vec<u8>,
+    /// Pre-resolved snapshot of every object reachable from `/Resources` (fonts, xobjects,
+    /// ext-gstate, color spaces, and their sub-objects, recursively). Captured during
+    /// `resolve_page` so `interpret` needs no live `DocStore` — it reads from this frozen
+    /// map. Keyed by `(object_num, generation)`.
+    pub objects: std::collections::HashMap<(u32, u32), PDFObject>,
 }
 
 impl<'a> DocStore<'a> {
@@ -69,11 +74,18 @@ impl<'a> DocStore<'a> {
 
         let contents = self.resolve_contents(page)?;
 
+        // Capture every object reachable from /Resources into an immutable snapshot, so
+        // `interpret` can run with no live DocStore. RenderingContext fetches resources
+        // by name from /Resources, so walking its ref-graph captures all fetch targets
+        // (fonts/xobjects/ext-gstate/color spaces + their sub-objects, recursively).
+        let objects = capture_reachable(self, &resources)?;
+
         Ok(ResolvedPage {
             view_box,
             rotation,
             resources,
             contents,
+            objects,
         })
     }
 
@@ -115,6 +127,100 @@ fn decode_stream(dict: &std::collections::HashMap<String, PDFObject>, data: &[u8
     match dict.get("Filter") {
         Some(f) => decode::apply_filters(data, f),
         None => Ok(data.to_vec()),
+    }
+}
+
+/// Resolve every object reachable from `root` (following indirect references recursively)
+/// into an immutable snapshot. `root` is typically the page's `/Resources` dictionary.
+/// This is the resolve-phase work that lets `interpret` be pure.
+fn capture_reachable(
+    store: &mut DocStore,
+    root: &PDFObject,
+) -> PDFResult<std::collections::HashMap<(u32, u32), PDFObject>> {
+    let mut snapshot: std::collections::HashMap<(u32, u32), PDFObject> =
+        std::collections::HashMap::new();
+    let mut queue: Vec<(u32, u32)> = find_refs(root);
+    while let Some(id) = queue.pop() {
+        if snapshot.contains_key(&id) {
+            continue;
+        }
+        let obj = store.resolve_ref(id.0, id.1)?;
+        queue.extend(find_refs(&obj));
+        snapshot.insert(id, obj);
+    }
+    Ok(snapshot)
+}
+
+/// Recursively collect all `(num, generation)` references inside an object (not following
+/// them — `capture_reachable` does that by resolving each).
+fn find_refs(obj: &PDFObject) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    collect_refs(obj, &mut out);
+    out
+}
+
+fn collect_refs(obj: &PDFObject, out: &mut Vec<(u32, u32)>) {
+    match obj {
+        PDFObject::Ref(r) => out.push((r.num, r.generation)),
+        PDFObject::Dictionary(d) => {
+            for v in d.values() {
+                collect_refs(v, out);
+            }
+        }
+        PDFObject::Array(a) => {
+            for e in a.iter() {
+                collect_refs(e, out);
+            }
+        }
+        PDFObject::Stream { dict, .. } => {
+            for v in dict.values() {
+                collect_refs(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A [`PageResolver`] backed by a frozen object snapshot (no live `DocStore`).
+///
+/// Used by `interpret` to run `RenderingContext` purely: `resolve_*` look up the
+/// pre-resolved snapshot, so interpretation performs no I/O and cannot block or emit `Need`.
+/// `as_xref_mut` is unreachable during interpretation (RenderingContext fetches only via
+/// `resolve_*`).
+pub struct SnapshotPageResolver<'o> {
+    objects: &'o std::collections::HashMap<(u32, u32), PDFObject>,
+}
+
+impl<'o> SnapshotPageResolver<'o> {
+    /// Wrap a frozen object snapshot as a [`PageResolver`] for pure interpretation.
+    pub fn new(objects: &'o std::collections::HashMap<(u32, u32), PDFObject>) -> Self {
+        Self { objects }
+    }
+}
+
+impl<'o> PageResolver for SnapshotPageResolver<'o> {
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
+        match obj {
+            PDFObject::Ref(r) => self.resolve_ref(r.num, r.generation),
+            other => Ok(other.clone()),
+        }
+    }
+
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<PDFObject> {
+        self.objects
+            .get(&(num, generation))
+            .cloned()
+            .ok_or_else(|| {
+                PDFError::Generic(format!(
+                    "object {num} {generation} not present in resolved snapshot"
+                ))
+            })
+    }
+
+    fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
+        // RenderingContext never calls this during interpret — all fetches go through
+        // resolve_*. Unreachable.
+        unimplemented!("SnapshotPageResolver has no live XRef")
     }
 }
 
@@ -228,9 +334,40 @@ mod tests {
             rotation: 0,
             resources: PDFObject::Null,
             contents: Vec::new(),
+            objects: std::collections::HashMap::new(),
         };
         let mut device = TestDevice::new(10.0, 10.0);
-        interpret(&page, &mut device);
+        interpret(&page, &mut device).expect("interpret runs with no DocStore (pure)");
+    }
+
+    #[test]
+    fn interpret_renders_form_xobject_from_snapshot() {
+        // Full-purity proof: resolve_page captures a snapshot, then interpret renders
+        // purely from it (no live DocStore). The Form XObject override is in the base
+        // here (no delta); resolve_page walks /Resources and snapshots the form object,
+        // and interpret's snapshot resolver fetches it.
+        use crate::rendering::{interpret, TestDevice};
+
+        let mut doc = PDFDocument::open(form_xobject_pdf(b"10 10 50 50 re f"))
+            .expect("pdf should parse and open");
+        let page = doc.get_page(0).expect("page 0 should resolve");
+        let resolved = doc
+            .doc_store_mut()
+            .resolve_page(&page)
+            .expect("resolve_page captures snapshot");
+
+        let mut device = TestDevice::new(200.0, 300.0);
+        interpret(&resolved, &mut device).expect("interpret renders from snapshot");
+
+        let fills = device
+            .operations()
+            .iter()
+            .filter(|op| op.starts_with("draw_path(fill"))
+            .count();
+        assert!(
+            fills > 0,
+            "interpret must render the Form XObject's rectangle from the snapshot"
+        );
     }
 
     #[test]
@@ -282,7 +419,8 @@ mod tests {
     /// A one-page PDF whose content draws a Form XObject via `Do`. The form is initially
     /// EMPTY; a delta override can replace it with one that draws, proving nested-resource
     /// (XObject) fetches through the resolver are delta-aware. Offsets computed at runtime.
-    fn pdf_with_form_xobject() -> Vec<u8> {
+    /// Build the form-XObject PDF with a given Form XObject content body (obj 4).
+    fn form_xobject_pdf(form_body: &[u8]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(b"%PDF-1.4\n");
 
@@ -298,15 +436,18 @@ mod tests {
 /Resources << /XObject << /Fm1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
         );
 
-        // obj 4: an empty Form XObject.
+        // obj 4: the Form XObject with the given content body.
         let o4 = buf.len();
-        buf.extend_from_slice(
-            b"4 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length 0 >>\nstream\nendstream\nendobj\n",
-        );
+        buf.extend_from_slice(format!(
+            "4 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length {} >>\nstream\n",
+            form_body.len()
+        ).as_bytes());
+        buf.extend_from_slice(form_body);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
 
-        // obj 5: page content that draws the form.
+        // obj 5: page content that draws the form ("/Fm1 Do" = 7 bytes).
         let o5 = buf.len();
-        buf.extend_from_slice(b"5 0 obj\n<< /Length 9 >>\nstream\n/Fm1 Do\nendstream\nendobj\n");
+        buf.extend_from_slice(b"5 0 obj\n<< /Length 7 >>\nstream\n/Fm1 Do\nendstream\nendobj\n");
 
         let xref_offset = buf.len();
         buf.extend_from_slice(b"xref\n0 6\n");
@@ -318,6 +459,10 @@ mod tests {
         buf.extend_from_slice(format!("{}\n", xref_offset).as_bytes());
         buf.extend_from_slice(b"%%EOF");
         buf
+    }
+
+    fn pdf_with_form_xobject() -> Vec<u8> {
+        form_xobject_pdf(b"")
     }
 
     #[test]

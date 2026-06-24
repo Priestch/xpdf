@@ -39,9 +39,55 @@ pub use font::Font;
 ///
 /// This is the interpret half of resolve-then-interpret: it takes only an immutable,
 /// fully-resolved page and a device — **no `DocStore`, no `Need`, no I/O** — so it cannot
-/// block or hang a `drive` loop, and a native shell can run it on another thread.
-///
-/// *Step 4b skeleton*: this signature is in place to lock the purity contract, but the
-/// body is a stub. The full content-stream engine moves off `RenderingContext`'s lazy
-/// fetching and onto `ResolvedPage` in the Step 4a rewire.
-pub fn interpret(_page: &crate::core::resolved_page::ResolvedPage, _device: &mut dyn Device) {}
+/// block or hang a `drive` loop, and a native shell can run it on another thread. Resources
+/// are read from the page's pre-resolved `objects` snapshot via a [`SnapshotPageResolver`].
+pub fn interpret<D: Device>(
+    page: &crate::core::resolved_page::ResolvedPage,
+    device: &mut D,
+) -> crate::core::error::PDFResult<()> {
+    use crate::core::base_stream::BaseStream;
+    use crate::core::content_stream::ContentStreamEvaluator;
+    use crate::core::lexer::Lexer;
+    use crate::core::parser::{PDFObject, Parser};
+    use crate::core::resolved_page::SnapshotPageResolver;
+    use crate::core::stream::Stream;
+    use crate::rendering::context::RenderingContext;
+    use crate::rendering::graphics_state::FillRule;
+
+    // Clip to the view box (matches Page::render's pre-amble).
+    let [x0, y0, x1, y1] = page.view_box;
+    device.begin_path();
+    device.move_to(x0, y0);
+    device.line_to(x1, y0);
+    device.line_to(x1, y1);
+    device.line_to(x0, y1);
+    device.close_path();
+    device.clip_path(FillRule::NonZero)?;
+
+    // Parse the decoded content stream into operations.
+    let stream = Box::new(Stream::from_bytes(page.contents.clone())) as Box<dyn BaseStream>;
+    let lexer = Lexer::new(stream)?;
+    let parser = Parser::new(lexer)?;
+    let mut evaluator = ContentStreamEvaluator::new(parser);
+
+    // Pure interpretation: drive RenderingContext with a snapshot-backed resolver — no
+    // live DocStore, no fetches beyond the frozen `objects` map. (No explicit save/restore:
+    // interpret is a single pass, and the content's own q/Q ops manage graphics state.)
+    let mut resolver = SnapshotPageResolver::new(&page.objects);
+    let mut ctx = RenderingContext::new(device);
+    if !matches!(page.resources, PDFObject::Null) {
+        ctx.set_xobject_resources(&mut resolver, &page.resources);
+    }
+
+    loop {
+        match evaluator.read_operation() {
+            Ok(Some(op)) => {
+                if let Err(e) = ctx.process_operation(&op) {
+                    eprintln!("Warning: interpret: failed to process {:?}: {}", op.op, e);
+                }
+            }
+            // End of stream, or a read error (e.g. a stray byte) — stop, like Page::render.
+            Ok(None) | Err(_) => return Ok(()),
+        }
+    }
+}

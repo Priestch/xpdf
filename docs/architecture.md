@@ -357,10 +357,12 @@ Tauri app.
   through a `PageResolver`, so a delta override of any resource object is honored (a Form
   XObject override changes rendered output — tested). Inherited page-tree properties
   (MediaBox/Rotate/Resources from parent nodes) still resolve through the base `XRef`.
-- 🔄 **Resolve-then-interpret** (decision C): `ResolvedPage` type +
-  `DocStore::resolve_page` (delta-aware, tested incl. a delta-override seam proof) + a
-  pure-signature `rendering::interpret` stub. ⚠️ The render pipeline is **not** rewired to
-  consume `ResolvedPage` yet (`RenderingContext` still resolves lazily).
+- ✅ **Resolve-then-interpret** (decision C): `ResolvedPage` carries an `objects` snapshot
+  (every object reachable from `/Resources`, captured by `resolve_page`). `rendering::interpret`
+  is a **pure** function — it runs `RenderingContext` over a `SnapshotPageResolver` with no
+  live `DocStore`, no `Need`, no fetches beyond the frozen snapshot (tested: a Form XObject
+  renders from the snapshot). ⚠️ `render_page_to_image` still uses the live `RenderingContext`
+  path; it is not yet rewired to `resolve_page → interpret`.
 - 🔄 **Progressive loading** uses the legacy exception form on production paths (see above).
 - 🔄 **Core still feature-flags shell concerns**: rendering (`tiny-skia`) and HTTP
   (`reqwest`/`tokio`) are pulled into the core; these must move behind traits/adapters.

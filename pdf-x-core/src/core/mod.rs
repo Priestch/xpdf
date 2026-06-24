@@ -61,7 +61,7 @@ pub use outline::{DestinationType, OutlineDestination, OutlineItem};
 pub use page::{Page, PageTreeCache};
 pub use parser::{PDFObject, Parser, Ref};
 pub use pdf_writer::PDFWriter;
-pub use resolved_page::ResolvedPage;
+pub use resolved_page::{ResolvedPage, SnapshotPageResolver};
 pub use stream::Stream;
 pub use sub_stream::SubStream;
 pub use xref::{XRef, XRefEntry};
