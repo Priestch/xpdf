@@ -95,7 +95,7 @@ impl PDFDocument {
         // points slightly past the `xref` keyword (regenerated/edited files); if the
         // recorded offset fails to parse, we scan this region backwards for `xref`.
         let recovery_start = startxref.saturating_sub(1024).min(data.len());
-        let recovery_end = data.len().min(startxref.saturating_add(1));
+        let recovery_end = data.len().min(startxref.saturating_add(1024));
         let recovery_region = if recovery_start < recovery_end {
             data[recovery_start..recovery_end].to_vec()
         } else {

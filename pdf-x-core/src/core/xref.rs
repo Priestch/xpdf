@@ -171,87 +171,19 @@ impl XRef {
                 continue;
             }
 
-            // Position stream at this xref location
-            self.stream.set_pos(pos)?;
-
-            let lexer = Lexer::new(
-                self.stream
-                    .make_sub_stream(pos, self.stream.length() - pos)?,
-            )?;
-            let mut parser = Parser::new(lexer)?;
-
-            // First token could be "xref" (traditional) or a number (XRef stream object)
-            let obj = parser.get_object()?;
-
-            let trailer = match obj {
-                obj if obj.is_command("xref") => {
-                    // Traditional xref table
-                    self.read_xref_table(&mut parser)?;
-
-                    // read_xref_table consumed the "trailer" keyword, so read the dictionary directly
-                    let trailer = parser.get_object()?;
-                    if !matches!(trailer, PDFObject::Dictionary(_)) {
-                        return Err(PDFError::Generic("Expected trailer dictionary".to_string()));
+            // Parse one xref section at `pos`. The root section (== start_pos) is mandatory;
+            // a /Prev-chained section that fails is skipped so a malformed older xref doesn't
+            // sink the whole document (the root section already covers current objects).
+            let trailer = match self.parse_one_xref_section(pos) {
+                Ok(t) => t,
+                Err(e) => {
+                    if pos == start_pos {
+                        return Err(e);
                     }
-
-                    trailer
-                }
-                PDFObject::Number(_obj_num) => {
-                    // Might be an XRef stream - format: N 0 obj << /Type /XRef >> stream...endstream
-                    let generation = parser.get_object()?;
-                    let obj_keyword = parser.get_object()?;
-
-                    // Verify this is an indirect object
-                    if !matches!(generation, PDFObject::Number(0.0)) {
-                        return Err(PDFError::Generic(
-                            "XRef stream must have generation 0".to_string(),
-                        ));
-                    }
-
-                    if !obj_keyword.is_command("obj") {
-                        return Err(PDFError::Generic(format!(
-                            "Expected 'obj' keyword, got {:?}",
-                            obj_keyword
-                        )));
-                    }
-
-                    // Read the object (should be a Stream with /Type /XRef)
-                    let xref_obj = parser.get_object()?;
-
-                    match xref_obj {
-                        PDFObject::Stream { dict, data } => {
-                            // Verify it's an XRef stream
-                            if let Some(PDFObject::Name(type_name)) = dict.get("Type") {
-                                if type_name != "XRef" {
-                                    return Err(PDFError::Generic(format!(
-                                        "Expected /Type /XRef, got /Type /{}",
-                                        type_name
-                                    )));
-                                }
-                            } else {
-                                return Err(PDFError::Generic(
-                                    "XRef stream missing /Type entry".to_string(),
-                                ));
-                            }
-
-                            // Parse the XRef stream
-                            self.parse_xref_stream(&dict, &data)?;
-
-                            // The trailer dictionary is the stream dictionary itself
-                            PDFObject::Dictionary(dict)
-                        }
-                        _ => {
-                            return Err(PDFError::Generic(
-                                "Expected XRef stream object".to_string(),
-                            ));
-                        }
-                    }
-                }
-                _ => {
-                    return Err(PDFError::Generic(format!(
-                        "Expected 'xref' keyword or object number, got {:?}",
-                        obj
-                    )));
+                    eprintln!(
+                        "Warning: skipping malformed xref section at offset {pos} (via /Prev): {e}"
+                    );
+                    continue;
                 }
             };
 
@@ -289,7 +221,76 @@ impl XRef {
         Ok(())
     }
 
-    /// Parses an XRef stream (PDF 1.5+).
+    /// Parse a single xref section (traditional table or XRef stream) at `pos`.
+    ///
+    /// Returns the section's trailer dictionary on success. Extracted from `parse()` so the
+    /// caller can tolerate failures on `/Prev`-chained sections.
+    fn parse_one_xref_section(&mut self, pos: usize) -> PDFResult<PDFObject> {
+        self.stream.set_pos(pos)?;
+
+        let lexer = Lexer::new(self.stream.make_sub_stream(pos, self.stream.length() - pos)?)?;
+        let mut parser = Parser::new(lexer)?;
+
+        let obj = parser.get_object()?;
+
+        let trailer = match obj {
+            obj if obj.is_command("xref") => {
+                self.read_xref_table(&mut parser)?;
+                let trailer = parser.get_object()?;
+                if !matches!(trailer, PDFObject::Dictionary(_)) {
+                    return Err(PDFError::Generic("Expected trailer dictionary".to_string()));
+                }
+                trailer
+            }
+            PDFObject::Number(_obj_num) => {
+                let generation = parser.get_object()?;
+                let obj_keyword = parser.get_object()?;
+                if !matches!(generation, PDFObject::Number(0.0)) {
+                    return Err(PDFError::Generic(
+                        "XRef stream must have generation 0".to_string(),
+                    ));
+                }
+                if !obj_keyword.is_command("obj") {
+                    return Err(PDFError::Generic(format!(
+                        "Expected 'obj' keyword, got {:?}",
+                        obj_keyword
+                    )));
+                }
+                let xref_obj = parser.get_object()?;
+                match xref_obj {
+                    PDFObject::Stream { dict, data } => {
+                        if let Some(PDFObject::Name(type_name)) = dict.get("Type") {
+                            if type_name != "XRef" {
+                                return Err(PDFError::Generic(format!(
+                                    "Expected /Type /XRef, got /Type /{}",
+                                    type_name
+                                )));
+                            }
+                        } else {
+                            return Err(PDFError::Generic(
+                                "XRef stream missing /Type entry".to_string(),
+                            ));
+                        }
+                        self.parse_xref_stream(&dict, &data)?;
+                        PDFObject::Dictionary(dict)
+                    }
+                    _ => {
+                        return Err(PDFError::Generic(
+                            "Expected XRef stream object".to_string(),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(PDFError::Generic(format!(
+                    "Expected 'xref' keyword or object number, got {:?}",
+                    obj
+                )));
+            }
+        };
+
+        Ok(trailer)
+    }
     ///
     /// XRef streams encode the cross-reference table as binary data in a stream.
     /// Dictionary keys:
