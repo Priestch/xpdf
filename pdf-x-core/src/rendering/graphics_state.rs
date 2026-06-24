@@ -221,6 +221,34 @@ impl Default for FillRule {
     }
 }
 
+/// Blend mode for compositing painting operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendMode {
+    /// Normal source-over compositing.
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl Default for BlendMode {
+    fn default() -> Self {
+        BlendMode::Normal
+    }
+}
+
 /// Graphics state for PDF rendering.
 ///
 /// This represents the current graphics state as defined in the PDF specification.
@@ -239,6 +267,9 @@ pub struct GraphicsState {
 
     /// Fill color
     pub fill_color: Color,
+
+    /// Current blend mode from ExtGState (`/BM`), defaults to Normal.
+    pub blend_mode: BlendMode,
 
     /// Stroke properties
     pub stroke_props: StrokeProps,
@@ -281,6 +312,7 @@ impl Default for GraphicsState {
             ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             stroke_color: Color::black(),
             fill_color: Color::black(),
+            blend_mode: BlendMode::default(),
             stroke_props: StrokeProps::default(),
             text_rendering_mode: TextRenderingMode::default(),
             text_leading: 0.0,

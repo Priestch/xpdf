@@ -4,7 +4,7 @@
 //! This allows different rendering implementations (e.g., CPU rendering, GPU rendering,
 //! image export) without changing the content stream interpretation logic.
 
-use super::graphics_state::{Color, FillRule, StrokeProps};
+use super::graphics_state::{BlendMode, Color, FillRule, StrokeProps};
 use crate::core::error::PDFResult;
 use crate::core::parser::PDFObject;
 
@@ -28,6 +28,8 @@ pub enum PathDrawMode {
 pub enum Paint {
     /// Solid color
     Solid(Color),
+    /// Fully transparent paint (draws nothing but still participates in layout measurement).
+    Transparent,
     // TODO: Add Pattern, Shading, Image support
 }
 
@@ -141,6 +143,11 @@ pub trait Device {
     /// * `matrix` - 6-element array [a b c d e f] representing the transform
     fn set_matrix(&mut self, matrix: &[f64; 6]);
 
+    /// Set the current blend mode for subsequent drawing operations.
+    ///
+    /// Implementations that don't support blend modes can ignore this.
+    fn set_blend_mode(&mut self, _mode: BlendMode) {}
+
     /// Draw text at the current position.
     ///
     /// # Arguments
@@ -151,6 +158,8 @@ pub trait Device {
     /// * `text_matrix` - Text transformation matrix (for positioning text in user space)
     /// * `horizontal_scaling` - Horizontal text scaling as percentage (default: 100.0)
     /// * `text_rise` - Text rise in user space units (for superscript/subscript)
+    /// * `char_spacing` - Character spacing from `Tc` (applied per shown code)
+    /// * `word_spacing` - Word spacing from `Tw` (applied to space code 0x20 in simple fonts)
     ///
     /// # Returns
     /// The total rendered width in text space units
@@ -163,6 +172,8 @@ pub trait Device {
         text_matrix: &[f64; 6],
         horizontal_scaling: f64,
         text_rise: f64,
+        char_spacing: f64,
+        word_spacing: f64,
     ) -> PDFResult<f64>;
 
     /// Draw an image.
@@ -200,6 +211,31 @@ pub trait Device {
         let _ = name;
         let _ = data;
         let _ = encoding;
+        Ok(())
+    }
+
+    /// Set per-character width metrics for a loaded font.
+    ///
+    /// Width values are expressed in glyph space units (typically 1000 units/em
+    /// for PDF simple fonts). Implementations can use this to improve text
+    /// advance accuracy for fonts whose native width tables are unavailable.
+    ///
+    /// # Arguments
+    /// * `name` - The loaded font name/identifier (e.g. "F1")
+    /// * `first_char` - First character code corresponding to `widths[0]`
+    /// * `widths` - Width array from the PDF font dictionary
+    /// * `default_width` - Width fallback for codes not present in `widths`
+    fn set_font_widths(
+        &mut self,
+        name: &str,
+        first_char: u32,
+        widths: &[f64],
+        default_width: f64,
+    ) -> PDFResult<()> {
+        let _ = name;
+        let _ = first_char;
+        let _ = widths;
+        let _ = default_width;
         Ok(())
     }
 }
@@ -359,16 +395,21 @@ impl Device for TestDevice {
         font_size: f64,
         _paint: &Paint,
         _text_matrix: &[f64; 6],
-        _horizontal_scaling: f64,
+        horizontal_scaling: f64,
         _text_rise: f64,
+        char_spacing: f64,
+        word_spacing: f64,
     ) -> PDFResult<f64> {
         self.operations.push(format!(
-            "draw_text({}, {}, {:?})",
-            font_name, font_size, text_bytes
+            "draw_text({}, {}, {:?}, hscale={}, tc={}, tw={})",
+            font_name, font_size, text_bytes, horizontal_scaling, char_spacing, word_spacing
         ));
-        // Return approximate width for testing
+        // Return approximate width for testing with Tc/Tw support.
         let num_chars = text_bytes.len() as f64;
-        let width = (num_chars * 500.0 * font_size) / 1000.0;
+        let num_spaces = text_bytes.iter().filter(|&&b| b == b' ').count() as f64;
+        let glyph_width = (num_chars * 500.0 * font_size) / 1000.0;
+        let spacing = char_spacing * num_chars + word_spacing * num_spaces;
+        let width = (glyph_width + spacing) * (horizontal_scaling / 100.0);
         Ok(width)
     }
 
