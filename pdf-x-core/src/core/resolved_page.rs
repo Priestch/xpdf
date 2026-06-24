@@ -341,6 +341,48 @@ mod tests {
     }
 
     #[test]
+    fn interpret_matches_live_render_output() {
+        // Parity: the pure interpret path and the live Page::render path must produce the
+        // same drawing for the same page (this is what makes rewiring render_page_to_image
+        // to resolve_page → interpret safe). Compare meaningful drawing (fills), ignoring
+        // the per-stream save/restore wrapper that only Page::render emits.
+        use crate::rendering::{interpret, TestDevice};
+
+        let data = form_xobject_pdf(b"10 10 50 50 re f");
+
+        // Live path: Page::render through a DocStore.
+        let mut doc_a = PDFDocument::open(data.clone()).expect("pdf should parse and open");
+        let page_a = doc_a.get_page(0).expect("page 0 should resolve");
+        let mut dev_a = TestDevice::new(200.0, 300.0);
+        {
+            let mut store = doc_a.doc_store_mut();
+            page_a.render(&mut store, &mut dev_a).expect("live render");
+        }
+
+        // Pure path: resolve_page → interpret.
+        let mut doc_b = PDFDocument::open(data).expect("pdf should parse and open");
+        let page_b = doc_b.get_page(0).expect("page 0 should resolve");
+        let resolved = doc_b
+            .doc_store_mut()
+            .resolve_page(&page_b)
+            .expect("resolve_page");
+        let mut dev_b = TestDevice::new(200.0, 300.0);
+        interpret(&resolved, &mut dev_b).expect("pure interpret");
+
+        let count_fills = |d: &TestDevice| {
+            d.operations()
+                .iter()
+                .filter(|o| o.starts_with("draw_path(fill"))
+                .count()
+        };
+        assert_eq!(
+            count_fills(&dev_a),
+            count_fills(&dev_b),
+            "live render and pure interpret must produce the same fills"
+        );
+    }
+
+    #[test]
     fn interpret_renders_form_xobject_from_snapshot() {
         // Full-purity proof: resolve_page captures a snapshot, then interpret renders
         // purely from it (no live DocStore). The Form XObject override is in the base

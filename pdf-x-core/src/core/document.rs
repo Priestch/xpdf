@@ -810,8 +810,10 @@ impl PDFDocument {
                 - rotate_d * scale as f64 * center_y,
         ]);
 
-        // Render the page through the DocStore (delta-aware).
-        page.render(&mut store, &mut device)?;
+        // Render via the pure interpret path: resolve to a snapshot (delta-aware), then
+        // interpret with no live DocStore (decision C end-state).
+        let resolved = store.resolve_page(&page)?;
+        crate::rendering::interpret(&resolved, &mut device)?;
 
         // Extract pixel data
         let pixels = pixmap.data().to_vec();

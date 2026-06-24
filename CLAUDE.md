@@ -63,12 +63,11 @@ directly from the base `XRef`. Interpretation is a pure function over a `Resolve
 `DocStore`, no `Need`). This is the resolve-then-interpret boundary (decision C); it makes
 interpretation restartable-safe, parallelizable, and WASM-clean.
 
-> **Current state** (see `docs/architecture.md`): `Page::render` and `extract_text` route
-> through a `DocStore`; `/Contents` and nested resources (fonts/xobjects/ext-gstate) are
-> delta-aware (a delta override of a Form XObject changes rendered output — tested).
-> `resolve_page` captures an object snapshot and `interpret(&ResolvedPage, &mut Device)` is
-> **pure** — no `DocStore`, no fetches (decision C end-state). `render_page_to_image` still
-> uses the live `RenderingContext` path (not yet rewired to `resolve_page → interpret`).
+> **Current state** (Phase 0 complete): `Page::render` and `extract_text` route through a
+> `DocStore`; `/Contents` and nested resources are delta-aware (tested). `render_page_to_image`
+> resolves to a `ResolvedPage` snapshot then calls the **pure** `interpret(&ResolvedPage,
+> &mut Device)` — no `DocStore`, no fetches (decision C, live end-to-end). `drive` owns the
+> `open_file` progressive-load loop (decision A).
 
 ## Development Commands
 
