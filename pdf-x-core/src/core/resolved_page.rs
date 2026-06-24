@@ -144,7 +144,20 @@ fn capture_reachable(
         if snapshot.contains_key(&id) {
             continue;
         }
-        let obj = store.resolve_ref(id.0, id.1)?;
+        // Tolerant: skip objects that fail to resolve (e.g. malformed/unusual objects in
+        // real-world PDFs). The lazy Page::render path skips bad resources the same way;
+        // an eager snapshot must be at least as resilient. Interpretation handles any
+        // resource missing from the snapshot via RenderingContext's existing tolerance.
+        let obj = match store.resolve_ref(id.0, id.1) {
+            Ok(obj) => obj,
+            Err(e) => {
+                eprintln!(
+                    "Warning: resolve_page snapshot skipped object {} {}: {}",
+                    id.0, id.1, e
+                );
+                continue;
+            }
+        };
         queue.extend(find_refs(&obj));
         snapshot.insert(id, obj);
     }

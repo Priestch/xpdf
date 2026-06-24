@@ -90,13 +90,43 @@ impl PDFDocument {
         // Find the startxref offset
         let startxref = Self::find_startxref(&data)?;
 
+        // Capture a small region around `startxref` for offset-recovery before `data`
+        // moves into the stream. Some real-world PDFs carry a `startxref` value that
+        // points slightly past the `xref` keyword (regenerated/edited files); if the
+        // recorded offset fails to parse, we scan this region backwards for `xref`.
+        let recovery_start = startxref.saturating_sub(1024).min(data.len());
+        let recovery_end = data.len().min(startxref.saturating_add(1));
+        let recovery_region = if recovery_start < recovery_end {
+            data[recovery_start..recovery_end].to_vec()
+        } else {
+            Vec::new()
+        };
+
         // Create stream and xref
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut xref = XRef::new(stream);
 
-        // Position at xref table and parse
+        // Position at xref table and parse. On failure, try recovering the `xref` keyword
+        // position from the captured region (mirrors pdf.js's recovery).
         xref.set_stream_pos(startxref)?;
-        xref.parse()?;
+        if let Err(_) = xref.parse() {
+            let recovered = recovery_region
+                .windows(b"\nxref".len())
+                .rposition(|w| w == b"\nxref")
+                .map(|rel| recovery_start + rel + 1); // +1: skip '\n', point at 'xref'
+            match recovered {
+                Some(offset) => {
+                    xref.set_stream_pos(offset)?;
+                    xref.parse()?;
+                }
+                None => {
+                    return Err(PDFError::Generic(format!(
+                        "Failed to parse xref at startxref offset {startxref}, and no `xref` \
+                         keyword found nearby for recovery"
+                    )));
+                }
+            }
+        }
 
         // Load the catalog
         let catalog = Some(xref.catalog()?);

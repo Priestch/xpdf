@@ -26,11 +26,11 @@ mod text_transform_tests {
         // PDF: origin at bottom-left, Y increases upward
         // Device: origin at top-left, Y increases downward
         let ctm = [
-            1.5,  // sx
-            0.0,  // kx
-            0.0,  // ky
-            -1.5, // sy (negative to flip Y)
-            0.0,  // tx
+            1.5,   // sx
+            0.0,   // kx
+            0.0,   // ky
+            -1.5,  // sy (negative to flip Y)
+            0.0,   // tx
             500.0, // ty (page height)
         ];
         device.concat_matrix(&ctm);
@@ -104,7 +104,10 @@ mod text_transform_tests {
             expected_y
         );
 
-        println!("✅ Text transform fix verified: Y={} (on-screen)", adjusted_ty);
+        println!(
+            "✅ Text transform fix verified: Y={} (on-screen)",
+            adjusted_ty
+        );
     }
 
     #[test]
