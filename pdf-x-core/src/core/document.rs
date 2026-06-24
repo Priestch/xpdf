@@ -87,45 +87,68 @@ impl PDFDocument {
     /// let doc = PDFDocument::open(pdf_data).unwrap();
     /// ```
     pub fn open(data: Vec<u8>) -> PDFResult<Self> {
-        // Find the startxref offset
-        let startxref = Self::find_startxref(&data)?;
+        // Find the startxref offset. If it's missing (truncated/corrupt file), go straight
+        // to full-file recovery scan below.
+        let startxref = Self::find_startxref(&data);
 
         // Capture a small region around `startxref` for offset-recovery before `data`
         // moves into the stream. Some real-world PDFs carry a `startxref` value that
         // points slightly past the `xref` keyword (regenerated/edited files); if the
         // recorded offset fails to parse, we scan this region backwards for `xref`.
-        let recovery_start = startxref.saturating_sub(1024).min(data.len());
-        let recovery_end = data.len().min(startxref.saturating_add(1024));
-        let recovery_region = if recovery_start < recovery_end {
-            data[recovery_start..recovery_end].to_vec()
-        } else {
-            Vec::new()
+        let (recovery_start, recovery_region) = match &startxref {
+            Ok(sx) => {
+                let recovery_start = sx.saturating_sub(1024).min(data.len());
+                let recovery_end = data.len().min(sx.saturating_add(1024));
+                let region = if recovery_start < recovery_end {
+                    data[recovery_start..recovery_end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                (recovery_start, region)
+            }
+            Err(_) => (0, Vec::new()),
         };
 
         // Create stream and xref
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut xref = XRef::new(stream);
 
-        // Position at xref table and parse. On failure, try recovering the `xref` keyword
-        // position from the captured region (mirrors pdf.js's recovery).
-        xref.set_stream_pos(startxref)?;
-        if let Err(_) = xref.parse() {
-            let recovered = recovery_region
-                .windows(b"\nxref".len())
-                .rposition(|w| w == b"\nxref")
-                .map(|rel| recovery_start + rel + 1); // +1: skip '\n', point at 'xref'
-            match recovered {
-                Some(offset) => {
-                    xref.set_stream_pos(offset)?;
-                    xref.parse()?;
-                }
-                None => {
-                    return Err(PDFError::Generic(format!(
-                        "Failed to parse xref at startxref offset {startxref}, and no `xref` \
-                         keyword found nearby for recovery"
-                    )));
+        // Position at xref table and parse. On failure, try the cheap `xref`-keyword
+        // recovery first (common "startxref slightly off" case), then fall back to a
+        // full-file scan (pdf.js `indexObjects`) for truncated/corrupt files.
+        let parse_ok = match &startxref {
+            Ok(sx) => {
+                xref.set_stream_pos(*sx)?;
+                if xref.parse().is_ok() {
+                    true
+                } else {
+                    // ±1KB `xref` keyword recovery.
+                    let recovered = recovery_region
+                        .windows(b"\nxref".len())
+                        .rposition(|w| w == b"\nxref")
+                        .map(|rel| recovery_start + rel + 1); // +1: skip '\n', point at 'xref'
+                    match recovered {
+                        Some(offset) => {
+                            xref.set_stream_pos(offset)?;
+                            xref.parse().is_ok()
+                        }
+                        None => false,
+                    }
                 }
             }
+            Err(_) => false,
+        };
+
+        if !parse_ok {
+            // Last resort: rebuild the xref table by scanning the whole file for objects.
+            // (Mirrors pdf.js's `XRef.indexObjects()` recovery; reads the whole file — the
+            // documented exception to progressive loading for corrupt input.)
+            xref.recover_by_scan().map_err(|_| {
+                PDFError::Generic(format!(
+                    "Failed to parse xref{} and full-file recovery scan failed",
+                    startxref.as_ref().map(|s| format!(" at startxref offset {s}")).unwrap_or_default()
+                ))
+            })?;
         }
 
         // Load the catalog
@@ -198,31 +221,36 @@ impl PDFDocument {
         // Get the last 1024 bytes to find startxref
         let search_data = stream.get_byte_range(startxref_search_start, file_length)?;
 
-        // Find startxref in the tail of the file
-        let startxref = Self::find_startxref_in_bytes(&search_data, startxref_search_start)?;
-
-        // Preload the chunk containing the xref table start
-        // (XRef tables are usually near the end, this improves initial load time)
-        let xref_preload_start = startxref;
-        let xref_preload_end = (startxref + stream.chunk_size()).min(file_length);
-        stream.preload_range(xref_preload_start, xref_preload_end)?;
+        // Find startxref in the tail of the file (tolerate missing → recovery scan below).
+        let startxref_opt = Self::find_startxref_in_bytes(&search_data, startxref_search_start).ok();
 
         // Create xref with the chunked stream
         let boxed_stream = Box::new(stream) as Box<dyn BaseStream>;
         let mut xref = XRef::new(boxed_stream);
 
-        // Position at xref table and parse with the shell-owned progressive-loading loop.
-        //
-        // `drive` retries on `Need` (adapted from `DataMissing` at the boundary). The op
-        // resets `stream_pos` to `startxref` on EVERY retry: `XRef::parse` reads from the
-        // current stream position, so without the reset a retry would resume mid-stream and
-        // loop forever. With the reset, each retry re-reads from `startxref` and progresses
-        // further as chunks load (xref entries use set-if-None guards, so re-parsing is
-        // idempotent). `XRef: Loadable` provides `ensure_range` for the drive loop.
-        crate::core::byte_source::drive(&mut xref, |x| {
-            x.set_stream_pos(startxref)?;
-            crate::core::byte_source::StepErr::adapt(x.parse())
-        })?;
+        let mut parse_ok = false;
+        if let Some(startxref) = startxref_opt {
+            // Position at xref table and parse with the shell-owned progressive-loading loop.
+            //
+            // `drive` retries on `Need` (adapted from `DataMissing` at the boundary). The op
+            // resets `stream_pos` to `startxref` on EVERY retry: `XRef::parse` reads from the
+            // current stream position, so without the reset a retry would resume mid-stream and
+            // loop forever. With the reset, each retry re-reads from `startxref` and progresses
+            // further as chunks load (xref entries use set-if-None guards, so re-parsing is
+            // idempotent). `XRef: Loadable` provides `ensure_range` for the drive loop; it pulls
+            // the xref region on demand (the explicit preload this replaced was only a hint).
+            parse_ok = crate::core::byte_source::drive(&mut xref, |x| {
+                x.set_stream_pos(startxref)?;
+                crate::core::byte_source::StepErr::adapt(x.parse())
+            })
+            .is_ok();
+        }
+
+        if !parse_ok {
+            // Last resort: rebuild the xref table by scanning the whole file (pdf.js
+            // `indexObjects`). Forces a full load — acceptable only as recovery.
+            xref.recover_by_scan()?;
+        }
 
         // Load the catalog
         let catalog = Some(xref.catalog()?);

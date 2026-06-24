@@ -221,6 +221,237 @@ impl XRef {
         Ok(())
     }
 
+    /// Rebuild the xref table by scanning the whole file for `N G obj` patterns.
+    ///
+    /// Last-resort recovery for corrupt/truncated PDFs where the normal xref read fails
+    /// or `startxref` is missing. Ports pdf.js's `XRef.indexObjects()`
+    /// (`pdf.js/src/core/xref.js`): it reads the entire file, records every indirect
+    /// object's offset, pulls compressed entries from any `/Type /XRef` streams it
+    /// encounters, and selects a trailer whose `/Root → /Pages → /Count` validates.
+    ///
+    /// **Progressive-loading exception:** this reads the whole file
+    /// (`stream.get_byte_range(0, length)`) — the documented last-resort recovery path,
+    /// exactly as pdf.js does (`stream.getBytes()`). The normal path never calls this.
+    pub fn recover_by_scan(&mut self) -> PDFResult<()> {
+        let length = self.stream.length();
+        let buf = self.stream.get_byte_range(0, length)?;
+        let buf = buf.as_slice();
+        let length = buf.len();
+
+        // Reset any partial entries/cache left by the failed normal parse.
+        self.entries.clear();
+        self.cache.clear();
+
+        const TAB: u8 = 0x9;
+        const LF: u8 = 0xa;
+        const CR: u8 = 0xd;
+        const SPACE: u8 = 0x20;
+        const PERCENT: u8 = 0x25;
+
+        let mut trailers: Vec<usize> = Vec::new();
+        let mut xref_stms: Vec<usize> = Vec::new();
+
+        let mut position = 0usize;
+        while position < length {
+            let ch = buf[position];
+            if ch == TAB || ch == LF || ch == CR || ch == SPACE {
+                position += 1;
+                continue;
+            }
+            if ch == PERCENT {
+                // %-comment: skip to end of line.
+                position += 1;
+                while position < length && buf[position] != LF && buf[position] != CR {
+                    position += 1;
+                }
+                continue;
+            }
+
+            // readToken: bytes from `position` until LF/CR/LT('<').
+            let token_len = read_token_len(buf, position);
+            let token = &buf[position..position + token_len];
+
+            if starts_with_keyword(token, b"xref") {
+                // skip to the "trailer" keyword, record it, then skip to "startxref".
+                position = match skip_until(buf, position, b"trailer") {
+                    Some(p) => p,
+                    None => break,
+                };
+                trailers.push(position);
+                position = skip_until(buf, position, b"startxref").unwrap_or(position);
+                continue;
+            }
+
+            if let Some((num, generation)) = parse_obj_header(token) {
+                // Record the object offset (first-writer-wins, like pdf.js).
+                set_entry_if_none(
+                    &mut self.entries,
+                    num,
+                    XRefEntry::Uncompressed {
+                        offset: position as u64,
+                        generation: generation,
+                    },
+                );
+
+                // Detect an xref-stream object: its body contains `/XRef` followed by a
+                // non-letter. Bound the search at the next `endobj`.
+                let body_end = find_endobj(buf, position + token_len).unwrap_or(length);
+                if let Some(off) = skip_until(&buf[position..body_end], 0, b"/XRef") {
+                    let after = off + b"/XRef".len();
+                    if after >= (body_end - position)
+                        || buf[position + after] < 0x40 /* '<' @, non-letter */
+                    {
+                        xref_stms.push(position);
+                    }
+                }
+
+                // Advance past this object to its `endobj` so the body isn't re-scanned.
+                position = body_end.checked_add(b"endobj".len()).unwrap_or(length);
+                continue;
+            }
+
+            if starts_with_keyword(token, b"trailer") {
+                trailers.push(position);
+                position += token_len;
+                continue;
+            }
+
+            // Unrecognized token: skip past it.
+            position += token_len + 1;
+        }
+
+        // Pull compressed (type-2) entries from any xref-stream objects we found, reusing
+        // the existing section parser (it handles `/Type /XRef` streams + /Prev). Failures
+        // are tolerated — partial recovery beats none.
+        for &off in &xref_stms {
+            let _ = self.parse_one_xref_section(off);
+        }
+
+        // Select a trailer from the candidates (or fall back to a dict carrying /Root).
+        self.trailer = self.select_recovery_trailer(&trailers, buf)?;
+        Ok(())
+    }
+
+    /// Read the `trailer` keyword + dictionary at `offset`. Returns the dict, or `None`
+    /// if it doesn't parse as `trailer << ... >>`.
+    fn parse_trailer_dict_at(&mut self, offset: usize) -> Option<PDFObject> {
+        let length = self.stream.length();
+        let sub = self.stream.make_sub_stream(offset, length.saturating_sub(offset)).ok()?;
+        let lexer = Lexer::new(sub).ok()?;
+        let mut parser = Parser::new(lexer).ok()?;
+        let kw = parser.get_object().ok()?;
+        if !kw.is_command("trailer") {
+            return None;
+        }
+        let dict = parser.get_object().ok()?;
+        match dict {
+            PDFObject::Dictionary(_) => Some(dict),
+            // Some generators nest the dict (pdf.js handles `dict.dict`).
+            _ => None,
+        }
+    }
+
+    /// Validate that `dict`'s `/Root` resolves to a catalog with `/Pages` whose `/Count`
+    /// is an integer — the same check pdf.js uses to pick a real trailer.
+    fn root_validates(&mut self, dict: &HashMap<String, PDFObject>) -> bool {
+        let root_ref = match dict.get("Root") {
+            Some(r) => r.clone(),
+            None => return false,
+        };
+        let catalog = match &root_ref {
+            PDFObject::Ref(r) => match self.fetch(r.num, r.generation) {
+                Ok(c) => (*c).clone(),
+                Err(_) => return false,
+            },
+            other => other.clone(),
+        };
+        let catalog_dict = match catalog {
+            PDFObject::Dictionary(d) => d,
+            _ => return false,
+        };
+        let pages_ref = match catalog_dict.get("Pages") {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+        let pages = match &pages_ref {
+            PDFObject::Ref(r) => match self.fetch(r.num, r.generation) {
+                Ok(p) => (*p).clone(),
+                Err(_) => return false,
+            },
+            other => other.clone(),
+        };
+        matches!(
+            pages,
+            PDFObject::Dictionary(ref pd) if matches!(pd.get("Count"), Some(PDFObject::Number(_)))
+        )
+    }
+
+    /// Pick the recovery trailer: prefer a validated candidate with `/ID`, else the last
+    /// validated candidate, else (pdf.js final fallback) the first dict carrying `/Root`.
+    /// `buf` is the whole-file buffer (already read by `recover_by_scan`) reused for the
+    /// byte-scan fallback.
+    fn select_recovery_trailer(
+        &mut self,
+        candidates: &[usize],
+        buf: &[u8],
+    ) -> PDFResult<Option<PDFObject>> {
+        let mut with_id: Option<PDFObject> = None;
+        let mut validated_last: Option<PDFObject> = None;
+
+        for &off in candidates {
+            let dict_obj = match self.parse_trailer_dict_at(off) {
+                Some(d) => d,
+                None => continue,
+            };
+            let dict = match &dict_obj {
+                PDFObject::Dictionary(d) => d.clone(),
+                _ => continue,
+            };
+            let has_id = dict.get("ID").is_some();
+            if self.root_validates(&dict) {
+                if has_id && with_id.is_none() {
+                    with_id = Some(dict_obj.clone());
+                }
+                validated_last = Some(dict_obj);
+            }
+        }
+
+        if let Some(t) = with_id.or(validated_last) {
+            return Ok(Some(t));
+        }
+
+        // Final fallback: no `trailer` candidate validated — find the first recorded object
+        // whose body carries a `/Root <num> <generation> R` reference and synthesize a trailer.
+        //
+        // This is a BYTE-SCAN, deliberately not a parser: recovery can record false-positive
+        // objects from binary content, and parsing at a bogus offset can send the lexer into
+        // a non-advancing loop on garbage (a separate parser-robustness issue). A bounded
+        // byte scan cannot loop. (Mirrors pdf.js's "first dict with /Root" fallback intent.)
+        let nums: Vec<u32> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.as_ref().map(|_| i as u32))
+            .collect();
+        for num in nums {
+            let Some(XRefEntry::Uncompressed { offset, .. }) = self.get_entry(num) else {
+                continue;
+            };
+            if let Some((root_num, root_gen)) = extract_root_ref(buf, *offset as usize) {
+                let mut dict = HashMap::new();
+                dict.insert(
+                    "Root".to_string(),
+                    PDFObject::Ref(super::parser::Ref::new(root_num, root_gen)),
+                );
+                return Ok(Some(PDFObject::Dictionary(dict)));
+            }
+        }
+
+        Err(PDFError::Generic(
+            "recovery scan found no usable trailer/Root".to_string(),
+        ))
+    }
+
     /// Parse a single xref section (traditional table or XRef stream) at `pos`.
     ///
     /// Returns the section's trailer dictionary on success. Extracted from `parse()` so the
@@ -1493,5 +1724,163 @@ mod tests {
         } else {
             panic!("Expected compressed entry, got {:?}", entry2);
         }
+    }
+
+    /// `recover_by_scan` rebuilds the xref table from object offsets when the file has
+    /// no xref table / no startxref (truncated tail). Ports pdf.js `indexObjects`.
+    #[test]
+    fn test_recover_by_scan_rebuilds_entries_and_trailer() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"%PDF-1.4\n");
+        data.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        data.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        data.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\n");
+        // Intentionally NO xref table and NO startxref/%%EOF.
+
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let mut xref = XRef::new(stream);
+
+        xref.recover_by_scan()
+            .expect("recovery scan rebuilds xref from object offsets");
+
+        // Entries for objects 1 and 2 recorded as uncompressed, generation 0.
+        let e1 = xref.get_entry(1).expect("obj 1 entry recovered");
+        let e2 = xref.get_entry(2).expect("obj 2 entry recovered");
+        assert!(
+            matches!(e1, XRefEntry::Uncompressed { generation: 0, .. }),
+            "obj 1 should be uncompressed generation 0, got {e1:?}"
+        );
+        assert!(
+            matches!(e2, XRefEntry::Uncompressed { generation: 0, .. }),
+            "obj 2 should be uncompressed generation 0, got {e2:?}"
+        );
+
+        // A trailer was selected and /Root resolves to a catalog.
+        assert!(xref.trailer().is_some(), "recovery selected a trailer");
+        xref.catalog().expect("catalog resolves via recovered trailer");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery-scan byte helpers (used by `XRef::recover_by_scan`). Hand-rolled to
+// avoid pulling in a `regex` dependency; mirrors pdf.js's `indexObjects` scan.
+// ---------------------------------------------------------------------------
+
+/// Length of the token starting at `off`: bytes until LF/CR/LT('<'). (pdf.js `readToken`.)
+fn read_token_len(buf: &[u8], mut off: usize) -> usize {
+    let start = off;
+    while off < buf.len() && buf[off] != 0xa && buf[off] != 0xd && buf[off] != b'<' {
+        off += 1;
+    }
+    off - start
+}
+
+/// True if `token` starts with `kw` and is followed by whitespace or end-of-token
+/// (i.e. `kw` is a whole keyword, not a prefix of a longer word).
+fn starts_with_keyword(token: &[u8], kw: &[u8]) -> bool {
+    token.starts_with(kw) && (token.len() == kw.len() || token[kw.len()].is_ascii_whitespace())
+}
+
+/// Offset of the first occurrence of `needle` at/after `off`, or `None`.
+/// (pdf.js `skipUntil`, but returns the absolute offset of the match.)
+fn skip_until(buf: &[u8], off: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || off >= buf.len() {
+        return None;
+    }
+    buf[off..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| off + p)
+}
+
+/// Parse a leading `(\d+)[ \t\r\n]+(\d+)[ \t\r\n]+obj\b` object header from `token`.
+/// Returns `(object_number, generation)` on match. (pdf.js `objRegExp`.)
+fn parse_obj_header(token: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 0;
+    let num_start = i;
+    while i < token.len() && token[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == num_start {
+        return None;
+    }
+    let num: u32 = std::str::from_utf8(&token[num_start..i]).ok()?.parse().ok()?;
+    // required whitespace
+    if i >= token.len() || !token[i].is_ascii_whitespace() {
+        return None;
+    }
+    while i < token.len() && (token[i] == b' ' || token[i] == b'\t' || token[i] == b'\r' || token[i] == b'\n') {
+        i += 1;
+    }
+    let gen_start = i;
+    while i < token.len() && token[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == gen_start {
+        return None;
+    }
+    let generation: u32 = std::str::from_utf8(&token[gen_start..i]).ok()?.parse().ok()?;
+    if i >= token.len() || !token[i].is_ascii_whitespace() {
+        return None;
+    }
+    while i < token.len() && (token[i] == b' ' || token[i] == b'\t' || token[i] == b'\r' || token[i] == b'\n') {
+        i += 1;
+    }
+    // "obj" + word boundary
+    if token[i..].starts_with(b"obj") {
+        let after = i + 3;
+        if after == token.len() || !token[after].is_ascii_alphanumeric() {
+            return Some((num, generation));
+        }
+    }
+    None
+}
+
+/// Offset of the next `endobj` at/after `off` (bounds an object's body for the
+/// `/XRef`-stream check and for advancing past the object).
+fn find_endobj(buf: &[u8], off: usize) -> Option<usize> {
+    skip_until(buf, off, b"endobj")
+}
+
+/// Byte-scan a small window at `off` for `/Root <num> <generation> R` and return the ref.
+/// Used by the recovery trailer fallback to avoid invoking the parser (which can loop
+/// on garbage at bogus recovery offsets). Bounded → cannot loop.
+fn extract_root_ref(buf: &[u8], off: usize) -> Option<(u32, u32)> {
+    let win = 512.min(buf.len().saturating_sub(off));
+    let region = &buf[off..off + win];
+    let i = region.windows(b"/Root".len()).position(|w| w == b"/Root")?;
+    let mut p = i + b"/Root".len();
+    let skip_ws = |p: &mut usize| {
+        while *p < region.len() && region[*p].is_ascii_whitespace() {
+            *p += 1;
+        }
+    };
+    let read_num = |p: &mut usize| -> Option<u32> {
+        let s = *p;
+        while *p < region.len() && region[*p].is_ascii_digit() {
+            *p += 1;
+        }
+        std::str::from_utf8(&region[s..*p]).ok()?.parse().ok()
+    };
+    skip_ws(&mut p);
+    let num = read_num(&mut p)?;
+    skip_ws(&mut p);
+    let generation = read_num(&mut p)?;
+    skip_ws(&mut p);
+    if p < region.len() && region[p] == b'R' {
+        Some((num, generation))
+    } else {
+        None
+    }
+}
+
+/// Ensure `entries` is large enough for `num`, then set the entry only if unset
+/// (first-writer-wins, matching pdf.js's `if (!this.entries[num])`).
+fn set_entry_if_none(entries: &mut Vec<Option<XRefEntry>>, num: u32, entry: XRefEntry) {
+    while entries.len() <= num as usize {
+        entries.push(None);
+    }
+    if entries[num as usize].is_none() {
+        entries[num as usize] = Some(entry);
     }
 }

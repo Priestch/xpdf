@@ -69,8 +69,10 @@ static CASES: &[Case] = &[
     // fixture is a parser-robustness probe, not a renderable page.
     Case { fixture: "bad-xref.pdf", page: 0, expect: Expect::Skip },
     Case { fixture: "basicapi.pdf", page: 0, expect: Expect::Ok },
-    // Open fail: ObjectStream (xref-stream) parsing not reached — "no `xref`
-    // keyword found nearby for recovery".
+    // Opens but can't render: its `/Type /XRef` stream is malformed (holds a text xref
+    // table), and the page's objects live in an ObjStm whose only index is that stream.
+    // Full-file recovery rebuilds the uncompressed objects + trailer, but cannot recover
+    // ObjStm-compressed objects, so rendering fails ("Object 4 not found in xref").
     Case { fixture: "compressed-object-stream.pdf", page: 0, expect: Expect::Skip },
     Case { fixture: "empty.pdf", page: 0, expect: Expect::Ok },
     // Render fail: "Expected object number, got Command('obj')".
@@ -84,9 +86,9 @@ static CASES: &[Case] = &[
     Case { fixture: "simpletype3font.pdf", page: 0, expect: Expect::Ok },
     Case { fixture: "tracemonkey.pdf", page: 0, expect: Expect::Ok },
     Case { fixture: "TrueType_without_cmap.pdf", page: 0, expect: Expect::Ok },
-    // Open fail: xref-stream parse — "no `xref` keyword found nearby for
-    // recovery".
-    Case { fixture: "xref-stream.pdf", page: 0, expect: Expect::Skip },
+    // Opens via full-file recovery scan (was Skip: malformed `/Type /XRef` stream that
+    // normal parse rejects; recovery rebuilds entries from real object offsets).
+    Case { fixture: "xref-stream.pdf", page: 0, expect: Expect::Ok },
 ];
 
 /// Workspace `tests/fixtures` directory (one level above `pdf-x-core`).
