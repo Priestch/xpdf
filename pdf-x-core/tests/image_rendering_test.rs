@@ -6,7 +6,8 @@
 //! - Grayscale images render correctly
 //! - Images are positioned correctly with transforms
 
-use pdf_x_core::rendering::{Device, ImageData, SkiaDevice};
+use pdf_x_core::rendering::{Device, ImageData};
+use pdf_x_device_tinyskia::SkiaDevice;
 use tiny_skia::Pixmap;
 
 #[test]

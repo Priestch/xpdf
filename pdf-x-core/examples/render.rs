@@ -9,7 +9,7 @@
 //!     cargo run --example render --features rendering -- test.pdf output.png 0
 
 use pdf_x_core::rendering::Device; // Import Device trait for concat_matrix
-use pdf_x_core::rendering::skia_device::SkiaDevice;
+use pdf_x_device_tinyskia::SkiaDevice;
 use pdf_x_core::{PDFDocument, Page};
 use std::env;
 use std::path::Path;
@@ -107,11 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Image coordinates: (0,0) at top-left, y increases downward
     // We need to flip Y and translate the origin
     device.concat_matrix(&[
-        scale,     // sx: scale X
-        0.0,       // kx: no skew
-        0.0,       // ky: no skew
-        -scale,    // sy: negative scale flips Y-axis
-        0.0,       // tx: no X translation
+        scale,             // sx: scale X
+        0.0,               // kx: no skew
+        0.0,               // ky: no skew
+        -scale,            // sy: negative scale flips Y-axis
+        0.0,               // tx: no X translation
         coords[3] * scale, // ty: move origin to page height
     ]);
 

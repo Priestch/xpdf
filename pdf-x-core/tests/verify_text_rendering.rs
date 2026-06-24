@@ -1,6 +1,7 @@
 //! Comprehensive test to verify text rendering fixes
 //! Tests: text not overlapping, text upright (not upside down)
 use pdf_x_core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 #[test]
 #[cfg(feature = "rendering")]

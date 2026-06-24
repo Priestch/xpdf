@@ -1,5 +1,6 @@
 //! Quick test to verify text renders upright (not upside down)
 use pdf_x_core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 #[test]
 #[cfg(feature = "rendering")]

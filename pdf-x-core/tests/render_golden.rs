@@ -30,6 +30,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use pdf_x_core::core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 /// Fixed render scale for every case. A single value keeps goldens comparable
 /// across cases and small.

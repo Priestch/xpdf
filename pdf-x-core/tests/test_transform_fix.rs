@@ -1,5 +1,6 @@
 //! Test the transform fix by rendering issue7200.pdf
 use pdf_x_core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 #[test]
 fn test_issue7200_rendering() {

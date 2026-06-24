@@ -2,7 +2,7 @@
 ///
 /// This test renders a PDF page with full logging to diagnose rendering issues.
 use pdf_x_core::rendering::device::Device;
-use pdf_x_core::rendering::skia_device::SkiaDevice;
+use pdf_x_device_tinyskia::SkiaDevice;
 use pdf_x_core::rendering::{Color, Paint};
 use pdf_x_core::{PDFDocument, Page};
 use std::fs::File;

@@ -1,4 +1,5 @@
 use pdf_x_core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pdf_path = "/home/gp/Books/Automate the Boring Stuff with Python, 3rd Edition.pdf";

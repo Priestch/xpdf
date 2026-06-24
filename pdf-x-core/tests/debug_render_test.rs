@@ -2,7 +2,8 @@
 //!
 //! This test uses real PDF files to debug rendering issues.
 
-use pdf_x_core::rendering::{Device, SkiaDevice};
+use pdf_x_core::rendering::Device;
+use pdf_x_device_tinyskia::SkiaDevice;
 use tiny_skia::Pixmap;
 
 /// Find the test PDFs directory

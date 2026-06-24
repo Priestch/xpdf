@@ -1,5 +1,6 @@
 //! Test to verify text overlapping fix
 use pdf_x_core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 #[test]
 #[cfg(feature = "rendering")]

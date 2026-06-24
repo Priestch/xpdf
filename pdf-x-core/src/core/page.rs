@@ -242,7 +242,11 @@ impl Page {
         Some([min_x, min_y, max_x, max_y])
     }
 
-    pub(crate) fn resolve_view_box_for_rendering(&self, xref: &mut super::xref::XRef) -> [f64; 4] {
+    /// Resolve the render view box (MediaBox ∩ CropBox) for this page.
+    ///
+    /// Public so a `Device` backend adapter (e.g. `pdf-x-device-tinyskia`) can size
+    /// its raster target without core knowing about any specific backend.
+    pub fn resolve_view_box_for_rendering(&self, xref: &mut super::xref::XRef) -> [f64; 4] {
         // Reference: pdf.js/src/core/document.js - Page.view
         let media_box = self
             .get_inheritable_property(xref, "MediaBox", false)
@@ -270,7 +274,8 @@ impl Page {
         }
     }
 
-    pub(crate) fn resolve_rotate_for_rendering(&self, xref: &mut super::xref::XRef) -> i32 {
+    /// Resolve the normalized `/Rotate` for this page. Public for backend adapters.
+    pub fn resolve_rotate_for_rendering(&self, xref: &mut super::xref::XRef) -> i32 {
         // Reference: pdf.js/src/core/document.js - Page.rotate
         let mut rotate = self
             .get_inheritable_property(xref, "Rotate", false)
@@ -576,7 +581,8 @@ impl Page {
     /// # Example
     /// ```no_run
     /// use pdf_x_core::PDFDocument;
-    /// use pdf_x_core::rendering::{SkiaDevice, Device};
+    /// use pdf_x_core::rendering::Device;
+    /// use pdf_x_device_tinyskia::SkiaDevice;
     /// use tiny_skia::Pixmap;
     ///
     /// let pdf_data = std::fs::read("document.pdf").unwrap();

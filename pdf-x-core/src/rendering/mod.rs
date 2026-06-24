@@ -20,20 +20,11 @@ pub use graphics_state::{
 };
 pub use path::{Path, PathBuilder, PathElement};
 
-#[cfg(feature = "rendering")]
-pub mod skia_device;
-
-#[cfg(feature = "rendering")]
-pub mod font;
-
-#[cfg(feature = "rendering")]
-pub mod type1_font;
-
-#[cfg(feature = "rendering")]
-pub use skia_device::SkiaDevice;
-
-#[cfg(feature = "rendering")]
-pub use font::Font;
+// The tiny-skia `Device` backend (`SkiaDevice`) and the TrueType/Type1/CFF font
+// shaping it needs live in the `pdf-x-device-tinyskia` adapter crate (Phase 0
+// decision A: backends are adapters, not core hard-deps). This module keeps only
+// the backend-agnostic surface: the `Device` trait, graphics state, paths, the
+// `RenderingContext` interpreter, and the pure `interpret` function.
 
 /// Pure interpretation of a [`ResolvedPage`] onto a [`Device`] (decision C).
 ///

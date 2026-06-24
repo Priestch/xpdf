@@ -7,7 +7,7 @@ use pdf_x_core::rendering::graphics_state::{Color, FillRule, StrokeProps};
 use pdf_x_core::rendering::{Device, Paint, PathDrawMode, TestDevice};
 
 #[cfg(feature = "rendering")]
-use pdf_x_core::rendering::skia_device::SkiaDevice;
+use pdf_x_device_tinyskia::SkiaDevice;
 
 #[cfg(feature = "rendering")]
 use tiny_skia::Pixmap;

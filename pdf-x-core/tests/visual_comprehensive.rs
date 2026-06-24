@@ -5,7 +5,7 @@
 //! infrastructure but adapted for pdf-x's testing needs.
 
 use pdf_x_core::rendering::Device;
-use pdf_x_core::rendering::skia_device::SkiaDevice;
+use pdf_x_device_tinyskia::SkiaDevice;
 use tiny_skia::Pixmap;
 
 #[cfg(feature = "rendering")]

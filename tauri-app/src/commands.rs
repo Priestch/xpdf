@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use crate::types::*;
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 use std::fs;
 use std::path::PathBuf;
 use tauri::State;
@@ -310,6 +310,7 @@ fn extract_media_box_dimensions(mediabox: &pdf_x_core::PDFObject) -> Option<(f64
 pub async fn render_page(
     page_index: usize,
     scale: Option<f32>,
+    text_trace: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<RenderedPage, String> {
     // Get the cached PDF data
@@ -321,10 +322,27 @@ pub async fn render_page(
     // Parse PDF from cached data (much faster than reading from disk)
     let mut doc = pdf_x_core::PDFDocument::open(pdf_data).map_err(|e| e.to_string())?;
 
-    // Render the page to image (RGBA pixels)
-    let (width, height, mut pixels) = doc
+    // Optional runtime trace for text spacing diagnostics (Tw/Tc/TJ/Tj).
+    let text_trace_enabled = text_trace.unwrap_or(false);
+    let previous_trace_state = pdf_x_core::rendering::set_text_trace_enabled(text_trace_enabled);
+    if text_trace_enabled {
+        eprintln!(
+            "[text-trace] render_page start: page={} scale={}",
+            page_index + 1,
+            scale.unwrap_or(1.0)
+        );
+    }
+
+    // Render the page to image (RGBA pixels) via the tiny-skia backend adapter.
+    use pdf_x_device_tinyskia::RenderToImage;
+    let render_result = doc
         .render_page_to_image(page_index, scale)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string());
+
+    // Restore previous global trace state to avoid leaking across requests.
+    pdf_x_core::rendering::set_text_trace_enabled(previous_trace_state);
+
+    let (width, height, pixels) = render_result?;
 
     // Debug: Check if we got any non-white pixels
     #[cfg(debug_assertions)]

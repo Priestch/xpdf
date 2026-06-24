@@ -114,13 +114,12 @@ pub use core::{
     XRefEntry,
 };
 
-// Re-export rendering types
+// Re-export rendering types. The `Device` trait + `RenderingContext` + `interpret`
+// are backend-agnostic and live here; concrete backends (e.g. tiny-skia's
+// `SkiaDevice`) are in the `pdf-x-device-tinyskia` adapter crate (Phase 0 step 5).
 pub use rendering::{
     Device, GraphicsState, Paint, Path, PathBuilder, PathDrawMode, RenderingContext,
 };
-
-#[cfg(feature = "rendering")]
-pub use rendering::SkiaDevice;
 
 // Re-export decode module
 pub use core::decode;

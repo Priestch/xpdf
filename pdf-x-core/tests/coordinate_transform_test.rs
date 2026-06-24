@@ -3,7 +3,8 @@
 //! This test verifies that PDF coordinates (Y-up, bottom-left origin)
 //! are correctly transformed to screen coordinates (Y-down, top-left origin).
 
-use pdf_x_core::rendering::{Device, SkiaDevice};
+use pdf_x_core::rendering::Device;
+use pdf_x_device_tinyskia::SkiaDevice;
 use tiny_skia::Pixmap;
 
 #[test]

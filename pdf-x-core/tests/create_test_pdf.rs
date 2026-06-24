@@ -120,7 +120,7 @@ fn test_create_and_render_colored_pdf() {
     pixmap.fill(tiny_skia::Color::WHITE);
 
     // Create rendering device
-    let mut device = pdf_x_core::rendering::SkiaDevice::new(pixmap.as_mut());
+    let mut device = pdf_x_device_tinyskia::SkiaDevice::new(pixmap.as_mut());
 
     // Apply coordinate transform (PDF Y-up to screen Y-down)
     device.set_matrix(&[

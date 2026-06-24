@@ -1,6 +1,7 @@
 //! Save rendered pages as PNG for visual inspection
 //! This creates output files that can be manually viewed to verify text orientation
 use pdf_x_core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 use std::fs::File;
 use std::io::BufWriter;
 

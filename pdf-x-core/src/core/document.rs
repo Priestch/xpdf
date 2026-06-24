@@ -733,123 +733,20 @@ impl PDFDocument {
 
     /// Render a page to RGBA pixel data.
     ///
-    /// This method renders the specified page and returns the raw RGBA pixel data.
-    /// The pixels are organized as [R, G, B, A, R, G, B, A, ...] row by row from top to bottom.
+    /// **Moved to the `pdf-x-device-tinyskia` adapter crate** (Phase 0 decision A: the
+    /// tiny-skia backend is an adapter, not a core dependency). To render to pixels,
+    /// depend on `pdf-x-device-tinyskia` and use its `RenderToImage` extension trait:
     ///
-    /// # Arguments
-    /// * `page_index` - The zero-based page index to render
-    /// * `scale` - Optional scale factor (default is 1.0)
-    ///
-    /// # Returns
-    /// A tuple of (width, height, pixels) where:
-    /// - `width` is the image width in pixels
-    /// - `height` is the image height in pixels
-    /// - `pixels` is a Vec<u8> containing RGBA pixel data
-    ///
-    /// # Example
-    /// ```no_run
+    /// ```ignore
     /// use pdf_x_core::PDFDocument;
+    /// use pdf_x_device_tinyskia::RenderToImage;
     ///
-    /// let pdf_data = std::fs::read("document.pdf").unwrap();
-    /// let mut doc = PDFDocument::open(pdf_data).unwrap();
-    ///
-    /// // Render first page at 2x scale
+    /// let mut doc = PDFDocument::open(std::fs::read("document.pdf").unwrap()).unwrap();
     /// let (width, height, pixels) = doc.render_page_to_image(0, Some(2.0)).unwrap();
-    ///
-    /// println!("Rendered {}x{} image ({} bytes)", width, height, pixels.len());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[cfg(feature = "rendering")]
-    pub fn render_page_to_image(
-        &mut self,
-        page_index: usize,
-        scale: Option<f32>,
-    ) -> PDFResult<(u32, u32, Vec<u8>)> {
-        use crate::rendering::{Device, SkiaDevice};
-        use tiny_skia::Pixmap;
-
-        // Get the page and a DocStore (delta → base). The whole render resolves through
-        // the store so delta overrides of /Contents (and page-level data) are honored.
-        let page = self.get_page(page_index)?;
-        let mut store = self.doc_store_mut();
-
-        // Reference: pdf.js/src/core/document.js - Page.view and Page.rotate
-        let [x0, y0, x1, y1] = page.resolve_view_box_for_rendering(store.xref_mut());
-        let rotation = page.resolve_rotate_for_rendering(store.xref_mut());
-
-        let page_width = x1 - x0;
-        let page_height = y1 - y0;
-
-        // Apply scale
-        let scale = scale.unwrap_or(1.0);
-        let (width, height) = if rotation % 180 == 0 {
-            (
-                (page_width as f32 * scale).ceil() as u32,
-                (page_height as f32 * scale).ceil() as u32,
-            )
-        } else {
-            (
-                (page_height as f32 * scale).ceil() as u32,
-                (page_width as f32 * scale).ceil() as u32,
-            )
-        };
-
-        // Create a white pixmap
-        let mut pixmap = Pixmap::new(width, height).ok_or_else(|| {
-            PDFError::Generic(format!("Failed to create {}x{} pixmap", width, height))
-        })?;
-
-        // Fill with white background
-        pixmap.fill(tiny_skia::Color::WHITE);
-
-        // Create rendering device
-        let mut device = SkiaDevice::new(pixmap.as_mut());
-
-        // Apply PDF.js-like viewport transform.
-        // Reference: pdf.js/src/display/display_utils.js - PageViewport
-        let center_x = (x0 + x1) / 2.0;
-        let center_y = (y0 + y1) / 2.0;
-
-        let (rotate_a, rotate_b, rotate_c, rotate_d) = match rotation {
-            90 => (0.0, 1.0, 1.0, 0.0),
-            180 => (-1.0, 0.0, 0.0, 1.0),
-            270 => (0.0, -1.0, -1.0, 0.0),
-            _ => (1.0, 0.0, 0.0, -1.0),
-        };
-
-        let offset_canvas_x;
-        let offset_canvas_y;
-        if rotate_a == 0.0 {
-            offset_canvas_x = (center_y - y0).abs() * scale as f64;
-            offset_canvas_y = (center_x - x0).abs() * scale as f64;
-        } else {
-            offset_canvas_x = (center_x - x0).abs() * scale as f64;
-            offset_canvas_y = (center_y - y0).abs() * scale as f64;
-        }
-
-        device.set_matrix(&[
-            rotate_a * scale as f64,
-            rotate_b * scale as f64,
-            rotate_c * scale as f64,
-            rotate_d * scale as f64,
-            offset_canvas_x
-                - rotate_a * scale as f64 * center_x
-                - rotate_c * scale as f64 * center_y,
-            offset_canvas_y
-                - rotate_b * scale as f64 * center_x
-                - rotate_d * scale as f64 * center_y,
-        ]);
-
-        // Render via the pure interpret path: resolve to a snapshot (delta-aware), then
-        // interpret with no live DocStore (decision C end-state).
-        let resolved = store.resolve_page(&page)?;
-        crate::rendering::interpret(&resolved, &mut device)?;
-
-        // Extract pixel data
-        let pixels = pixmap.data().to_vec();
-
-        Ok((width, height, pixels))
-    }
+    ///
+    /// Core itself stays backend-free; this type only exposes the pure
+    /// [`rendering::interpret`](crate::rendering::interpret) over a `ResolvedPage`.
 
     /// Gets an inheritable property from a page dictionary.
     ///
