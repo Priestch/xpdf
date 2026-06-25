@@ -250,6 +250,7 @@ impl XRef {
 
         let mut trailers: Vec<usize> = Vec::new();
         let mut xref_stms: Vec<usize> = Vec::new();
+        let mut obj_stms: Vec<u32> = Vec::new();
 
         let mut position = 0usize;
         while position < length {
@@ -283,26 +284,47 @@ impl XRef {
             }
 
             if let Some((num, generation)) = parse_obj_header(token) {
+                let body_start = position + token_len;
+
+                // (a) Validate before recording: only accept the object if a plausible
+                // object-start byte follows the `N G obj` header. This filters the
+                // false-positive headers that binary stream content produces (hayro does the
+                // same by attempting a read), and — crucially — keeps us from later parsing
+                // at bogus offsets where the lexer can loop on garbage.
+                if !plausible_object_start(buf, body_start) {
+                    position = find_endobj(buf, body_start)
+                        .map(|e| e.checked_add(b"endobj".len()).unwrap_or(length))
+                        .unwrap_or(body_start + token_len + 1);
+                    continue;
+                }
+
                 // Record the object offset (first-writer-wins, like pdf.js).
                 set_entry_if_none(
                     &mut self.entries,
                     num,
                     XRefEntry::Uncompressed {
                         offset: position as u64,
-                        generation: generation,
+                        generation,
                     },
                 );
 
+                let body_end = find_endobj(buf, body_start).unwrap_or(length);
+                let body = &buf[body_start..body_end];
+
                 // Detect an xref-stream object: its body contains `/XRef` followed by a
-                // non-letter. Bound the search at the next `endobj`.
-                let body_end = find_endobj(buf, position + token_len).unwrap_or(length);
-                if let Some(off) = skip_until(&buf[position..body_end], 0, b"/XRef") {
+                // non-letter.
+                if let Some(off) = skip_until(body, 0, b"/XRef") {
                     let after = off + b"/XRef".len();
-                    if after >= (body_end - position)
-                        || buf[position + after] < 0x40 /* '<' @, non-letter */
-                    {
+                    if after >= body.len() || body[after] < 0x40 {
                         xref_stms.push(position);
                     }
+                }
+
+                // (b) Detect an Object Stream (`/Type /ObjStm`): we'll decode it after the
+                // scan and index every object it contains as a Compressed entry, so objects
+                // stored only in an ObjStm become resolvable (hayro does this inline).
+                if has_type_objstm(body) {
+                    obj_stms.push(num);
                 }
 
                 // Advance past this object to its `endobj` so the body isn't re-scanned.
@@ -325,6 +347,12 @@ impl XRef {
         // are tolerated — partial recovery beats none.
         for &off in &xref_stms {
             let _ = self.parse_one_xref_section(off);
+        }
+
+        // (b) Index every object inside each ObjStm we found, as Compressed entries — so
+        // objects that live only in an object stream become resolvable. Best-effort.
+        for &objstm_num in &obj_stms {
+            self.index_object_stream(objstm_num);
         }
 
         // Select a trailer from the candidates (or fall back to a dict carrying /Root).
@@ -384,6 +412,91 @@ impl XRef {
             pages,
             PDFObject::Dictionary(ref pd) if matches!(pd.get("Count"), Some(PDFObject::Number(_)))
         )
+    }
+
+    /// Pick the recovery trailer: prefer a validated candidate with `/ID`, else the last
+    /// Decode an Object Stream (`/Type /ObjStm`) and record every object it contains as a
+    /// `Compressed` entry, so objects that live only inside an ObjStm become resolvable.
+    /// Used by `recover_by_scan` (mirrors hayro's `fallback_xref_map_inner` ObjStm handling).
+    /// Best-effort: any decode/parse failure just aborts indexing that stream.
+    fn index_object_stream(&mut self, obj_stream_num: u32) {
+        let obj = match self.fetch(obj_stream_num, 0) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        let (dict, data) = match &*obj {
+            PDFObject::Stream { dict, data } => (dict.clone(), data.clone()),
+            _ => return,
+        };
+        if !matches!(dict.get("Type"), Some(PDFObject::Name(n)) if n == "ObjStm") {
+            return;
+        }
+        let n = match dict.get("N") {
+            Some(PDFObject::Number(n)) => *n as u32,
+            _ => return,
+        };
+        let first = match dict.get("First") {
+            Some(PDFObject::Number(n)) => *n as usize,
+            _ => return,
+        };
+        let filter = dict
+            .get("Filter")
+            .and_then(|f| match f {
+                PDFObject::Name(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .map(str::to_owned);
+
+        let mut decoded = match decode::decode_stream(&data, filter.as_deref()) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        // PNG predictor (mirror fetch_compressed).
+        if let Some(PDFObject::Dictionary(parms)) = dict.get("DecodeParms") {
+            if let Some(PDFObject::Number(p)) = parms.get("Predictor") {
+                let pred = *p as i32;
+                if (10..=14).contains(&pred) {
+                    let columns = num_in(parms, "Columns").unwrap_or(1);
+                    let colors = num_in(parms, "Colors").unwrap_or(1);
+                    let bpc = num_in(parms, "BitsPerComponent").unwrap_or(8);
+                    match decode::decode_png_predictor(&decoded, colors, bpc, columns) {
+                        Ok(d) => decoded = d,
+                        Err(_) => return,
+                    }
+                }
+            }
+        }
+
+        // Parse the `N` (obj_num, offset) header pairs that precede the objects.
+        if first > decoded.len() {
+            return;
+        }
+        let header_stream = Stream::from_bytes(decoded[..first].to_vec());
+        let lexer = match Lexer::new(Box::new(header_stream) as Box<dyn BaseStream>) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let mut parser = match Parser::new(lexer) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        for i in 0..n {
+            let num_obj = parser.get_object();
+            let off_obj = parser.get_object();
+            match (num_obj, off_obj) {
+                (Ok(PDFObject::Number(obj_num)), Ok(PDFObject::Number(_))) => {
+                    set_entry_if_none(
+                        &mut self.entries,
+                        obj_num as u32,
+                        XRefEntry::Compressed {
+                            obj_stream_num,
+                            index: i,
+                        },
+                    );
+                }
+                _ => return,
+            }
+        }
     }
 
     /// Pick the recovery trailer: prefer a validated candidate with `/ID`, else the last
@@ -1882,5 +1995,42 @@ fn set_entry_if_none(entries: &mut Vec<Option<XRefEntry>>, num: u32, entry: XRef
     }
     if entries[num as usize].is_none() {
         entries[num as usize] = Some(entry);
+    }
+}
+
+/// Skip whitespace from `p`, then return true if the next byte is a plausible start of a
+/// PDF object (`<`, `(`, `[`, `/`, a number, or `t`/`f`/`n` for true/false/null). Used by
+/// the recovery scan to reject false-positive `N G obj` headers in binary content WITHOUT
+/// invoking the parser (which can loop on garbage). (hayro validates by attempting a read.)
+fn plausible_object_start(buf: &[u8], mut p: usize) -> bool {
+    while p < buf.len() && matches!(buf[p], b' ' | b'\t' | b'\r' | b'\n') {
+        p += 1;
+    }
+    if p >= buf.len() {
+        return false;
+    }
+    let c = buf[p];
+    matches!(c, b'<' | b'(' | b'[' | b'/' | b'.' | b'+' | b'-')
+        || c.is_ascii_digit()
+        || matches!(c, b't' | b'f' | b'n')
+}
+
+/// True if an object body contains a `/ObjStm` name (followed by a non-letter), i.e. the
+/// object is an Object Stream whose contained objects the recovery scan should index.
+fn has_type_objstm(body: &[u8]) -> bool {
+    match skip_until(body, 0, b"/ObjStm") {
+        Some(off) => {
+            let after = off + b"/ObjStm".len();
+            after >= body.len() || !body[after].is_ascii_alphabetic()
+        }
+        None => false,
+    }
+}
+
+/// Read a numeric dict entry as `usize` (helper for ObjStm DecodeParms parsing).
+fn num_in(dict: &HashMap<String, PDFObject>, key: &str) -> Option<usize> {
+    match dict.get(key)? {
+        PDFObject::Number(n) => Some(*n as usize),
+        _ => None,
     }
 }

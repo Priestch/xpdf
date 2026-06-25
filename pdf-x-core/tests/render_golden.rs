@@ -69,10 +69,9 @@ static CASES: &[Case] = &[
     // fixture is a parser-robustness probe, not a renderable page.
     Case { fixture: "bad-xref.pdf", page: 0, expect: Expect::Skip },
     Case { fixture: "basicapi.pdf", page: 0, expect: Expect::Ok },
-    // Opens but can't render: its `/Type /XRef` stream is malformed (holds a text xref
-    // table), and the page's objects live in an ObjStm whose only index is that stream.
-    // Full-file recovery rebuilds the uncompressed objects + trailer, but cannot recover
-    // ObjStm-compressed objects, so rendering fails ("Object 4 not found in xref").
+    // Opens via full-file recovery + ObjStm indexing (page_count resolves to 1), but render
+    // fails further on the separate content-stream bug ("Expected object number, got
+    // Command('obj')") — the same bug blocking annotation-text/flatedecode/issue3115.
     Case { fixture: "compressed-object-stream.pdf", page: 0, expect: Expect::Skip },
     Case { fixture: "empty.pdf", page: 0, expect: Expect::Ok },
     // Render fail: "Expected object number, got Command('obj')".
