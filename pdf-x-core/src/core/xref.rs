@@ -236,6 +236,28 @@ impl XRef {
                         }
                     }
                 }
+
+                // Hybrid-reference files: a classic `xref` table's trailer may carry
+                // `/XRefStm <offset>` pointing at a cross-reference STREAM whose entries
+                // (including compressed/object-stream ones the classic table can't express)
+                // must also be pulled in. Per the spec the stream entries take precedence, so
+                // we queue it to be parsed too; parse_one_xref_section's set-if-None means the
+                // first writer wins, so we push /XRefStm FIRST (it's popped last → applied
+                // before this section's classic entries only if it was queued earlier — but
+                // since classic entries are already set by the call above, we instead let the
+                // stream fill only the gaps the classic table doesn't cover, which is exactly
+                // the compressed-object case. This is the practical hybrid behavior.)
+                if let Some(PDFObject::Number(xrefstm_pos)) = dict.get("XRefStm") {
+                    let pos = *xrefstm_pos as usize;
+                    if parsed_positions.insert(pos) {
+                        // Best-effort: parse the stream section, tolerate failure.
+                        if let Err(e) = self.parse_one_xref_section(pos) {
+                            eprintln!(
+                                "Warning: skipping malformed /XRefStm section at offset {pos}: {e}"
+                            );
+                        }
+                    }
+                }
             }
         }
 
