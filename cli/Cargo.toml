@@ -18,6 +18,3 @@ default = ["jpeg-decoding"]
 jpeg-decoding = ["pdf-x-core/jpeg-decoding"]
 png-decoding = ["pdf-x-core/png-decoding"]
 advanced-image-formats = ["pdf-x-core/advanced-image-formats"]
-
-# Optional: enable async network loading
-# async = ["pdf-x-core/async"]

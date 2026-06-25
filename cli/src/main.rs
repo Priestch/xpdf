@@ -1046,41 +1046,40 @@ fn extract_all_text(doc: &mut PDFDocument) {
     let mut total_chars = 0;
 
     for page_num in 0..page_count {
-        if let Ok(page) = doc.get_page(page_num as usize) {
-            println!("═══ Page {} ═══", page_num + 1);
+        println!("═══ Page {} ═══", page_num + 1);
 
-            match page.extract_text(doc.xref_mut()) {
-                Ok(text_items) => {
-                    if text_items.is_empty() {
-                        println!("  (No text on this page)");
-                    } else {
-                        // Group text by line (similar Y position)
-                        let mut lines: std::collections::BTreeMap<i32, Vec<String>> =
-                            std::collections::BTreeMap::new();
+        // Routes through DocStore (delta → base) per decision B/C.
+        match doc.extract_text_from_page(page_num as usize) {
+            Ok(text_items) => {
+                if text_items.is_empty() {
+                    println!("  (No text on this page)");
+                } else {
+                    // Group text by line (similar Y position)
+                    let mut lines: std::collections::BTreeMap<i32, Vec<String>> =
+                        std::collections::BTreeMap::new();
 
-                        for item in text_items {
-                            let y_key = if let Some(pos) = item.position {
-                                (pos.1 * 10.0) as i32
-                            } else {
-                                0
-                            };
-                            lines.entry(y_key).or_insert_with(Vec::new).push(item.text);
-                        }
+                    for item in text_items {
+                        let y_key = if let Some(pos) = item.position {
+                            (pos.1 * 10.0) as i32
+                        } else {
+                            0
+                        };
+                        lines.entry(y_key).or_insert_with(Vec::new).push(item.text);
+                    }
 
-                        // Print lines
-                        for (_, texts) in lines.into_iter().rev() {
-                            let line = texts.join(" ");
-                            println!("  {}", line);
-                            total_chars += line.len();
-                        }
+                    // Print lines
+                    for (_, texts) in lines.into_iter().rev() {
+                        let line = texts.join(" ");
+                        println!("  {}", line);
+                        total_chars += line.len();
                     }
                 }
-                Err(e) => {
-                    println!("  Error extracting text: {:?}", e);
-                }
             }
-            println!();
+            Err(e) => {
+                println!("  Error extracting text: {:?}", e);
+            }
         }
+        println!();
     }
 
     println!("Total characters extracted: {}", total_chars);
