@@ -461,17 +461,16 @@ impl Page {
 
         // Process each content stream
         for (dict, data) in content_streams {
-            // Decode the stream if it's compressed
+            // Decode the stream if it's compressed. Use apply_filters (handles both
+            // /Filter as a Name and as an Array, e.g. [/FlateDecode]) — the same path
+            // the render path uses. The previous hand-written match only handled a bare
+            // /FlateDecode Name and silently used raw compressed bytes for anything else
+            // (including single-element arrays like [/FlateDecode], which many producers
+            // emit), causing "Unknown PDF operator" errors on every such stream.
             let decoded_data = if let Some(filter) = dict.get("Filter") {
-                match filter {
-                    PDFObject::Name(filter_name) if filter_name == "FlateDecode" => {
-                        // Decompress FlateDecode stream
-                        match decode_flate(&data) {
-                            Ok(decompressed) => decompressed,
-                            Err(_) => continue, // Skip this stream if decompression fails
-                        }
-                    }
-                    _ => data, // Other filters not yet supported, use raw data
+                match super::decode::apply_filters(&data, filter) {
+                    Ok(decoded) => decoded,
+                    Err(_) => continue, // Skip this stream if decoding fails
                 }
             } else {
                 data // No filter, use raw data
