@@ -287,85 +287,62 @@ impl MD5Context {
 /// # Returns
 /// A 32-byte SHA-256 hash
 pub fn calculate_sha256(data: &[u8]) -> [u8; 32] {
-    // Use Rust's built-in SHA-256 via the sha2 crate if available
-    // For now, use a simple implementation or external crate
-    #[cfg(feature = "sha2")]
+    // SHA-256 is provided by the `sha2` crate, pulled in via the `crypto` feature.
+    // (The gate must be `crypto` — the feature that enables the `sha2` optional dep. An
+    // earlier version gated on a non-existent `sha2` feature and silently fell back to a
+    // dummy hash, which broke PDF 2.0 / R=6 authentication.)
+    #[cfg(feature = "crypto")]
     {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(data);
-        let result = hasher.finalize();
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&result);
-        output
+        hasher.finalize().into()
     }
 
-    #[cfg(not(feature = "sha2"))]
+    #[cfg(not(feature = "crypto"))]
     {
-        // Fallback: simple implementation (placeholder)
-        // In production, you'd want a proper SHA-256 implementation
-        calculate_sha256_fallback(data)
+        let _ = data;
+        // No fake fallback: SHA-2 is required for encryption. If `crypto` is off, fail
+        // loudly rather than returning a dummy hash.
+        panic!("calculate_sha256 requires the `crypto` feature (enables the sha2 crate)");
     }
-}
-
-#[cfg(not(feature = "sha2"))]
-fn calculate_sha256_fallback(data: &[u8]) -> [u8; 32] {
-    // This is a placeholder. In a real implementation, you'd
-    // want to either:
-    // 1. Use the sha2 crate (add to Cargo.toml)
-    // 2. Implement SHA-256 from scratch (complex)
-    // For now, return a dummy hash
-    let mut hasher = [0u8; 32];
-    let len = data.len().min(32);
-    hasher[..len].copy_from_slice(&data[..len]);
-    hasher
 }
 
 // ============================================================================
 // SHA-384 and SHA-512 (FIPS 180-4)
 // ============================================================================
 
-/// Calculates the SHA-384 hash of the input data.
+/// Calculates the SHA-384 hash of the input data. Requires the `crypto` feature.
 pub fn calculate_sha384(data: &[u8]) -> [u8; 48] {
-    #[cfg(feature = "sha2")]
+    #[cfg(feature = "crypto")]
     {
         use sha2::{Digest, Sha384};
         let mut hasher = Sha384::new();
         hasher.update(data);
-        let result = hasher.finalize();
-        let mut output = [0u8; 48];
-        output.copy_from_slice(&result);
-        output
+        hasher.finalize().into()
     }
 
-    #[cfg(not(feature = "sha2"))]
+    #[cfg(not(feature = "crypto"))]
     {
-        let mut hasher = [0u8; 48];
-        let len = data.len().min(48);
-        hasher[..len].copy_from_slice(&data[..len]);
-        hasher
+        let _ = data;
+        panic!("calculate_sha384 requires the `crypto` feature (enables the sha2 crate)");
     }
 }
 
-/// Calculates the SHA-512 hash of the input data.
+/// Calculates the SHA-512 hash of the input data. Requires the `crypto` feature.
 pub fn calculate_sha512(data: &[u8]) -> [u8; 64] {
-    #[cfg(feature = "sha2")]
+    #[cfg(feature = "crypto")]
     {
         use sha2::{Digest, Sha512};
         let mut hasher = Sha512::new();
         hasher.update(data);
-        let result = hasher.finalize();
-        let mut output = [0u8; 64];
-        output.copy_from_slice(&result);
-        output
+        hasher.finalize().into()
     }
 
-    #[cfg(not(feature = "sha2"))]
+    #[cfg(not(feature = "crypto"))]
     {
-        let mut hasher = [0u8; 64];
-        let len = data.len().min(64);
-        hasher[..len].copy_from_slice(&data[..len]);
-        hasher
+        let _ = data;
+        panic!("calculate_sha512 requires the `crypto` feature (enables the sha2 crate)");
     }
 }
 
@@ -1116,57 +1093,46 @@ impl PDF20 {
     }
 
     fn hash(&self, password: &[u8], input: &[u8], user_bytes: &[u8]) -> Vec<u8> {
-        // Algorithm 2.B from ISO 32000-2
-        let mut k = calculate_sha256(input)[..32].to_vec();
+        // Algorithm 2.B from ISO 32000-2 (mirrors pdf.js `PDF20._hash` in
+        // pdf.js/src/core/crypto.js).
+        //
+        // Key detail: `k` keeps its FULL hash length (32 / 48 / 64 bytes) across iterations
+        // — only truncated to 32 on return. (The AES key/IV are always `k[0..16]` / `k[16..32]`,
+        // valid since SHA-256/384/512 are all ≥ 32 bytes.) Truncating `k` mid-loop would
+        // change `combined = password ‖ k ‖ userBytes` and break every subsequent round.
+        let mut k = calculate_sha256(input).to_vec();
 
         let mut e = vec![0u8; 1];
         let mut i: u32 = 0;
 
-        let combined_length = password.len() + k.len() + user_bytes.len();
-
-        while i < 64 || u32::from(e.last().copied().unwrap_or(0)) > i.saturating_sub(32) {
-            // Create combined array: password + k + user_bytes
-            let mut combined_array = Vec::with_capacity(combined_length);
+        while i < 64 || u32::from(*e.last().unwrap_or(&0)) > i.saturating_sub(32) {
+            // combined = password ‖ k ‖ userBytes
+            let mut combined_array =
+                Vec::with_capacity(password.len() + k.len() + user_bytes.len());
             combined_array.extend_from_slice(password);
             combined_array.extend_from_slice(&k);
             combined_array.extend_from_slice(user_bytes);
 
-            // Create k1 by repeating combined_array 64 times
-            let mut k1 = Vec::with_capacity(combined_length * 64);
+            // k1 = combined repeated 64 times
+            let mut k1 = Vec::with_capacity(combined_array.len() * 64);
             for _ in 0..64 {
                 k1.extend_from_slice(&combined_array);
             }
 
-            // AES128 CBC NO PADDING
-            // First 16 bytes of k as the key, second 16 as the IV
-            let key128: [u8; 16] = k[..16]
-                .try_into()
-                .expect("first 16 bytes of k should be valid key");
-            let iv: [u8; 16] = k[16..32]
-                .try_into()
-                .expect("second 16 bytes of k should be valid IV");
+            // AES-128 CBC, no padding: key = k[0..16], iv = k[16..32].
+            let key128: [u8; 16] = k[..16].try_into().expect("k[..16] is 16 bytes");
+            let iv: [u8; 16] = k[16..32].try_into().expect("k[16..32] is 16 bytes");
+            e = AES128Cipher::new(&key128).encrypt_streaming(&k1, &iv);
 
-            let cipher = AES128Cipher::new(&key128);
-            e = cipher.encrypt_streaming(&k1, &iv);
-
-            // Compute the first 16 bytes as an unsigned big-endian integer
-            // and compute the remainder modulo 3.
-            // Since 256 % 3 == 1, we can just sum the bytes and take modulo 3.
+            // remainder = big-endian int(e[0..16]) mod 3. Since 256 ≡ 1 (mod 3), this equals
+            // (sum of e[0..16]) mod 3 (pdf.js uses the same sum equivalence).
             let remainder: u32 = e[..16].iter().map(|&b| b as u32).sum::<u32>() % 3;
-
             k = match remainder {
                 0 => calculate_sha256(&e).to_vec(),
-                1 => {
-                    let hash = calculate_sha384(&e);
-                    hash[..32].to_vec()
-                }
-                2 => {
-                    let hash = calculate_sha512(&e);
-                    hash[..32].to_vec()
-                }
+                1 => calculate_sha384(&e).to_vec(),
+                2 => calculate_sha512(&e).to_vec(),
                 _ => unreachable!(),
             };
-
             i += 1;
         }
 
@@ -1446,7 +1412,7 @@ mod tests {
     }
 
     // SHA-256 Tests
-    #[cfg(feature = "sha2")]
+    #[cfg(feature = "crypto")]
     #[test]
     fn test_sha256_abc() {
         use sha2::{Digest, Sha256};
@@ -1461,7 +1427,7 @@ mod tests {
         assert_eq!(&result[..], &expected[..]);
     }
 
-    #[cfg(feature = "sha2")]
+    #[cfg(feature = "crypto")]
     #[test]
     fn test_sha256_multiblock() {
         use sha2::{Digest, Sha256};
@@ -1477,7 +1443,7 @@ mod tests {
     }
 
     // SHA-384 multiblock tests
-    #[cfg(feature = "sha2")]
+    #[cfg(feature = "crypto")]
     #[test]
     fn test_sha384_multiblock() {
         use sha2::{Digest, Sha384};
@@ -1495,7 +1461,7 @@ mod tests {
     }
 
     // SHA-512 multiblock tests
-    #[cfg(feature = "sha2")]
+    #[cfg(feature = "crypto")]
     #[test]
     fn test_sha512_multiblock() {
         use sha2::{Digest, Sha512};
@@ -1514,7 +1480,7 @@ mod tests {
     }
 
     // SHA-384 Tests
-    #[cfg(feature = "sha2")]
+    #[cfg(feature = "crypto")]
     #[test]
     fn test_sha384_abc() {
         use sha2::{Digest, Sha384};
@@ -1532,7 +1498,7 @@ mod tests {
     }
 
     // SHA-512 Tests
-    #[cfg(feature = "sha2")]
+    #[cfg(feature = "crypto")]
     #[test]
     fn test_sha512_abc() {
         use sha2::{Digest, Sha512};
@@ -1628,23 +1594,6 @@ mod tests {
 
         // let expected = hex_to_bytes("00112233445566778899aabbccddeeff");
         // assert_eq!(result, expected);
-    }
-
-    // Placeholder tests for when sha2/aes features are not enabled
-    #[cfg(not(feature = "sha2"))]
-    #[test]
-    fn test_sha256_placeholder() {
-        let input = b"abc";
-        let _result = calculate_sha256(input);
-        // Just verify it compiles and returns correct length
-    }
-
-    #[cfg(not(feature = "aes"))]
-    #[test]
-    fn test_aes128_placeholder() {
-        let key = [0u8; 16];
-        let _cipher = AES128Cipher::new(&key);
-        // Just verify it compiles
     }
 
     // PDF17 Algorithm Tests (ported from crypto_spec.js)

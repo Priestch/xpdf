@@ -70,6 +70,9 @@ static CASES: &[Case] = &[
     // fixture is a parser-robustness probe, not a renderable page.
     Case { fixture: "bad-xref.pdf", page: 0, expect: Expect::Skip },
     Case { fixture: "basicapi.pdf", page: 0, expect: Expect::Ok },
+    // V=5/R=6 AES-256, empty user password, catalog in an ObjStm — proves end-to-end
+    // decryption (open → auto-auth empty password → decrypt streams/strings on fetch).
+    Case { fixture: "catalog-in-objstm-aes.pdf", page: 0, expect: Expect::Ok },
     // Opens via full-file recovery + ObjStm indexing (page_count resolves to 1), but render
     // fails further on the separate content-stream bug ("Expected object number, got
     // Command('obj')") — the same bug blocking annotation-text/flatedecode/issue3115.

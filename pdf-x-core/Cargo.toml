@@ -87,7 +87,12 @@ required-features = ["rendering"]
 [[test]]
 name = "render_golden"
 path = "tests/render_golden.rs"
-required-features = ["rendering"]
+required-features = ["rendering", "crypto"]
+
+[[test]]
+name = "encryption_tests"
+path = "tests/encryption_tests.rs"
+required-features = ["crypto"]
 
 [[example]]
 name = "render"

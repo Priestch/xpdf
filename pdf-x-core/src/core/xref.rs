@@ -68,6 +68,15 @@ pub struct XRef {
     /// Guards lazy fetch-time recovery (hayro's `repair()` model): the first `fetch` that
     /// fails on a bad/stale offset triggers `recover_by_scan` once, then retries.
     recovered: bool,
+
+    /// Keyed decryptor for an encrypted PDF (`Some` only after the password was verified
+    /// and the file key derived). `None` = unencrypted, or encrypted-but-locked. Set via
+    /// [`XRef::set_decryptor`]; decrypts streams/strings inline in [`XRef::fetch_inner`].
+    decryptor: Option<super::encryption::EncryptDict>,
+
+    /// Object number of the `/Encrypt` dictionary, if any — it is exempt from decryption
+    /// (so is the cross-reference stream, detected by `/Type /XRef` on the object itself).
+    encrypt_obj_num: Option<u32>,
 }
 
 /// `XRef` participates in the pull-based [`drive`](crate::core::byte_source::drive) loop:
@@ -117,6 +126,8 @@ impl XRef {
             trailer: None,
             stream,
             recovered: false,
+            decryptor: None,
+            encrypt_obj_num: None,
         }
     }
 
@@ -1365,6 +1376,18 @@ impl XRef {
 
                 // Read the actual object
                 let object = parser.get_object()?;
+
+                // Decrypt streams/strings inline if a keyed decryptor is installed and
+                // the object is not exempt (the /Encrypt dict itself is never encrypted).
+                let object = if let Some(ref decryptor) = self.decryptor {
+                    if self.encrypt_obj_num == Some(obj_num) {
+                        object
+                    } else {
+                        Self::decrypt_object(decryptor, object, obj_num, generation)?
+                    }
+                } else {
+                    object
+                };
                 let object_rc = Rc::new(object);
 
                 // Cache the Rc - cheap clone
@@ -1465,20 +1488,9 @@ impl XRef {
                 // The first element of the ID array is the file ID
                 match &*arr[0] {
                     PDFObject::String(bytes) => Ok(bytes.to_vec()),
-                    PDFObject::HexString(hex) => {
-                        // Convert hex string to bytes
-                        let hex_str = String::from_utf8_lossy(hex);
-                        let mut bytes = Vec::new();
-                        for i in (0..hex_str.len()).step_by(2) {
-                            if i + 1 < hex_str.len() {
-                                let byte_str = &hex_str[i..i + 2];
-                                if let Ok(byte) = u8::from_str_radix(byte_str, 16) {
-                                    bytes.push(byte);
-                                }
-                            }
-                        }
-                        Ok(bytes)
-                    }
+                    // `HexString` is already decoded to raw bytes by the parser (a `<...>`
+                    // token), so the file ID is its bytes directly.
+                    PDFObject::HexString(bytes) => Ok(bytes.to_vec()),
                     _ => Err(PDFError::Generic(
                         "ID array element is not a string".to_string(),
                     )),
@@ -1501,6 +1513,48 @@ impl XRef {
         };
 
         trailer_dict.get("Encrypt").cloned()
+    }
+
+    /// Install the keyed decryptor (file key already derived) so subsequent `fetch`es
+    /// decrypt streams/strings inline. `encrypt_obj_num` is the `/Encrypt` object number,
+    /// which is exempt from decryption. Pass `None` to disable decryption (locked doc).
+    pub fn set_decryptor(
+        &mut self,
+        decryptor: Option<super::encryption::EncryptDict>,
+        encrypt_obj_num: Option<u32>,
+    ) {
+        self.decryptor = decryptor;
+        self.encrypt_obj_num = encrypt_obj_num;
+    }
+
+    /// Decrypt an object's encrypted streams/strings in place, per the installed
+    /// decryptor. Mirrors pdf.js applying a `CipherTransform` during object fetch.
+    /// No-op for non-encrypted content. `obj_num`/`generation` key the per-object cipher.
+    fn decrypt_object(
+        decryptor: &super::encryption::EncryptDict,
+        object: PDFObject,
+        obj_num: u32,
+        generation: u32,
+    ) -> PDFResult<PDFObject> {
+        Ok(match object {
+            PDFObject::Stream { mut dict, data } => {
+                // Cross-reference streams are never encrypted.
+                let is_xref = matches!(dict.get("Type"), Some(PDFObject::Name(n)) if n == "XRef");
+                if is_xref {
+                    PDFObject::Stream { dict, data }
+                } else {
+                    let decrypted = decryptor.decrypt_stream(&data, obj_num, generation)?;
+                    PDFObject::Stream { dict: std::mem::take(&mut dict), data: decrypted }
+                }
+            }
+            PDFObject::String(bytes) => {
+                PDFObject::String(decryptor.decrypt_string(&bytes, obj_num, generation)?)
+            }
+            PDFObject::HexString(bytes) => {
+                PDFObject::HexString(decryptor.decrypt_string(&bytes, obj_num, generation)?)
+            }
+            other => other,
+        })
     }
 
     /// Returns the number of entries in the xref table.

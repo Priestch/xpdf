@@ -151,6 +151,13 @@ impl PDFDocument {
             })?;
         }
 
+        // Wire end-to-end decryption BEFORE any object fetch: read /Encrypt, auto-auth the
+        // empty password, install the decryptor. (The /Encrypt dict itself and the
+        // cross-reference stream are fetched/created during parse, before this point, and
+        // are exempt from decryption anyway; all later fetches — catalog, pages, content —
+        // must see the installed decryptor so an encrypted catalog-in-ObjStm decrypts.)
+        let encrypt_dict = Self::setup_encryption(&mut xref)?;
+
         // Load the catalog
         let catalog = Some(xref.catalog()?);
 
@@ -167,7 +174,7 @@ impl PDFDocument {
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
-            encrypt_dict: None, // Will be set later if encrypted
+            encrypt_dict,
             page_ref_cache: FxHashMap::default(),
             page_ref_cache_built: false,
         })
@@ -252,6 +259,13 @@ impl PDFDocument {
             xref.recover_by_scan()?;
         }
 
+        // Wire end-to-end decryption BEFORE any object fetch: read /Encrypt, auto-auth the
+        // empty password, install the decryptor. (The /Encrypt dict itself and the
+        // cross-reference stream are fetched/created during parse, before this point, and
+        // are exempt from decryption anyway; all later fetches — catalog, pages, content —
+        // must see the installed decryptor so an encrypted catalog-in-ObjStm decrypts.)
+        let encrypt_dict = Self::setup_encryption(&mut xref)?;
+
         // Load the catalog
         let catalog = Some(xref.catalog()?);
 
@@ -268,7 +282,7 @@ impl PDFDocument {
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
-            encrypt_dict: None, // Will be set later if encrypted
+            encrypt_dict,
             page_ref_cache: FxHashMap::default(),
             page_ref_cache_built: false,
         })
@@ -899,6 +913,42 @@ impl PDFDocument {
     /// rotated clockwise when displayed or printed. Must be a multiple of 90.
     pub fn get_rotate(&mut self, page: &Page) -> PDFResult<PDFObject> {
         self.get_inheritable_property(page, "Rotate")
+    }
+
+    /// Read `/Encrypt` from the trailer, build an [`EncryptDict`], and auto-authenticate
+    /// the empty user password (the common corpus case). If the key is derived, install a
+    /// decryptor on `xref` so subsequent fetches decrypt streams/strings inline; in either
+    /// case return the (possibly un-keyed) `EncryptDict` so `is_encrypted()` etc. work.
+    /// Mirrors pdf.js building a `CipherTransformFactory` in `XRef.parse`.
+    fn setup_encryption(xref: &mut XRef) -> PDFResult<Option<EncryptDict>> {
+        let Some(encrypt_ref) = xref.get_encrypt_dict_ref() else {
+            return Ok(None);
+        };
+        // Fetch the /Encrypt dict BEFORE installing any decryptor (it is never encrypted).
+        let encrypt_obj = xref.fetch_if_ref(&encrypt_ref)?;
+        let mut encrypt = EncryptDict::from_object(&encrypt_obj)?;
+
+        // Record the /Encrypt object number so fetch can exempt it from decryption.
+        let encrypt_obj_num = match &encrypt_ref {
+            PDFObject::Ref(r) => Some(r.num),
+            _ => None,
+        };
+
+        // Auto-authenticate the empty user password (most test PDFs use it).
+        let keyed = match encrypt.encryption_version() {
+            EncryptionVersion::V5R5 | EncryptionVersion::V5R6 => encrypt.check_user_password(b""),
+            _ => {
+                // Legacy (V1/2/4) needs the file ID from the trailer.
+                match xref.file_id() {
+                    Ok(file_id) => encrypt.derive_encryption_key_with_file_id(b"", &file_id),
+                    Err(_) => false,
+                }
+            }
+        };
+        if keyed {
+            xref.set_decryptor(Some(encrypt.clone()), encrypt_obj_num);
+        }
+        Ok(Some(encrypt))
     }
 
     /// Checks if this PDF is linearized (optimized for web view).

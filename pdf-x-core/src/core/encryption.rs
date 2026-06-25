@@ -138,14 +138,14 @@ impl EncryptDict {
             let o = dict
                 .get("O")
                 .ok_or_else(|| PDFError::parse_error("Missing O in Encrypt dict", None))?
-                .as_string()
-                .ok_or_else(|| PDFError::parse_error("O must be a string", None))?;
+                .as_string_or_hex()
+                .ok_or_else(|| PDFError::parse_error("O must be a (hex) string", None))?;
 
             let u = dict
                 .get("U")
                 .ok_or_else(|| PDFError::parse_error("Missing U in Encrypt dict", None))?
-                .as_string()
-                .ok_or_else(|| PDFError::parse_error("U must be a string", None))?;
+                .as_string_or_hex()
+                .ok_or_else(|| PDFError::parse_error("U must be a (hex) string", None))?;
 
             let p = dict
                 .get("P")
@@ -156,10 +156,10 @@ impl EncryptDict {
 
             let oe = dict
                 .get("OE")
-                .and_then(|obj| obj.as_string().map(|v| v.to_vec()));
+                .and_then(|obj| obj.as_string_or_hex().map(|v| v.to_vec()));
             let ue = dict
                 .get("UE")
-                .and_then(|obj| obj.as_string().map(|v| v.to_vec()));
+                .and_then(|obj| obj.as_string_or_hex().map(|v| v.to_vec()));
 
             let encrypt_metadata = dict
                 .get("EncryptMetadata")

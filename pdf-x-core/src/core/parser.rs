@@ -136,6 +136,16 @@ impl PDFObject {
         }
     }
 
+    /// Returns the string value whether the object is a literal `String` or a
+    /// `HexString` — both are valid encodings for PDF string values (e.g. the binary
+    /// `/O`, `/U`, `/OE`, `/UE` fields in `/Encrypt`, which are commonly hex-encoded).
+    pub fn as_string_or_hex(&self) -> Option<&[u8]> {
+        match self {
+            PDFObject::String(data) | PDFObject::HexString(data) => Some(data),
+            _ => None,
+        }
+    }
+
     /// Returns the hex string value if this is a HexString object.
     pub fn as_hex_string(&self) -> Option<&[u8]> {
         match self {
