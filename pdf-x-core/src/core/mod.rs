@@ -26,11 +26,6 @@ pub mod stream;
 pub mod sub_stream;
 pub mod xref;
 
-#[cfg(feature = "async")]
-pub mod async_http_chunked_stream;
-#[cfg(feature = "async")]
-pub mod http_chunked_stream;
-
 pub use annotation::{
     Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags, AnnotationRect,
     AnnotationType, FileAttachmentAnnotation, FormFieldType, LinkAction, LinkAnnotation,
@@ -65,8 +60,3 @@ pub use resolved_page::{ResolvedPage, SnapshotPageResolver};
 pub use stream::Stream;
 pub use sub_stream::SubStream;
 pub use xref::{XRef, XRefEntry};
-
-#[cfg(feature = "async")]
-pub use async_http_chunked_stream::{AsyncHttpChunkedStream, ProgressCallback};
-#[cfg(feature = "async")]
-pub use http_chunked_stream::HttpChunkedStream;

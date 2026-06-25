@@ -123,6 +123,3 @@ pub use rendering::{
 
 // Re-export decode module
 pub use core::decode;
-
-#[cfg(feature = "async")]
-pub use core::{AsyncHttpChunkedStream, HttpChunkedStream, ProgressCallback};
