@@ -61,9 +61,10 @@ struct Case {
 /// can be added — it never silently passes.
 static CASES: &[Case] = &[
     Case { fixture: "annotation-border-styles.pdf", page: 0, expect: Expect::Ok },
-    // Render fail: "Expected object number, got Command('obj')" — content-stream
-    // parser quirk on this fixture.
-    Case { fixture: "annotation-text.pdf", page: 0, expect: Expect::Skip },
+    // Renders after lazy fetch-time recovery: this fixture's xref has stale object offsets
+    // (parses fine, but offsets point at wrong bytes); the first failing fetch triggers a
+    // full-file xref rebuild, then the page renders.
+    Case { fixture: "annotation-text.pdf", page: 0, expect: Expect::Ok },
     Case { fixture: "asciihexdecode.pdf", page: 0, expect: Expect::Ok },
     // Open fail: malformed xref (offset 999999 beyond 427-byte stream) — this
     // fixture is a parser-robustness probe, not a renderable page.
@@ -74,10 +75,10 @@ static CASES: &[Case] = &[
     // Command('obj')") — the same bug blocking annotation-text/flatedecode/issue3115.
     Case { fixture: "compressed-object-stream.pdf", page: 0, expect: Expect::Skip },
     Case { fixture: "empty.pdf", page: 0, expect: Expect::Ok },
-    // Render fail: "Expected object number, got Command('obj')".
-    Case { fixture: "flatedecode.pdf", page: 0, expect: Expect::Skip },
-    // Render fail: "Expected object number, got Command('obj')".
-    Case { fixture: "issue3115.pdf", page: 0, expect: Expect::Skip },
+    // Renders after lazy fetch-time recovery (stale xref offsets, like annotation-text).
+    Case { fixture: "flatedecode.pdf", page: 0, expect: Expect::Ok },
+    // Renders after lazy fetch-time recovery (stale xref offsets, like annotation-text).
+    Case { fixture: "issue3115.pdf", page: 0, expect: Expect::Ok },
     // Open fail: linearization header parse — "Object number mismatch: expected
     // 2, got 0".
     Case { fixture: "linearized.pdf", page: 0, expect: Expect::Skip },

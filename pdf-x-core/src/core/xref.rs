@@ -63,6 +63,11 @@ pub struct XRef {
 
     /// Stream to read PDF data from
     stream: Box<dyn BaseStream>,
+
+    /// Whether the xref table has already been rebuilt by the full-file recovery scan.
+    /// Guards lazy fetch-time recovery (hayro's `repair()` model): the first `fetch` that
+    /// fails on a bad/stale offset triggers `recover_by_scan` once, then retries.
+    recovered: bool,
 }
 
 /// `XRef` participates in the pull-based [`drive`](crate::core::byte_source::drive) loop:
@@ -111,6 +116,7 @@ impl XRef {
             cache,
             trailer: None,
             stream,
+            recovered: false,
         }
     }
 
@@ -357,6 +363,7 @@ impl XRef {
 
         // Select a trailer from the candidates (or fall back to a dict carrying /Root).
         self.trailer = self.select_recovery_trailer(&trailers, buf)?;
+        self.recovered = true;
         Ok(())
     }
 
@@ -1210,7 +1217,27 @@ impl XRef {
     ///
     /// This resolves an indirect reference like "5 0 R" to its actual object.
     /// The object is cached after being parsed. Returns an Rc to avoid expensive cloning.
+    ///
+    /// **Lazy recovery:** if the fetch fails on a bad/stale offset (common in corrupt or
+    /// regenerated PDFs whose xref parses but points at the wrong bytes), the first such
+    /// failure triggers a full-file `recover_by_scan` once and retries — mirroring hayro's
+    /// `get_with` → `repair()` model. Subsequent failures pass through.
     pub fn fetch(&mut self, obj_num: u32, generation: u32) -> PDFResult<Rc<PDFObject>> {
+        match self.fetch_inner(obj_num, generation) {
+            Ok(obj) => Ok(obj),
+            Err(e) if !self.recovered && is_stale_offset_error(&e) => {
+                // The xref entry's offset points at the wrong bytes (a corrupt/regenerated
+                // PDF whose xref parses but is stale). Rebuild the xref from real object
+                // offsets once, then retry — hayro's `get_with` → `repair()` model.
+                self.recovered = true;
+                let _ = self.recover_by_scan();
+                self.fetch_inner(obj_num, generation).map_err(|_| e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn fetch_inner(&mut self, obj_num: u32, generation: u32) -> PDFResult<Rc<PDFObject>> {
         // Check cache first - Rc::clone is cheap (just increments refcount)
         if let Some(cached) = self.cache.get(&obj_num) {
             return Ok(Rc::clone(cached));
@@ -2033,4 +2060,16 @@ fn num_in(dict: &HashMap<String, PDFObject>, key: &str) -> Option<usize> {
         PDFObject::Number(n) => Some(*n as usize),
         _ => None,
     }
+}
+
+/// True if a fetch error indicates the xref entry's *offset* points at the wrong bytes
+/// (the "stale xref" signature of regenerated/corrupt PDFs) — the case where lazy fetch-time
+/// recovery should rebuild the xref. Other failures (free objects, genuinely missing
+/// objects, ObjStm decode errors) are left alone.
+fn is_stale_offset_error(e: &PDFError) -> bool {
+    let s = e.to_string();
+    s.contains("Expected object number")
+        || s.contains("Object number mismatch")
+        || s.contains("Generation mismatch for object")
+        || s.contains("Object offset")
 }
