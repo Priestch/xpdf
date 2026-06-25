@@ -77,6 +77,12 @@ pub struct XRef {
     /// Object number of the `/Encrypt` dictionary, if any — it is exempt from decryption
     /// (so is the cross-reference stream, detected by `/Type /XRef` on the object itself).
     encrypt_obj_num: Option<u32>,
+
+    /// Object refs currently being fetched (in progress, below this frame on the stack).
+    /// Guards against circular references in corrupt PDFs: a ref already in this set is
+    /// returned as the null object instead of recursing to a stack overflow. Mirrors
+    /// pdf.js's `_pendingRefs` / hayro's `obj_stream_id == id` check.
+    pending_refs: std::collections::HashSet<(u32, u32)>,
 }
 
 /// `XRef` participates in the pull-based [`drive`](crate::core::byte_source::drive) loop:
@@ -128,6 +134,7 @@ impl XRef {
             recovered: false,
             decryptor: None,
             encrypt_obj_num: None,
+            pending_refs: std::collections::HashSet::new(),
         }
     }
 
@@ -1234,7 +1241,22 @@ impl XRef {
     /// failure triggers a full-file `recover_by_scan` once and retries — mirroring hayro's
     /// `get_with` → `repair()` model. Subsequent failures pass through.
     pub fn fetch(&mut self, obj_num: u32, generation: u32) -> PDFResult<Rc<PDFObject>> {
-        match self.fetch_inner(obj_num, generation) {
+        // Circular-reference guard: a ref already being resolved on the stack (e.g. an
+        // object whose indirect /Length refers back into its own dependency cycle) would
+        // recurse unboundedly and overflow the stack. pdf.js's `_pendingRefs` returns a
+        // CIRCULAR_REF; we return the null object.
+        let key = (obj_num, generation);
+        if self.pending_refs.contains(&key) {
+            eprintln!(
+                "Warning: ignoring circular object reference {obj_num} {generation} R"
+            );
+            return Ok(Rc::new(PDFObject::Null));
+        }
+        self.pending_refs.insert(key);
+        let result = self.fetch_inner(obj_num, generation);
+        self.pending_refs.remove(&key);
+
+        match result {
             Ok(obj) => Ok(obj),
             Err(e) if !self.recovered && matches!(e, PDFError::BadXRefOffset { .. }) => {
                 // The xref entry's offset points at the wrong bytes (a corrupt/regenerated
@@ -1952,6 +1974,40 @@ mod tests {
         // A trailer was selected and /Root resolves to a catalog.
         assert!(xref.trailer().is_some(), "recovery selected a trailer");
         xref.catalog().expect("catalog resolves via recovered trailer");
+    }
+
+    /// A circular object reference (A's /Length is `B R`, B's /Length is `A R`) must NOT
+    /// recurse to a stack overflow — `fetch` returns the null object for the re-entered ref.
+    #[test]
+    fn fetch_circular_reference_returns_null() {
+        // Two dicts that reference each other via indirect /Length: fetch(1) resolves its
+        // /Length 2 0 R via fetch(2), whose /Length 1 0 R re-enters fetch(1) → cycle.
+        let data = b"1 0 obj\n<< /Length 2 0 R >>\nendobj\n2 0 obj\n<< /Length 1 0 R >>\nendobj\n";
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let mut xref = XRef::new(stream);
+        // Place entries directly at the real offsets (bypass full recovery, which needs a
+        // trailer — the cycle behavior doesn't depend on the trailer).
+        let p1 = data
+            .windows(b"1 0 obj".len())
+            .position(|w| w == b"1 0 obj")
+            .unwrap();
+        let p2 = data
+            .windows(b"2 0 obj".len())
+            .position(|w| w == b"2 0 obj")
+            .unwrap();
+        xref.entries.push(None); // obj 0
+        xref.entries.push(Some(XRefEntry::Uncompressed {
+            offset: p1 as u64,
+            generation: 0,
+        }));
+        xref.entries.push(Some(XRefEntry::Uncompressed {
+            offset: p2 as u64,
+            generation: 0,
+        }));
+        // Must terminate (no stack overflow) — the re-entered fetch returns Null.
+        let _ = xref
+            .fetch(1, 0)
+            .expect("circular fetch terminates, not stack-overflows");
     }
 }
 
