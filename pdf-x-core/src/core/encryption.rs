@@ -147,12 +147,15 @@ impl EncryptDict {
                 .as_string_or_hex()
                 .ok_or_else(|| PDFError::parse_error("U must be a (hex) string", None))?;
 
+            // /P is a signed 32-bit integer (commonly negative, e.g. -4). The dictionary
+            // stores it as a float, so cast through i32 first: `-4.0_f64 as u32` saturates
+            // to 0 (Rust's float→uint rule), which would silently break key derivation.
             let p = dict
                 .get("P")
                 .ok_or_else(|| PDFError::parse_error("Missing P in Encrypt dict", None))?
                 .as_number()
                 .ok_or_else(|| PDFError::parse_error("P must be a number", None))?
-                as u32;
+                as i32 as u32;
 
             let oe = dict
                 .get("OE")
@@ -607,16 +610,18 @@ fn check_user_password_legacy(
         encrypt_metadata,
     );
 
-    // For R >= 3, do 19 rounds of RC4 with varying keys
+    // User-password verification (PDF spec Algorithm 5 / pdf.js CipherTransformFactory).
+    // For R >= 3: seed = MD5(PAD ‖ file_id), then 20 RC4 rounds (i=0..19, key XOR i).
+    //   (The previous code seeded with the bare PAD — omitting file_id and the inner MD5 —
+    //    which made the U-check never match, so V=2/V=4 documents could never authenticate.)
+    // For R == 2: check = RC4(key, PAD).
     let check_data = if revision >= 3 {
-        let mut check_data = DEFAULT_PASSWORD_PAD.to_vec();
-        // Iterate backwards from 19 to 0 (as per PDF spec)
-        for i in (0..=19).rev() {
-            let mut derived_key = key.clone();
-            // XOR each byte with the iteration count (not addition!)
-            for byte in derived_key.iter_mut() {
-                *byte ^= i as u8;
-            }
+        use crate::core::crypto::calculate_md5;
+        let mut seed = DEFAULT_PASSWORD_PAD.to_vec();
+        seed.extend_from_slice(file_id);
+        let mut check_data = calculate_md5(&seed).to_vec();
+        for i in 0..=19u8 {
+            let derived_key: Vec<u8> = key.iter().map(|b| b ^ i).collect();
             let mut cipher = ARC4Cipher::new(&derived_key);
             check_data = cipher.encrypt_block(&check_data);
         }
@@ -1102,13 +1107,14 @@ mod tests {
 
         let key = &hash[..key_length];
 
-        // Now compute U with 19 XOR iterations
-        let mut check_data = DEFAULT_PASSWORD_PAD.to_vec();
-        for i in (0..=19).rev() {
-            let mut derived_key = key.to_vec();
-            for byte in derived_key.iter_mut() {
-                *byte ^= i as u8;
-            }
+        // Compute U per PDF spec Algorithm 5 (matches production
+        // check_user_password_legacy for R>=3): seed = MD5(PAD ‖ file_id),
+        // then 20 RC4 rounds i=0..=19 with derived_key = key XOR i.
+        let mut seed = DEFAULT_PASSWORD_PAD.to_vec();
+        seed.extend_from_slice(&file_id);
+        let mut check_data = calculate_md5(&seed).to_vec();
+        for i in 0..=19u8 {
+            let derived_key: Vec<u8> = key.iter().map(|b| b ^ i).collect();
             let mut cipher = ARC4Cipher::new(&derived_key);
             check_data = cipher.encrypt_block(&check_data);
         }
@@ -1239,7 +1245,7 @@ mod tests {
         dict.insert("R".to_string(), PDFObject::Number(3.0));
         dict.insert("O".to_string(), PDFObject::String(vec![0u8; 32]));
         dict.insert("U".to_string(), PDFObject::String(vec![0u8; 32]));
-        dict.insert("P".to_string(), PDFObject::Number(0xFFFFFFFCu32 as f64));
+        dict.insert("P".to_string(), PDFObject::Number(-4.0f64));
 
         let encrypt_obj = PDFObject::Dictionary(dict);
 
@@ -1318,5 +1324,37 @@ mod tests {
             .expect("Stream decryption should succeed");
 
         assert_eq!(decrypted, original.to_vec());
+    }
+}
+
+#[cfg(all(test, feature = "crypto"))]
+mod legacy_tests {
+    use super::*;
+    #[test]
+    fn legacy_v2_user_password_with_test() {
+        // qpdf V=2/R=3 RC4-128, user password "test".
+        let o = vec![0xba,0xda,0xd1,0xe8,0x64,0x42,0x69,0x94,0x27,0x11,0x6d,0x3e,0x5d,0x52,0x71,0xbc,
+                     0x80,0xa2,0x78,0x14,0xfc,0x5e,0x80,0xf8,0x15,0xef,0xee,0xf8,0x39,0x35,0x4c,0x5f];
+        let u = vec![0x0b,0x79,0xb7,0x50,0x2c,0x17,0x09,0x6b,0xf9,0x45,0x2c,0x4e,0x55,0x74,0xeb,0x4b,
+                     0x01,0x22,0x45,0x6a,0x91,0xba,0xe5,0x13,0x42,0x73,0xa6,0xdb,0x13,0x4c,0x87,0xc4];
+        let file_id = vec![0xea,0x8b,0x35,0x91,0x9d,0x62,0x79,0xa3,0x69,0xe8,0x35,0xbd,0xe7,0x78,0x61,0x1b];
+        let key = check_user_password_legacy(b"test", &o, (-4i32) as u32, &file_id, 3, 16, true, &u);
+        assert!(key.is_some(), "V=2/R=3 user password 'test' must authenticate");
+    }
+
+    /// The qpdf V=2 fixture encrypted with the EMPTY user password — `check_user_password_legacy`
+    /// with "" must succeed (cross-checked against an independent reference implementation).
+    #[test]
+    fn legacy_v2_user_password_empty() {
+        let o = vec![0x36,0x45,0x1b,0xd3,0x9d,0x75,0x3b,0x7c,0x1d,0x10,0x92,0x2c,0x28,0xe6,0x66,0x5a,
+                     0xa4,0xf3,0x35,0x3f,0xb0,0x34,0x8b,0x53,0x68,0x93,0xe3,0xb1,0xdb,0x5c,0x57,0x9b];
+        let u = vec![0xf1,0x35,0x3b,0x80,0x4b,0x58,0xd9,0x16,0xa1,0x60,0xbe,0x6a,0x1e,0x67,0x5e,0x35,
+                     0x01,0x22,0x45,0x6a,0x91,0xba,0xe5,0x13,0x42,0x73,0xa6,0xdb,0x13,0x4c,0x87,0xc4];
+        let file_id = vec![0xea,0x8b,0x35,0x91,0x9d,0x62,0x79,0xa3,0x69,0xe8,0x35,0xbd,0xe7,0x78,0x61,0x1b];
+        let key = check_user_password_legacy(b"", &o, (-4i32) as u32, &file_id, 3, 16, true, &u);
+        let dk = derive_encryption_key(b"", &o, (-4i32) as u32, &file_id, 3, 16, true);
+        // Cross-check: the derived file key for empty pw must be 62088b... (independent ref).
+        assert_eq!(key, Some(vec![0x62,0x08,0x8b,0x87,0x51,0xfd,0x15,0xdd,0x6b,0xf8,0x2c,0x6f,0xaf,0xa3,0xaf,0x01]),
+            "empty-pw legacy file key mismatch");
     }
 }

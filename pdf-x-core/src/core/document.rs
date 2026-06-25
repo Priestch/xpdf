@@ -1120,19 +1120,26 @@ impl PDFDocument {
     /// the file ID must have been stored in the trailer during parsing.
     pub fn authenticate_with_password(&mut self, password: &[u8]) -> PDFResult<bool> {
         if let Some(ref mut encrypt_dict) = self.encrypt_dict {
-            // Try to get file ID from trailer for V=1,2,4
-            let file_id = self.xref.file_id()?;
-
-            if matches!(
+            let keyed = if matches!(
                 encrypt_dict.encryption_version(),
                 EncryptionVersion::V5R5 | EncryptionVersion::V5R6
             ) {
-                // PDF 2.0 doesn't need file ID
-                Ok(encrypt_dict.check_user_password(password))
+                encrypt_dict.check_user_password(password)
             } else {
-                // Earlier versions need file ID
-                Ok(encrypt_dict.derive_encryption_key_with_file_id(password, &file_id))
+                // Legacy (V=1/2/4) needs the file ID from the trailer.
+                let file_id = self.xref.file_id()?;
+                encrypt_dict.derive_encryption_key_with_file_id(password, &file_id)
+            };
+            if keyed {
+                // Install the decryptor so subsequent fetches decrypt streams/strings inline.
+                let encrypt_obj_num = self
+                    .xref
+                    .get_encrypt_dict_ref()
+                    .and_then(|r| match r { PDFObject::Ref(r) => Some(r.num), _ => None });
+                self.xref
+                    .set_decryptor(Some(encrypt_dict.clone()), encrypt_obj_num);
             }
+            Ok(keyed)
         } else {
             Ok(false) // Not encrypted
         }
