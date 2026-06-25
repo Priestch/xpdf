@@ -70,6 +70,27 @@ pub struct PDFDocument {
     page_ref_cache_built: bool,
 }
 
+/// Given a resolved page tree node, return the number of leaf pages in its subtree.
+/// Returns `None` if the count cannot be determined (non-dict kid, missing `/Count`
+/// on a Pages node, etc.). A single Page leaf always returns `Some(1)`.
+fn get_subtree_page_count(obj: &PDFObject) -> Option<usize> {
+    match obj {
+        PDFObject::Dictionary(dict) => {
+            if dict.contains_key("Kids") {
+                // Pages intermediate node — use /Count
+                dict.get("Count").and_then(|c| match c {
+                    PDFObject::Number(n) if *n >= 0.0 => Some(*n as usize),
+                    _ => None,
+                })
+            } else {
+                // Page leaf node
+                Some(1)
+            }
+        }
+        _ => None,
+    }
+}
+
 impl PDFDocument {
     /// Opens a PDF document from a byte array.
     ///
@@ -589,83 +610,100 @@ impl PDFDocument {
         self.page_ref_cache.get(&(ref_num, ref_gen)).copied()
     }
 
-    /// Traverses the page tree to find a specific page by index.
+    /// Traverses the page tree to find a specific page by index, using count-based
+    /// branch skipping to avoid O(N²) on sequential access.
     ///
     /// PDF page trees can be hierarchical with intermediate "Pages" nodes
-    /// containing "Kids" arrays. This method implements depth-first traversal
-    /// similar to PDF.js's getPageDict method.
+    /// containing "Kids" arrays. Each Pages node has a `/Count` field giving the
+    /// total number of leaf pages in its subtree. When iterating Kids, if the
+    /// entire subtree lies before the target index, we skip it without entering
+    /// — this makes each call visit O(depth) nodes rather than O(N).
     ///
-    /// # Arguments
-    /// * `page_index` - The 0-based page index to retrieve
+    /// Mirrors PDF.js's `Catalog.getPageDict` approach adapted for count-based
+    /// pruning.
     ///
-    /// # Returns
-    /// Returns (page_dict, page_ref) where page_ref is the indirect reference if available
+    /// Cache: found pages are cached by ref in `PageTreeCache.page_refs`.
+    /// `fully_built` is only set when the tree has been exhausted (page not found),
+    /// preventing repeated failed traversals for out-of-bounds requests.
     fn get_page_dict(&mut self, page_index: usize) -> PDFResult<(PDFObject, Option<(u32, u32)>)> {
-        // Get the root Pages dictionary
-        let root_pages = self.pages_dict()?;
+        // Fast path: check the forward ref cache.
+        let cached_target = self.page_cache.get_page_ref(page_index);
+        if let Some(cached_ref) = cached_target {
+            let mut store = self.doc_store_mut();
+            let page_dict = store.resolve_ref(cached_ref.0, cached_ref.1)?;
+            return Ok((page_dict, Some(cached_ref)));
+        }
 
-        // Resolve page-tree objects through the DocStore (delta → base), so edits to
-        // page-tree nodes are honored. Delta is empty in v1 → behavior-preserving.
+        // Already fully walked but page_index not cached — doesn't exist.
+        if self.page_cache.is_fully_built() {
+            return Err(PDFError::Generic(format!(
+                "Page index {} not found in page tree",
+                page_index
+            )));
+        }
+
+        // Slow path: DFS with count-based branch skipping.
+        let root_pages = self.pages_dict()?;
         let mut store = self.doc_store_mut();
 
-        // Stack for depth-first traversal: (node, is_reference)
-        let mut nodes_to_visit: Vec<(PDFObject, Option<(u32, u32)>)> = vec![(root_pages, None)];
+        let mut stack: Vec<(PDFObject, Option<(u32, u32)>)> = vec![(root_pages, None)];
         let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
-        let mut current_page_index = 0;
+        let mut current_page_index = 0usize;
+        let mut discovered: Vec<(usize, Option<(u32, u32)>)> = Vec::new();
 
-        while let Some((current_node, node_ref)) = nodes_to_visit.pop() {
-            // Handle references
-            let (node_obj, obj_ref) = match &current_node {
+        while let Some((current_node, node_ref)) = stack.pop() {
+            // Resolve indirect references with cycle detection.
+            let (node_obj, resolved_ref) = match &current_node {
                 PDFObject::Ref(ref_obj) => {
                     let ref_key = (ref_obj.num, ref_obj.generation);
-
-                    // Prevent circular references
                     if visited_refs.contains(&ref_key) {
                         return Err(PDFError::Generic(
                             "Circular reference in page tree".to_string(),
                         ));
                     }
                     visited_refs.insert(ref_key);
-
-                    // Fetch the object via delta → base resolution.
                     let obj = store.resolve_ref(ref_obj.num, ref_obj.generation)?;
                     (obj, Some(ref_key))
                 }
                 _ => (current_node.clone(), node_ref),
             };
 
-            // Check if this is a dictionary
             let dict = match &node_obj {
                 PDFObject::Dictionary(d) => d,
                 _ => continue,
             };
 
-            // Check the Type field
             let type_obj = dict.get("Type");
             let is_page = match type_obj {
                 Some(PDFObject::Name(name)) => name == "Page",
-                _ => !dict.contains_key("Kids"), // If no Type, check for Kids (leaf node)
+                _ => !dict.contains_key("Kids"),
             };
 
             if is_page {
-                // This is a page node
+                // Record every page we pass through (builds cache for future lookups).
+                discovered.push((current_page_index, resolved_ref));
+
                 if current_page_index == page_index {
-                    return Ok((node_obj, obj_ref));
+                    // Found target — flush cache and return.
+                    drop(store);
+                    for (idx, ref_opt) in &discovered {
+                        self.page_cache.put_page_ref(*idx, *ref_opt);
+                    }
+                    return Ok((node_obj, resolved_ref));
                 }
+
                 current_page_index += 1;
                 continue;
             }
 
-            // This is an intermediate Pages node - traverse its Kids
-            let kids = dict
-                .get("Kids")
-                .ok_or_else(|| PDFError::Generic("Pages node missing Kids array".to_string()))?;
+            // Pages node: get Kids array.
+            let kids = dict.get("Kids").ok_or_else(|| {
+                PDFError::Generic("Pages node missing Kids array".to_string())
+            })?;
 
-            // Get the kids array (either directly or by resolving a reference)
             let kids_array = match kids {
                 PDFObject::Array(arr) => arr.clone(),
                 PDFObject::Ref(ref_obj) => {
-                    // Kids is a reference, resolve it via delta → base.
                     let fetched = store.resolve_ref(ref_obj.num, ref_obj.generation)?;
                     match &fetched {
                         PDFObject::Array(arr) => arr.clone(),
@@ -683,12 +721,63 @@ impl PDFDocument {
                 }
             };
 
-            // Add kids to stack in reverse order (to maintain order during DFS)
-            for kid in kids_array.iter().rev() {
-                nodes_to_visit.push(((**kid).clone(), None));
+            // Walk kids in forward order, accumulating page count.
+            // For each kid: if `base + count > page_index` the target is inside
+            // this kid's subtree — enter it. Otherwise add `count` to `base`
+            // and skip the entire branch. Unknown count forces entry (can't skip).
+            let mut base = current_page_index;
+            let mut entered_kid = false;
+
+            for kid_ref_obj in kids_array.iter() {
+                let kid = &**kid_ref_obj;
+
+                let (resolved_kid, kid_ref, subtree_count) = match kid {
+                    PDFObject::Ref(ref_obj) => {
+                        let ref_key = (ref_obj.num, ref_obj.generation);
+                        let resolved = store.resolve_ref(ref_obj.num, ref_obj.generation)?;
+                        let count = get_subtree_page_count(&resolved);
+                        (resolved, Some(ref_key), count)
+                    }
+                    _ => {
+                        let count = get_subtree_page_count(kid);
+                        (kid.clone(), None, count)
+                    }
+                };
+
+                let should_enter = match subtree_count {
+                    Some(c) => base + c > page_index,
+                    None => true, // unknown count — must enter
+                };
+
+                if should_enter {
+                    if let Some(ref_key) = kid_ref {
+                        if visited_refs.contains(&ref_key) {
+                            return Err(PDFError::Generic(
+                                "Circular reference in page tree".to_string(),
+                            ));
+                        }
+                        visited_refs.insert(ref_key);
+                    }
+                    current_page_index = base;
+                    stack.push((resolved_kid, kid_ref));
+                    entered_kid = true;
+                    break;
+                }
+
+                if let Some(c) = subtree_count {
+                    base += c;
+                }
+            }
+
+            if !entered_kid {
+                // Every kid was skipped — update position past this entire subtree.
+                current_page_index = base;
             }
         }
 
+        // Exhausted the tree without finding the page.
+        drop(store);
+        self.page_cache.set_fully_built();
         Err(PDFError::Generic(format!(
             "Page index {} not found in page tree",
             page_index

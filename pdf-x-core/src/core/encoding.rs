@@ -43,10 +43,22 @@ impl Encoding {
                 _ => None,
             },
             crate::core::parser::PDFObject::Dictionary(d) => {
-                // Custom encoding with Differences array
+                // Custom encoding with BaseEncoding and/or Differences
+                // PDF spec §9.6.6: BaseEncoding provides the base mapping;
+                // Differences overrides specific character codes.
+                // Ported from pdf.js src/core/evaluator.js (readEncoding)
+                let base = d.get("BaseEncoding");
+                let mut map = if let Some(base_enc) = encoding_table_from_name(base) {
+                    base_enc
+                } else {
+                    // PDF spec §9.6.6: Type1 fonts with no explicit BaseEncoding
+                    // default to StandardEncoding. Ported from pdf.js evaluator.js
+                    // translateFont() which does the same for simple non-CID fonts.
+                    encoding_table_from_name(Some(&crate::core::parser::PDFObject::Name("StandardEncoding".into())))
+                        .unwrap_or_else(|| vec![0u16; 256])
+                };
                 if let Some(diff) = d.get("Differences") {
                     if let crate::core::parser::PDFObject::Array(arr) = diff {
-                        let mut map = vec![0u16; 256];
                         let mut current = 0u16;
                         for item in arr {
                             match &**item {
@@ -55,17 +67,18 @@ impl Encoding {
                                 }
                                 crate::core::parser::PDFObject::Name(name) => {
                                     if let Some(c) = name_to_unicode(name) {
-                                        map[current as usize] = c;
+                                        if (current as usize) < map.len() {
+                                            map[current as usize] = c;
+                                        }
                                     }
                                     current += 1;
                                 }
                                 _ => {}
                             }
                         }
-                        return Some(Encoding::Custom(map));
                     }
                 }
-                None
+                return Some(Encoding::Custom(map));
             }
             _ => None,
         }
@@ -90,6 +103,26 @@ impl Encoding {
             Encoding::None => char::from_u32(code as u32).unwrap_or('\u{FFFD}'),
         }
     }
+}
+
+/// Returns the base encoding table for a named encoding (Vec<u16>).
+/// Used by Encoding::from_pdf_object to initialize Custom encoding
+/// from BaseEncoding before applying Differences.
+/// Ported from pdf.js src/core/encodings.js getEncoding().
+fn encoding_table_from_name(obj: Option<&crate::core::parser::PDFObject>) -> Option<Vec<u16>> {
+    let name = match obj {
+        Some(crate::core::parser::PDFObject::Name(n)) => n.as_str(),
+        _ => return None,
+    };
+    let table: &[char; 256] = match name {
+        "WinAnsiEncoding" => &WIN_ANSI_ENCODING,
+        "MacRomanEncoding" => &MAC_ROMAN_ENCODING,
+        "MacExpertEncoding" => &MAC_EXPERT_ENCODING,
+        "StandardEncoding" => &STANDARD_ENCODING,
+        "PDFDocEncoding" => &STANDARD_ENCODING,
+        _ => return None,
+    };
+    Some(table.iter().map(|c| *c as u16).collect())
 }
 
 /// Convert a glyph name to Unicode character.

@@ -33,6 +33,8 @@ pub enum FontType {
     CIDFontType0,
     /// CID TrueType font
     CIDFontType2,
+    /// Type0 composite font (wraps a CID font via /DescendantFonts)
+    Type0,
     /// Unknown font type
     Unknown,
 }
@@ -45,6 +47,7 @@ impl FontType {
             "Type1C" => FontType::Type1C,
             "TrueType" => FontType::TrueType,
             "Type3" => FontType::Type3,
+            "Type0" => FontType::Type0,
             "CIDFontType0" => FontType::CIDFontType0,
             "CIDFontType2" => FontType::CIDFontType2,
             _ => FontType::Unknown,
@@ -52,8 +55,12 @@ impl FontType {
     }
 
     /// Returns true if this is a CID font (multi-byte character IDs).
+    /// Type0 is a composite font that always uses a CIDFont descendant.
     pub fn is_cid_font(&self) -> bool {
-        matches!(self, FontType::CIDFontType0 | FontType::CIDFontType2)
+        matches!(
+            self,
+            FontType::Type0 | FontType::CIDFontType0 | FontType::CIDFontType2
+        )
     }
 }
 

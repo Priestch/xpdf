@@ -1,5 +1,6 @@
 use super::error::{PDFError, PDFResult};
 use super::parser::PDFObject;
+use super::{ContentStreamEvaluator, Lexer, Stream};
 use rustc_hash::FxHashMap;
 
 /// A single page in a PDF document.
@@ -416,7 +417,6 @@ impl Page {
         &self,
         resolver: &mut R,
     ) -> PDFResult<Vec<super::content_stream::TextItem>> {
-        use super::decode::decode_flate;
         use super::{ContentStreamEvaluator, Lexer, Stream};
 
         let contents = match self.contents() {
@@ -494,12 +494,141 @@ impl Page {
                 let _ = evaluator.load_fonts(&resources, resolver.as_xref_mut());
             }
 
-            // Extract text from this stream
-            let text_items = evaluator.extract_text()?;
+                // Extract text from this stream
+                let text_items = evaluator.extract_text()?;
             all_text_items.extend(text_items);
+
+            // Recurse into Form XObjects referenced by `Do` in this stream — text
+            // inside Form XObjects must be extracted too (many PDFs put body text
+            // in Form XObjects, e.g. TAMReview.pdf). The evaluator collected the
+            // XObject names; we resolve each through the page resources and, if it
+            // is a Form XObject, decode + extract its text with the same machinery.
+            let form_names = evaluator.take_form_xobject_names();
+            if !form_names.is_empty() {
+                let resources = self.get_inheritable_resources(resolver.as_xref_mut())?;
+                for name in form_names {
+                    if let Some(ref res) = resources {
+                        if let Err(e) = self.extract_text_from_form_xobject(
+                            &name,
+                            res,
+                            resolver,
+                            &mut all_text_items,
+                            0,
+                        ) {
+                            eprintln!("Warning: Form XObject '{}' text extraction failed: {:?}", name, e);
+                        }
+                    }
+                }
+            }
         }
 
         Ok(all_text_items)
+    }
+
+    /// Maximum recursion depth for nested Form XObjects (prevent infinite loops).
+    const FORM_XOBJECT_MAX_DEPTH: u8 = 16;
+
+    /// Recursively extract text from a Form XObject referenced by name in the
+    /// given resources. Mirrors `RenderingContext::paint_form_xobject` but for
+    /// text extraction: decodes the form stream, loads its fonts (from the form's
+    /// own /Resources or the inherited page resources), and runs the evaluator.
+    fn extract_text_from_form_xobject<R: PageResolver>(
+        &self,
+        xobject_name: &str,
+        resources: &PDFObject,
+        resolver: &mut R,
+        out: &mut Vec<super::content_stream::TextItem>,
+        depth: u8,
+    ) -> PDFResult<()> {
+        if depth >= Self::FORM_XOBJECT_MAX_DEPTH {
+            return Ok(());
+        }
+
+        let resources_dict = match resources {
+            PDFObject::Dictionary(d) => d,
+            _ => return Ok(()),
+        };
+
+        // Find /XObject in resources and resolve if Ref.
+        let xobject_obj = match resources_dict.get("XObject") {
+            Some(o) => o,
+            None => return Ok(()),
+        };
+        let xobject_dict = match resolver.resolve_if_ref(xobject_obj)? {
+            PDFObject::Dictionary(d) => d,
+            _ => return Ok(()),
+        };
+
+        // Find the named XObject.
+        let xobject_ref = match xobject_dict.get(xobject_name) {
+            Some(o) => o,
+            None => return Ok(()),
+        };
+        let xobject = resolver.resolve_if_ref(xobject_ref)?;
+
+        let (form_dict, form_data) = match xobject {
+            PDFObject::Stream { dict, data } => (dict, data),
+            _ => return Ok(()),
+        };
+
+        // Only Form XObjects contain text; Image XObjects don't.
+        let is_form = form_dict
+            .get("Subtype")
+            .and_then(|s| match s {
+                PDFObject::Name(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .map(|n| n == "Form")
+            .unwrap_or(false);
+        if !is_form {
+            return Ok(());
+        }
+
+        // Decode the form stream.
+        let decoded_data = if let Some(filter) = form_dict.get("Filter") {
+            match super::decode::apply_filters(&form_data, filter) {
+                Ok(d) => d,
+                Err(_) => return Ok(()),
+            }
+        } else {
+            form_data.clone()
+        };
+
+        let stream = Box::new(Stream::from_bytes(decoded_data)) as Box<dyn super::BaseStream>;
+        let lexer = Lexer::new(stream)?;
+        let parser = super::Parser::new(lexer)?;
+        let mut evaluator = ContentStreamEvaluator::new(parser);
+
+        // Load fonts: Form XObjects may define their own /Resources; otherwise
+        // inherit the page's. Fetch if Ref.
+        let form_resources = if let Some(res_obj) = form_dict.get("Resources") {
+            resolver.resolve_if_ref(res_obj).ok()
+        } else {
+            Some(resources.clone())
+        };
+        if let Some(ref form_res) = form_resources {
+            let _ = evaluator.load_fonts(form_res, resolver.as_xref_mut());
+        }
+
+        // Extract text from the form's content stream.
+        let text_items = evaluator.extract_text()?;
+        out.extend(text_items);
+
+        // Recurse into nested Form XObjects.
+        let nested_names = evaluator.take_form_xobject_names();
+        for name in nested_names {
+            if let Some(ref form_res) = form_resources {
+                let _ = self.extract_text_from_form_xobject(
+                    &name,
+                    form_res,
+                    resolver,
+                    out,
+                    depth + 1,
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Extracts all text from the page as a single string.
@@ -543,31 +672,79 @@ impl Page {
             }
         });
 
-        // Group text items into lines based on Y position
-        let mut result = String::new();
-        let mut last_y: Option<f64> = None;
-        let line_threshold = 2.0; // Y-distance threshold to consider same line
+        // Group text items into lines based on Y position.
+        //
+        // Two joining strategies:
+        //   1) Per-char mode (all items single-char): join using positional X-gap
+        //      running average. Gaps > 1.4× the running average are word boundaries.
+        //   2) Normal mode (any multi-char item): standard space join between items.
+        //
+        // The TJ handler already inserts word spaces for multi-char text in TJ arrays
+        // (using last_string_multi guard), so strategy 2 handles the common case well.
+        // Strategy 1 handles per-char Tj sequences where word boundaries are implicit
+        // from positional gaps (e.g. issue6961, freeculture).
+        let all_single_char = text_items.iter().all(|t| t.text.chars().count() == 1);
 
-        for item in text_items {
-            if let Some((_, y)) = item.position {
-                if let Some(prev_y) = last_y {
-                    // If Y position changed significantly, start a new line
-                    if (y - prev_y).abs() > line_threshold {
-                        result.push('\n');
-                    } else {
-                        // Same line, add a space between items
-                        if !result.is_empty() && !result.ends_with(' ') && !result.ends_with('\n') {
+        if all_single_char {
+            let mut result = String::new();
+            let mut last_y: Option<f64> = None;
+            let mut last_x: Option<f64> = None;
+            let line_threshold = 2.0;
+            let mut avg_gap: f64 = 0.0;
+            let mut has_avg: bool = false;
+
+            for item in &text_items {
+                if let Some(pos) = item.position {
+                    if let Some(prev_y) = last_y {
+                        if (pos.1 - prev_y).abs() > line_threshold {
+                            result.push('\n');
+                            avg_gap = 0.0;
+                            has_avg = false;
+                        } else if let Some(prev_x) = last_x {
+                            let gap = pos.0 - prev_x;
+                            if has_avg {
+                                if gap > avg_gap * 1.35
+                                    && !result.is_empty()
+                                    && !result.ends_with(' ')
+                                {
+                                    result.push(' ');
+                                    has_avg = false;
+                                } else {
+                                    avg_gap = avg_gap * 0.6 + gap * 0.4;
+                                }
+                            } else if gap > 0.0 {
+                                avg_gap = gap;
+                                has_avg = true;
+                            }
+                        }
+                    }
+                    last_y = Some(pos.1);
+                    last_x = Some(pos.0);
+                }
+                result.push_str(&item.text);
+            }
+            Ok(result)
+        } else {
+            // Normal mode: simply group into lines and join with spaces.
+            let mut result = String::new();
+            let mut last_y: Option<f64> = None;
+            let line_threshold = 2.0;
+
+            for item in text_items {
+                if let Some(pos) = item.position {
+                    if let Some(prev_y) = last_y {
+                        if (pos.1 - prev_y).abs() > line_threshold {
+                            result.push('\n');
+                        } else if !result.is_empty() && !result.ends_with(' ') {
                             result.push(' ');
                         }
                     }
+                    last_y = Some(pos.1);
                 }
-                last_y = Some(y);
+                result.push_str(&item.text);
             }
-
-            result.push_str(&item.text);
+            Ok(result)
         }
-
-        Ok(result)
     }
 
     /// Renders this page to a rendering device.
@@ -975,6 +1152,12 @@ impl Page {
 pub struct PageTreeCache {
     /// Cache of page dictionaries by page index
     pages: FxHashMap<usize, Page>,
+
+    /// Forward cache: page index → page ref (object number, generation).
+    /// Populated lazily; once `page_refs_fully_built` the entire tree has
+    /// been enumerated so no further traversal is needed.
+    page_refs: Vec<Option<(u32, u32)>>,
+    page_refs_fully_built: bool,
 }
 
 impl PageTreeCache {
@@ -982,6 +1165,8 @@ impl PageTreeCache {
     pub fn new() -> Self {
         PageTreeCache {
             pages: FxHashMap::default(),
+            page_refs: Vec::new(),
+            page_refs_fully_built: false,
         }
     }
 
@@ -1000,9 +1185,34 @@ impl PageTreeCache {
         self.pages.contains_key(&page_index)
     }
 
+    /// Returns the cached page ref for an index, if known.
+    pub fn get_page_ref(&self, page_index: usize) -> Option<(u32, u32)> {
+        self.page_refs.get(page_index).copied().flatten()
+    }
+
+    /// Stores a page ref for a given index, ensuring the vec is large enough.
+    pub fn put_page_ref(&mut self, page_index: usize, page_ref: Option<(u32, u32)>) {
+        if page_index >= self.page_refs.len() {
+            self.page_refs.resize(page_index + 1, None);
+        }
+        self.page_refs[page_index] = page_ref;
+    }
+
+    /// Whether the full page tree has been walked at least once.
+    pub fn is_fully_built(&self) -> bool {
+        self.page_refs_fully_built
+    }
+
+    /// Marks the full page tree as enumerated.
+    pub fn set_fully_built(&mut self) {
+        self.page_refs_fully_built = true;
+    }
+
     /// Clears the cache.
     pub fn clear(&mut self) {
         self.pages.clear();
+        self.page_refs.clear();
+        self.page_refs_fully_built = false;
     }
 }
 

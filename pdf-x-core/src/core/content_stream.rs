@@ -485,11 +485,19 @@ struct TextExtractionState {
     /// Current text rendering mode
     text_rendering_mode: Option<i32>,
 
+    /// Current text leading (set by TL operator)
+    leading: f64,
+
     /// Whether we're in a text object (BT...ET)
     in_text_object: bool,
 
     /// Extracted text items
     extracted_text: Vec<TextItem>,
+
+    /// Form XObject names encountered via `Do` during this extraction. The caller
+    /// (Page::extract_text) drains this after the run and recursively extracts text
+    /// from each Form XObject, so text inside Form XObjects is not silently lost.
+    form_xobject_names: Vec<String>,
 }
 
 impl Default for TextExtractionState {
@@ -501,8 +509,10 @@ impl Default for TextExtractionState {
             current_font_name: None,
             current_font_size: None,
             text_rendering_mode: None,
+            leading: 0.0,
             in_text_object: false,
             extracted_text: Vec::new(),
+            form_xobject_names: Vec::new(),
         }
     }
 }
@@ -608,6 +618,14 @@ impl ContentStreamEvaluator {
         Ok(self.text_state.extracted_text.clone())
     }
 
+    /// Returns the Form XObject names encountered via `Do` during the last
+    /// `extract_text` run, draining the internal buffer. The caller is expected
+    /// to recursively extract text from each Form XObject (resolving it through
+    /// the page's resources) so text inside Form XObjects is not lost.
+    pub fn take_form_xobject_names(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.text_state.form_xobject_names)
+    }
+
     /// Processes an operation for text extraction.
     fn process_text_operation(&mut self, op: &Operation) -> PDFResult<()> {
         match op.op {
@@ -638,6 +656,13 @@ impl ContentStreamEvaluator {
                     }
                 }
             }
+            OpCode::SetLeading => {
+                if op.args.len() >= 1 {
+                    if let PDFObject::Number(leading) = &op.args[0] {
+                        self.text_state.leading = *leading;
+                    }
+                }
+            }
             OpCode::SetTextMatrix => {
                 if op.args.len() >= 6 {
                     // Set text matrix from 6 numbers [a b c d e f]
@@ -665,31 +690,47 @@ impl ContentStreamEvaluator {
             }
             OpCode::NextLine => {
                 if self.text_state.in_text_object {
-                    // T* - move to next line using leading
-                    self.text_state.text_line_matrix[5] -=
-                        self.text_state.text_line_matrix[5] * 0.0; // Simplified
+                    // T* - move to start of next line
+                    self.text_state.text_line_matrix[4] = 0.0;
+                    self.text_state.text_line_matrix[5] -= self.text_state.leading;
                     self.text_state.text_matrix = self.text_state.text_line_matrix;
+                }
+            }
+            OpCode::SetLeadingMoveText => {
+                if op.args.len() >= 2 && self.text_state.in_text_object {
+                    // TD - set leading and move text position
+                    if let (PDFObject::Number(tx), PDFObject::Number(ty)) =
+                        (&op.args[0], &op.args[1])
+                    {
+                        self.text_state.leading = -*ty;
+                        self.text_state.text_line_matrix[4] += tx;
+                        self.text_state.text_line_matrix[5] += ty;
+                        self.text_state.text_matrix = self.text_state.text_line_matrix;
+                    }
                 }
             }
             OpCode::ShowText => {
                 // Tj - show text string
                 if op.args.len() >= 1 && self.text_state.in_text_object {
-                    if let PDFObject::String(text_bytes) = &op.args[0] {
-                        let text = self.decode_text(text_bytes);
-                        let position = Some((
-                            self.text_state.text_matrix[4],
-                            self.text_state.text_matrix[5],
-                        ));
+                    match &op.args[0] {
+                        PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
+                            let text = self.decode_text(text_bytes);
+                            let position = Some((
+                                self.text_state.text_matrix[4],
+                                self.text_state.text_matrix[5],
+                            ));
 
-                        let text_item = TextItem {
-                            text,
-                            font_name: self.text_state.current_font_name.clone(),
-                            font_size: self.text_state.current_font_size,
-                            position,
-                            rendering_mode: self.text_state.text_rendering_mode,
-                        };
+                            let text_item = TextItem {
+                                text,
+                                font_name: self.text_state.current_font_name.clone(),
+                                font_size: self.text_state.current_font_size,
+                                position,
+                                rendering_mode: self.text_state.text_rendering_mode,
+                            };
 
-                        self.text_state.extracted_text.push(text_item);
+                            self.text_state.extracted_text.push(text_item);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -705,20 +746,67 @@ impl ContentStreamEvaluator {
                             self.text_state.text_matrix[5],
                         ));
 
+                        // Track whether the last string in the array was a full word
+                        // or punctuation. Only spacing values following a multi-char
+                        // string or punctuation can be word boundaries (separating full
+                        // words). Per-char TJ arrays (e.g., `[(P) -207 (a) ...]`) use
+                        // spacing values that represent glyph advances, not word spaces.
+                        let mut last_was_word_or_punct = false;
+                        // Also track whether we've skipped an initial single-character
+                        // word (meaning subsequent spacing should still be word spaces).
+                        let mut seen_word = false;
+
                         for item in items {
                             match &**item {
-                                PDFObject::String(text_bytes) => {
+                                PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
                                     // Decode text using font encoding (CMap)
                                     let text = self.decode_text(text_bytes);
+                                    let count = text.chars().count();
+                                    last_was_word_or_punct = count > 1
+                                        || count == 1 && text.chars().next().is_some_and(|c| {
+                                            c == ',' || c == '.' || c == ';' || c == ':'
+                                                || c == '!' || c == '?' || c == ')'
+                                                || c == ']' || c == '}' || c == '%'
+                                        });
+                                    if count > 1 { seen_word = true; }
                                     accumulated_text.push_str(&text);
                                 }
-                                PDFObject::Number(spacing) => {
-                                    // Spacing adjustment in 1/1000ths of a text space unit
-                                    // Negative numbers move text closer together (like kerning)
-                                    // Large negative numbers (< -100) typically indicate word spaces
-
-                                    // Add a space if the adjustment is significant (word boundary)
-                                    if *spacing < -100.0 {
+                                 PDFObject::Number(spacing) => {
+                                    // Spacing adjustment in 1/1000ths of a text space unit.
+                                    // Negative values move subsequent glyphs right (gap), positive
+                                    // values move left (tightening / kerning).
+                                    //
+                                    // pdf.js thresholds (evaluator.js):
+                                    //   SPACE_IN_FLOW_MIN_FACTOR = 0.102  →  spacing < -102
+                                    //   SPACE_IN_FLOW_MAX_FACTOR = 0.6    →  spacing < -600
+                                    // Gaps in [-600, -102) are word spaces — but only when the
+                                    // preceding string was multi-character (otherwise it's just
+                                    // a glyph advance in a per-char TJ array, e.g. issue6961).
+                                    // Gaps < -600 are too large — flush as a separate item.
+                                    // Gaps ≥ -102 are kerning — no space.
+                                    if *spacing < -600.0 {
+                                        // Large gap — flush current text as a separate item
+                                        if !accumulated_text.is_empty() {
+                                            let text_item = TextItem {
+                                                text: accumulated_text,
+                                                font_name: self.text_state.current_font_name.clone(),
+                                                font_size: self.text_state.current_font_size,
+                                                position: Some((
+                                                    self.text_state.text_matrix[4],
+                                                    self.text_state.text_matrix[5],
+                                                )),
+                                                rendering_mode: self.text_state.text_rendering_mode,
+                                            };
+                                            self.text_state.extracted_text.push(text_item);
+                                        }
+                                        accumulated_text = String::new();
+                                    } else if *spacing < -102.0
+                                        && (last_was_word_or_punct || seen_word)
+                                    {
+                                        // Word-space gap — only if preceded by a word or
+                                        // punctuation. Per-char TJ arrays (all single-char,
+                                        // non-punct strings) skip space insertion even when
+                                        // the spacing value falls in the word-space range.
                                         accumulated_text.push(' ');
                                     }
 
@@ -744,6 +832,69 @@ impl ContentStreamEvaluator {
                             self.text_state.extracted_text.push(text_item);
                         }
                     }
+                }
+            }
+            OpCode::NextLineShowText => {
+                // ' - move to next line and show text (T* + Tj)
+                if op.args.len() >= 1 && self.text_state.in_text_object {
+                    match &op.args[0] {
+                        PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
+                            self.text_state.text_line_matrix[4] = 0.0;
+                            self.text_state.text_line_matrix[5] -= self.text_state.leading;
+                            self.text_state.text_matrix = self.text_state.text_line_matrix;
+                            let text = self.decode_text(text_bytes);
+                            let position = Some((
+                                self.text_state.text_matrix[4],
+                                self.text_state.text_matrix[5],
+                            ));
+                            let text_item = TextItem {
+                                text,
+                                font_name: self.text_state.current_font_name.clone(),
+                                font_size: self.text_state.current_font_size,
+                                position,
+                                rendering_mode: self.text_state.text_rendering_mode,
+                            };
+                            self.text_state.extracted_text.push(text_item);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OpCode::NextLineSetSpacingShowText => {
+                // " - set word/char spacing, move to next line, and show text
+                // args: word_spacing char_spacing text_string
+                if op.args.len() >= 3 && self.text_state.in_text_object {
+                    match &op.args[2] {
+                        PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
+                            self.text_state.text_line_matrix[4] = 0.0;
+                            self.text_state.text_line_matrix[5] -= self.text_state.leading;
+                            self.text_state.text_matrix = self.text_state.text_line_matrix;
+                            let text = self.decode_text(text_bytes);
+                            let position = Some((
+                                self.text_state.text_matrix[4],
+                                self.text_state.text_matrix[5],
+                            ));
+                            let text_item = TextItem {
+                                text,
+                                font_name: self.text_state.current_font_name.clone(),
+                                font_size: self.text_state.current_font_size,
+                                position,
+                                rendering_mode: self.text_state.text_rendering_mode,
+                            };
+                            self.text_state.extracted_text.push(text_item);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OpCode::PaintXObject => {
+                // Record Form XObject names so the caller can recursively extract
+                // text from them. We don't know here whether it's a Form or Image
+                // XObject (that requires resolving resources), so we record the name
+                // and let Page::extract_text decide. Only names are collected; args
+                // that aren't a Name are ignored.
+                if let Some(PDFObject::Name(name)) = op.args.first() {
+                    self.text_state.form_xobject_names.push(name.clone());
                 }
             }
             _ => {
