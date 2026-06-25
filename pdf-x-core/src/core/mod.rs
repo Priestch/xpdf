@@ -14,6 +14,7 @@ pub mod encryption;
 pub mod error;
 pub mod file_chunked_stream;
 pub mod font;
+pub mod glyphlist;
 pub mod image;
 pub mod lexer;
 pub mod outline;

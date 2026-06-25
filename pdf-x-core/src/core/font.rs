@@ -204,9 +204,13 @@ impl Font {
     pub fn new(font_dict: PDFObject, xref: &mut crate::core::xref::XRef) -> PDFResult<Self> {
         let dict = FontDict::from_pdf_object(&font_dict)?;
 
-        // Parse encoding from the font dictionary
+        // Parse encoding from the font dictionary.
+        // /Encoding may be an inline dict (with /Differences) or a Ref to one —
+        // fetch it so Ref-encoded custom encodings (common in Type1 fonts) are
+        // honored instead of falling back to StandardEncoding.
         let encoding = if let Some(enc_obj) = &dict.encoding {
-            Encoding::from_pdf_object(enc_obj).unwrap_or(Encoding::Standard) // Default to StandardEncoding
+            let fetched = xref.fetch_if_ref(enc_obj).unwrap_or_else(|_| enc_obj.clone());
+            Encoding::from_pdf_object(&fetched).unwrap_or(Encoding::Standard)
         } else {
             // No encoding specified - default to StandardEncoding for simple fonts
             Encoding::Standard
@@ -219,15 +223,15 @@ impl Font {
                     dict: stream_dict,
                     data,
                 } => {
-                    // Decompress the stream
-                    let filter_name = stream_dict.get("Filter").and_then(|f| match f {
-                        PDFObject::Name(name) => Some(name.as_str()),
-                        _ => None,
-                    });
-
-                    let decompressed = decode::decode_stream(&data, filter_name).map_err(|e| {
-                        PDFError::Generic(format!("ToUnicode stream decode error: {}", e))
-                    })?;
+                    // Decompress the stream. Use apply_filters so both /Filter as a
+                    // Name and as an Array (e.g. [/FlateDecode]) work — same fix as
+                    // the content-stream path.
+                    let decompressed = if let Some(filter) = stream_dict.get("Filter") {
+                        decode::apply_filters(&data, filter)
+                            .map_err(|e| PDFError::Generic(format!("ToUnicode stream decode error: {}", e)))?
+                    } else {
+                        data.to_vec()
+                    };
 
                     // Parse CMap
                     Some(CMap::parse(&decompressed)?)

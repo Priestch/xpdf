@@ -13,6 +13,9 @@ smallvec = { workspace = true }
 lru = { workspace = true }
 flate2 = { workspace = true }
 
+# Adobe Glyph List (static perfect hash, compile-time)
+phf = { workspace = true }
+
 # Optional dependencies
 # (reqwest/tokio removed — HTTP I/O belongs in the shell per decision A.
 # See archive/shell-http-impls/ for the reference implementation.)

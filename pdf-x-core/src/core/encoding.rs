@@ -93,77 +93,18 @@ impl Encoding {
 }
 
 /// Convert a glyph name to Unicode character.
+/// Look up a glyph name's Unicode code point via the Adobe Glyph List.
+/// Delegates to `glyphlist::name_to_unicode` (ported from pdf.js
+/// `src/core/glyphlist.js`, 4528 entries). The previous hand-written table
+/// only covered A-Z/a-z + ~12 punctuation, so glyphs like `less`/`greater`
+/// (`<`/`>`) mapped to nothing — causing `<email>` to render as `f email g`.
 fn name_to_unicode(name: &str) -> Option<u16> {
-    // This is a minimal implementation - a full version would include all PDF glyph names
-    // For now, just handle common single-character names
-    Some(match name {
-        "A" => 'A' as u16,
-        "B" => 'B' as u16,
-        "C" => 'C' as u16,
-        "D" => 'D' as u16,
-        "E" => 'E' as u16,
-        "F" => 'F' as u16,
-        "G" => 'G' as u16,
-        "H" => 'H' as u16,
-        "I" => 'I' as u16,
-        "J" => 'J' as u16,
-        "K" => 'K' as u16,
-        "L" => 'L' as u16,
-        "M" => 'M' as u16,
-        "N" => 'N' as u16,
-        "O" => 'O' as u16,
-        "P" => 'P' as u16,
-        "Q" => 'Q' as u16,
-        "R" => 'R' as u16,
-        "S" => 'S' as u16,
-        "T" => 'T' as u16,
-        "U" => 'U' as u16,
-        "V" => 'V' as u16,
-        "W" => 'W' as u16,
-        "X" => 'X' as u16,
-        "Y" => 'Y' as u16,
-        "Z" => 'Z' as u16,
-        "a" => 'a' as u16,
-        "b" => 'b' as u16,
-        "c" => 'c' as u16,
-        "d" => 'd' as u16,
-        "e" => 'e' as u16,
-        "f" => 'f' as u16,
-        "g" => 'g' as u16,
-        "h" => 'h' as u16,
-        "i" => 'i' as u16,
-        "j" => 'j' as u16,
-        "k" => 'k' as u16,
-        "l" => 'l' as u16,
-        "m" => 'm' as u16,
-        "n" => 'n' as u16,
-        "o" => 'o' as u16,
-        "p" => 'p' as u16,
-        "q" => 'q' as u16,
-        "r" => 'r' as u16,
-        "s" => 's' as u16,
-        "t" => 't' as u16,
-        "u" => 'u' as u16,
-        "v" => 'v' as u16,
-        "w" => 'w' as u16,
-        "x" => 'x' as u16,
-        "y" => 'y' as u16,
-        "z" => 'z' as u16,
-        "space" => ' ' as u16,
-        "quotedbl" => '"' as u16,
-        "quoteright" => '\'' as u16,
-        "quoterightbase" => '\'' as u16,
-        "parenleft" => '(' as u16,
-        "parenright" => ')' as u16,
-        "comma" => ',' as u16,
-        "hyphen" => '-' as u16,
-        "period" => '.' as u16,
-        "slash" => '/' as u16,
-        "colon" => ':' as u16,
-        "semicolon" => ';' as u16,
-        "exclam" => '!' as u16,
-        "question" => '?' as u16,
-        _ => return None,
+    super::glyphlist::name_to_unicode(name).and_then(|cp| {
+        if cp <= 0xFFFF {
+            Some(cp as u16)
+        } else {
+            None
+        }
     })
 }
 

@@ -482,10 +482,16 @@ impl Page {
             let parser = super::Parser::new(lexer)?;
             let mut evaluator = ContentStreamEvaluator::new(parser);
 
-            // Load fonts from page resources (for proper character encoding)
-            if let Some(resources) = self.resources() {
+            // Load fonts from page resources (for proper character encoding).
+            // Use get_inheritable_resources so /Resources as a Ref is fetched and
+            // inherited resources from parent Pages nodes are honored — the render
+            // path does the same. The previous self.resources() returned a raw Ref
+            // which load_fonts skipped (not a Dictionary), so NO fonts were loaded
+            // for any page with /Resources as an indirect object.
+            let page_resources = self.get_inheritable_resources(resolver.as_xref_mut())?;
+            if let Some(resources) = page_resources {
                 // Ignore font loading errors - text extraction will still work with fallback encoding
-                let _ = evaluator.load_fonts(resources, resolver.as_xref_mut());
+                let _ = evaluator.load_fonts(&resources, resolver.as_xref_mut());
             }
 
             // Extract text from this stream
