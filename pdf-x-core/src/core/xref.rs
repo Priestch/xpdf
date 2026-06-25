@@ -1225,7 +1225,7 @@ impl XRef {
     pub fn fetch(&mut self, obj_num: u32, generation: u32) -> PDFResult<Rc<PDFObject>> {
         match self.fetch_inner(obj_num, generation) {
             Ok(obj) => Ok(obj),
-            Err(e) if !self.recovered && is_stale_offset_error(&e) => {
+            Err(e) if !self.recovered && matches!(e, PDFError::BadXRefOffset { .. }) => {
                 // The xref entry's offset points at the wrong bytes (a corrupt/regenerated
                 // PDF whose xref parses but is stale). Rebuild the xref from real object
                 // offsets once, then retry — hayro's `get_with` → `repair()` model.
@@ -1272,10 +1272,10 @@ impl XRef {
 
                 // Validate offset is within stream bounds
                 if offset_value as usize >= stream_length {
-                    return Err(PDFError::corrupted_pdf(format!(
-                        "Object offset {} exceeds stream length {}",
-                        offset_value, stream_length
-                    )));
+                    return Err(PDFError::bad_xref_offset(
+                        obj_num,
+                        format!("offset {offset_value} exceeds stream length {stream_length}"),
+                    ));
                 }
 
                 // Create a sub-stream starting at the object's position
@@ -1321,18 +1321,18 @@ impl XRef {
                 let parsed_num = match num_obj {
                     PDFObject::Number(n) => n as u32,
                     _ => {
-                        return Err(PDFError::Generic(format!(
-                            "Expected object number, got {:?}",
-                            num_obj
-                        )));
+                        return Err(PDFError::bad_xref_offset(
+                            obj_num,
+                            format!("expected object number, got {num_obj:?}"),
+                        ));
                     }
                 };
 
                 if parsed_num != obj_num {
-                    return Err(PDFError::Generic(format!(
-                        "Object number mismatch: expected {}, got {}",
-                        obj_num, parsed_num
-                    )));
+                    return Err(PDFError::bad_xref_offset(
+                        obj_num,
+                        format!("object number mismatch: expected {obj_num}, got {parsed_num}"),
+                    ));
                 }
 
                 // Read generation number
@@ -1340,27 +1340,27 @@ impl XRef {
                 let parsed_gen = match gen_obj {
                     PDFObject::Number(n) => n as u32,
                     _ => {
-                        return Err(PDFError::Generic(format!(
-                            "Expected generation number, got {:?}",
-                            gen_obj
-                        )));
+                        return Err(PDFError::bad_xref_offset(
+                            obj_num,
+                            format!("expected generation number, got {gen_obj:?}"),
+                        ));
                     }
                 };
 
                 if parsed_gen != generation {
-                    return Err(PDFError::Generic(format!(
-                        "Generation number mismatch: expected {}, got {}",
-                        generation, parsed_gen
-                    )));
+                    return Err(PDFError::bad_xref_offset(
+                        obj_num,
+                        format!("generation mismatch: expected {generation}, got {parsed_gen}"),
+                    ));
                 }
 
                 // Read "obj" keyword
                 let obj_keyword = parser.get_object()?;
                 if !obj_keyword.is_command("obj") {
-                    return Err(PDFError::Generic(format!(
-                        "Expected 'obj' keyword, got {:?}",
-                        obj_keyword
-                    )));
+                    return Err(PDFError::bad_xref_offset(
+                        obj_num,
+                        format!("expected 'obj' keyword, got {obj_keyword:?}"),
+                    ));
                 }
 
                 // Read the actual object
@@ -2060,16 +2060,4 @@ fn num_in(dict: &HashMap<String, PDFObject>, key: &str) -> Option<usize> {
         PDFObject::Number(n) => Some(*n as usize),
         _ => None,
     }
-}
-
-/// True if a fetch error indicates the xref entry's *offset* points at the wrong bytes
-/// (the "stale xref" signature of regenerated/corrupt PDFs) — the case where lazy fetch-time
-/// recovery should rebuild the xref. Other failures (free objects, genuinely missing
-/// objects, ObjStm decode errors) are left alone.
-fn is_stale_offset_error(e: &PDFError) -> bool {
-    let s = e.to_string();
-    s.contains("Expected object number")
-        || s.contains("Object number mismatch")
-        || s.contains("Generation mismatch for object")
-        || s.contains("Object offset")
 }

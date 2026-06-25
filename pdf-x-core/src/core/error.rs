@@ -27,6 +27,13 @@ pub enum PDFError {
     /// Object marked as deleted in the delta layer (resolve: `delta → base`)
     ObjectDeleted { num: u32, generation: u32 },
 
+    /// An xref entry's recorded offset is unusable — it doesn't land on the expected
+    /// `N G obj` header (wrong object number, missing generation, out of bounds, or the
+    /// bytes there don't parse as an object header). The signature of a stale xref in a
+    /// regenerated/corrupt PDF. Carries the failing object number so lazy fetch-time
+    /// recovery can rebuild the xref and retry.
+    BadXRefOffset { num: u32, reason: String },
+
     /// Parse error with context
     ParseError {
         message: String,
@@ -97,6 +104,9 @@ impl fmt::Display for PDFError {
             }
             PDFError::ObjectDeleted { num, generation } => {
                 write!(f, "Object {} {} deleted in delta layer", num, generation)
+            }
+            PDFError::BadXRefOffset { num, reason } => {
+                write!(f, "Bad xref offset for object {num}: {reason}")
             }
             PDFError::ParseError {
                 message,
@@ -238,6 +248,14 @@ impl PDFError {
             found: found.into(),
         }
     }
+
+    /// Creates a `BadXRefOffset` error (a stale/unusable xref entry offset).
+    pub fn bad_xref_offset<S: Into<String>>(num: u32, reason: S) -> Self {
+        PDFError::BadXRefOffset {
+            num,
+            reason: reason.into(),
+        }
+    }
 }
 
 impl std::error::Error for PDFError {}
@@ -322,6 +340,22 @@ mod tests {
                 assert_eq!(found, "String");
             }
             _ => panic!("Expected InvalidObject"),
+        }
+    }
+
+    #[test]
+    fn test_bad_xref_offset_error() {
+        let err = PDFError::bad_xref_offset(7, "object number mismatch: expected 7, got 5");
+        assert_eq!(
+            format!("{}", err),
+            "Bad xref offset for object 7: object number mismatch: expected 7, got 5"
+        );
+        match err {
+            PDFError::BadXRefOffset { num, reason } => {
+                assert_eq!(num, 7);
+                assert_eq!(reason, "object number mismatch: expected 7, got 5");
+            }
+            _ => panic!("Expected BadXRefOffset"),
         }
     }
 
