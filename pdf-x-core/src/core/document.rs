@@ -987,70 +987,53 @@ impl PDFDocument {
             _ => return Ok(None),
         };
 
-        // Extract linearized information
-        let file_size = dict
-            .get("L")
-            .and_then(|obj| match obj {
+        // Linearization is an optimization, not a structural requirement: a missing or
+        // malformed linearization dict must NOT prevent the document from opening. Treat the
+        // whole field extraction as best-effort — if we can't build full LinearizedInfo, we
+        // simply report "not usable as linearized" (Ok(None)) and fall back to normal access.
+        let as_num = |key: &str| -> Option<u64> {
+            match dict.get(key)? {
                 PDFObject::Number(n) => Some(*n as u64),
+                // Some generators emit the first-page entry as an indirect ref (`/O 2 0 R`)
+                // rather than the bare object number — accept both.
+                PDFObject::Ref(r) => Some(r.num as u64),
                 _ => None,
-            })
-            .ok_or_else(|| {
-                PDFError::Generic("Linearized PDF missing /L (file size)".to_string())
-            })?;
+            }
+        };
 
-        let primary_hint_offset = dict
-            .get("H")
-            .and_then(|obj| match obj {
-                PDFObject::Array(arr) if arr.len() >= 2 => match &*arr[0] {
-                    PDFObject::Number(n) => Some(*n as u64),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .unwrap_or(0);
+        // /O (first-page object number) and /N (page count) are the load-bearing fields for
+        // fast first paint; the rest are hints. Require at least these two to report
+        // linearization, else degrade gracefully.
+        let first_page_obj_num = match as_num("O") {
+            Some(n) => n as u32,
+            None => return Ok(None),
+        };
+        let page_count = match as_num("N") {
+            Some(n) => n as u32,
+            None => return Ok(None),
+        };
 
-        let primary_hint_length = dict
-            .get("H")
-            .and_then(|obj| match obj {
-                PDFObject::Array(arr) if arr.len() >= 2 => match &*arr[1] {
-                    PDFObject::Number(n) => Some(*n as u64),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .unwrap_or(0);
-
-        let first_page_offset = dict
-            .get("O")
-            .and_then(|obj| match obj {
-                PDFObject::Number(n) => Some(*n as u64),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                PDFError::Generic("Linearized PDF missing /O (first page offset)".to_string())
-            })?;
-
-        let first_page_obj_num = dict
-            .get("P")
-            .and_then(|obj| match obj {
-                PDFObject::Number(n) => Some(*n as u32),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                PDFError::Generic(
-                    "Linearized PDF missing /P (first page object number)".to_string(),
-                )
-            })?;
-
-        let page_count = dict
-            .get("N")
-            .and_then(|obj| match obj {
-                PDFObject::Number(n) => Some(*n as u32),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                PDFError::Generic("Linearized PDF missing /N (page count)".to_string())
-            })?;
+        let file_size = as_num("L").unwrap_or(0);
+        let first_page_offset = first_page_obj_num as u64; // object number; offset resolved lazily
+        let first_page_p = match dict.get("P") {
+            Some(PDFObject::Number(n)) => *n as u32,
+            Some(PDFObject::Ref(r)) => r.num,
+            _ => first_page_obj_num,
+        };
+        let (primary_hint_offset, primary_hint_length) = match dict.get("H") {
+            Some(PDFObject::Array(arr)) if arr.len() >= 2 => {
+                let off = match &*arr[0] {
+                    PDFObject::Number(n) => *n as u64,
+                    _ => 0,
+                };
+                let len = match &*arr[1] {
+                    PDFObject::Number(n) => *n as u64,
+                    _ => 0,
+                };
+                (off, len)
+            }
+            _ => (0, 0),
+        };
 
         Ok(Some(LinearizedInfo {
             file_size,
@@ -1058,7 +1041,7 @@ impl PDFDocument {
             primary_hint_length,
             first_page_offset,
             page_count,
-            first_page_obj_num,
+            first_page_obj_num: first_page_p,
         }))
     }
 

@@ -82,9 +82,9 @@ static CASES: &[Case] = &[
     Case { fixture: "flatedecode.pdf", page: 0, expect: Expect::Ok },
     // Renders after lazy fetch-time recovery (stale xref offsets, like annotation-text).
     Case { fixture: "issue3115.pdf", page: 0, expect: Expect::Ok },
-    // Open fail: linearization header parse — "Object number mismatch: expected
-    // 2, got 0".
-    Case { fixture: "linearized.pdf", page: 0, expect: Expect::Skip },
+    // Opens + renders: linearization detection was made tolerant — /O may be an indirect
+    // ref, and missing linearization fields now degrade gracefully instead of aborting open.
+    Case { fixture: "linearized.pdf", page: 0, expect: Expect::Ok },
     Case { fixture: "rotation.pdf", page: 0, expect: Expect::Ok },
     Case { fixture: "simpletype3font.pdf", page: 0, expect: Expect::Ok },
     Case { fixture: "tracemonkey.pdf", page: 0, expect: Expect::Ok },
