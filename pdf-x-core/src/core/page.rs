@@ -1,3 +1,4 @@
+use super::content_stream::TextItem;
 use super::error::{PDFError, PDFResult};
 use super::parser::PDFObject;
 use super::{ContentStreamEvaluator, Lexer, Stream};
@@ -652,19 +653,25 @@ impl Page {
     pub fn extract_text_as_string<R: PageResolver>(&self, resolver: &mut R) -> PDFResult<String> {
         let mut text_items = self.extract_text(resolver)?;
 
-        // Sort text items by position (top to bottom, left to right)
-        // Y-axis in PDF goes bottom to top, so we sort by descending Y, then ascending X
+        // Group text items into lines by Y-position clustering.
+        //
+        // Strategy: cluster items whose Y positions are within a common
+        // line-height tolerance, then sort each cluster by X (left→right).
+        // This avoids the problem of items on the same visual line but
+        // with slightly different Y baselines getting sorted by Y first
+        // (e.g. "Chapter 1" at Y=713.7 vs dots at Y=714.52 in basicapi).
+        //
+        // Determine line threshold: use the largest font size * 0.5, min 2.0.
+        let line_threshold = text_items
+            .iter()
+            .filter_map(|t| t.font_size)
+            .fold(2.0_f64, |m, fs| m.max(fs * 0.5));
+
+        // Sort by Y descending (top→bottom) so we can cluster linearly.
         text_items.sort_by(|a, b| {
             match (a.position, b.position) {
-                (Some((x1, y1)), Some((x2, y2))) => {
-                    // First sort by Y (descending - top to bottom)
-                    let y_cmp = y2.partial_cmp(&y1).unwrap_or(std::cmp::Ordering::Equal);
-                    if y_cmp != std::cmp::Ordering::Equal {
-                        y_cmp
-                    } else {
-                        // Then sort by X (ascending - left to right)
-                        x1.partial_cmp(&x2).unwrap_or(std::cmp::Ordering::Equal)
-                    }
+                (Some((_, y1)), Some((_, y2))) => {
+                    y2.partial_cmp(&y1).unwrap_or(std::cmp::Ordering::Equal)
                 }
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -672,76 +679,99 @@ impl Page {
             }
         });
 
-        // Group text items into lines based on Y position.
-        //
+        // Cluster into lines
+        let mut lines: Vec<Vec<&TextItem>> = Vec::new();
+        for item in &text_items {
+            let y = item.position.map(|p| p.1);
+            let placed = lines.last_mut().and_then(|line| {
+                line.first()
+                    .and_then(|f| f.position.map(|p| p.1))
+                    .and_then(|first_y| {
+                        y.map(|iy| (iy - first_y).abs() <= line_threshold)
+                    })
+            });
+            if placed == Some(true) {
+                lines.last_mut().unwrap().push(item);
+            } else {
+                lines.push(vec![item]);
+            }
+        }
+
+        // Sort each line by X (ascending, left→right)
+        for line in &mut lines {
+            line.sort_by(|a, b| {
+                match (a.position, b.position) {
+                    (Some((x1, _)), Some((x2, _))) => {
+                        x1.partial_cmp(&x2).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+        }
+
         // Two joining strategies:
         //   1) Per-char mode (all items single-char): join using positional X-gap
         //      running average. Gaps > 1.4× the running average are word boundaries.
         //   2) Normal mode (any multi-char item): standard space join between items.
-        //
-        // The TJ handler already inserts word spaces for multi-char text in TJ arrays
-        // (using last_string_multi guard), so strategy 2 handles the common case well.
-        // Strategy 1 handles per-char Tj sequences where word boundaries are implicit
-        // from positional gaps (e.g. issue6961, freeculture).
         let all_single_char = text_items.iter().all(|t| t.text.chars().count() == 1);
 
         if all_single_char {
             let mut result = String::new();
             let mut last_y: Option<f64> = None;
             let mut last_x: Option<f64> = None;
-            let line_threshold = 2.0;
             let mut avg_gap: f64 = 0.0;
             let mut has_avg: bool = false;
 
-            for item in &text_items {
-                if let Some(pos) = item.position {
-                    if let Some(prev_y) = last_y {
-                        if (pos.1 - prev_y).abs() > line_threshold {
-                            result.push('\n');
-                            avg_gap = 0.0;
-                            has_avg = false;
-                        } else if let Some(prev_x) = last_x {
-                            let gap = pos.0 - prev_x;
-                            if has_avg {
-                                if gap > avg_gap * 1.35
-                                    && !result.is_empty()
-                                    && !result.ends_with(' ')
-                                {
-                                    result.push(' ');
-                                    has_avg = false;
-                                } else {
-                                    avg_gap = avg_gap * 0.6 + gap * 0.4;
+            for line in &lines {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                for item in line {
+                    if let Some(pos) = item.position {
+                        if let Some(prev_y) = last_y {
+                            if (pos.1 - prev_y).abs() > line_threshold {
+                                result.push('\n');
+                                avg_gap = 0.0;
+                                has_avg = false;
+                            } else if let Some(prev_x) = last_x {
+                                let gap = pos.0 - prev_x;
+                                if has_avg {
+                                    if gap > avg_gap * 1.35
+                                        && !result.is_empty()
+                                        && !result.ends_with(' ')
+                                    {
+                                        result.push(' ');
+                                        has_avg = false;
+                                    } else {
+                                        avg_gap = avg_gap * 0.6 + gap * 0.4;
+                                    }
+                                } else if gap > 0.0 {
+                                    avg_gap = gap;
+                                    has_avg = true;
                                 }
-                            } else if gap > 0.0 {
-                                avg_gap = gap;
-                                has_avg = true;
                             }
                         }
+                        last_y = Some(pos.1);
+                        last_x = Some(pos.0);
                     }
-                    last_y = Some(pos.1);
-                    last_x = Some(pos.0);
+                    result.push_str(&item.text);
                 }
-                result.push_str(&item.text);
             }
             Ok(result)
         } else {
-            // Normal mode: simply group into lines and join with spaces.
             let mut result = String::new();
-            let mut last_y: Option<f64> = None;
-            let line_threshold = 2.0;
-
-            for item in text_items {
-                if let Some(pos) = item.position {
-                    if let Some(prev_y) = last_y {
-                        if (pos.1 - prev_y).abs() > line_threshold {
-                            result.push('\n');
-                        } else if !result.is_empty() && !result.ends_with(' ') {
-                            result.push(' ');
-                        }
-                    }
-                    last_y = Some(pos.1);
+            for line in &lines {
+                if !result.is_empty() {
+                    result.push('\n');
                 }
-                result.push_str(&item.text);
+                for (i, item) in line.iter().enumerate() {
+                    if i > 0 && !item.text.starts_with(' ') && !result.ends_with(' ') {
+                        result.push(' ');
+                    }
+                    result.push_str(&item.text);
+                }
             }
             Ok(result)
         }

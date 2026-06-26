@@ -68,6 +68,9 @@ impl CMap {
         let mut cmap = CMap::new();
         let content = std::str::from_utf8(stream_data)
             .map_err(|e| PDFError::Generic(format!("Invalid UTF-8 in CMap stream: {}", e)))?;
+        // Normalize CR-only line endings (old Mac style) before splitting.
+        // Rust's str::lines() only splits on \n, not on standalone \r.
+        let content = content.replace("\r\n", "\n").replace('\r', "\n");
 
         // Parse the CMap stream line by line
         let mut lines = content.lines().peekable();
