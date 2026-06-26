@@ -216,6 +216,10 @@ pub struct StoredFont {
     font_type: FontType,
     /// Optional PDF width table (byte code -> width in glyph space units).
     pdf_widths: Option<[f32; 256]>,
+    /// Cached glyph outlines for Type1 fonts, keyed by byte code.
+    /// Type1 charstring → bezier Path is expensive; caching avoids re-outlining
+    /// the same glyph on every draw_text call.
+    glyph_cache: HashMap<u8, Option<tiny_skia::Path>>,
 }
 
 /// Enum to hold different font types
@@ -241,6 +245,7 @@ impl StoredFont {
                 _data: Arc::new(data),
                 font_type: FontType::Type1 { font },
                 pdf_widths: None,
+                glyph_cache: HashMap::new(),
             })
         } else {
             // Try TrueType font
@@ -265,6 +270,7 @@ impl StoredFont {
                 _data: arc_data,
                 font_type: FontType::TrueType { face, buzz_face },
                 pdf_widths: None,
+                glyph_cache: HashMap::new(),
             })
         }
     }
@@ -310,6 +316,30 @@ impl StoredFont {
     /// Check if this is a Type1 font
     pub fn is_type1(&self) -> bool {
         matches!(self.font_type, FontType::Type1 { .. })
+    }
+
+    /// Get a cached glyph outline for a Type1 font byte code.
+    /// Returns a cloned Path (cheap — tiny_skia::Path is internally Arc'd).
+    /// On first access, outlines the glyph via hayro-font and caches the result.
+    pub fn cached_glyph_path(&mut self, byte: u8) -> Option<tiny_skia::Path> {
+        // Check cache first.
+        if let Some(cached) = self.glyph_cache.get(&byte) {
+            return cached.clone();
+        }
+        // Outline the glyph and cache the result.
+        let path = if let FontType::Type1 { font } = &self.font_type {
+            let ch = char::from(byte);
+            let mut builder = PathBuilder::new();
+            if font.outline_glyph_char(ch, &mut builder).is_some() {
+                builder.finish()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.glyph_cache.insert(byte, path.clone());
+        path
     }
 
     /// Set custom encoding for Type1/CFF fonts.
@@ -1253,13 +1283,12 @@ impl<'a> Device for SkiaDevice<'a> {
             text_bytes.len()
         );
 
-        // Clone the font data to avoid borrow issues
+        // Get font widths and type1 font ref (clone type1 for width queries).
         let (type1_font, pdf_widths) = {
             let font = self.font_cache.get(font_name).unwrap();
             (font.type1_font().unwrap().clone(), font.pdf_widths.clone())
         };
 
-        // Now render the text with Type1 font
         // Type1 fonts use 1000 units per em
         let units_per_em = 1000.0f32;
         let units_per_em_f64 = units_per_em as f64;
@@ -1272,27 +1301,11 @@ impl<'a> Device for SkiaDevice<'a> {
 
         let mut text_path_builder = PathBuilder::new();
 
-        // Keep glyph positions local to the text run; text_matrix applies run placement.
         let mut current_x = 0.0f32;
         let current_y = 0.0f32;
         let mut total_advance_user = 0.0f64;
 
-        #[cfg(feature = "debug-logging")]
-        let mut glyphs_rendered = 0;
-        #[cfg(feature = "debug-logging")]
-        let mut glyphs_total = 0;
-
-        // For each byte, outline it directly (works for both Type1 and CFF)
-        // PDF text strings use font encoding, where each byte maps to a glyph
         for &byte in text_bytes {
-            #[cfg(feature = "debug-logging")]
-            {
-                glyphs_total += 1;
-            }
-            let mut glyph_path_builder = PathBuilder::new();
-
-            // Convert byte to char (for code-to-glyph mapping)
-            // The font's encoding maps byte codes to glyphs
             let ch = char::from(byte);
             let glyph_width = pdf_widths
                 .as_ref()
@@ -1304,22 +1317,16 @@ impl<'a> Device for SkiaDevice<'a> {
             }
             let spacing_font_units = (spacing_user * spacing_to_font_units) as f32;
 
-            // Use outline_glyph_char which works for both Type1 and CFF
-            if type1_font
-                .outline_glyph_char(ch, &mut glyph_path_builder)
-                .is_some()
+            // Use cached glyph outline — avoids re-parsing Type1 charstrings.
+            if let Some(glyph_path) = self
+                .font_cache
+                .get_mut(font_name)
+                .unwrap()
+                .cached_glyph_path(byte)
             {
-                #[cfg(feature = "debug-logging")]
-                {
-                    glyphs_rendered += 1;
-                }
-                if let Some(glyph_path) = glyph_path_builder.finish() {
-                    // Transform the glyph to the current position
-                    let transform = Transform::from_row(1.0, 0.0, 0.0, 1.0, current_x, current_y);
-
-                    if let Some(path_transformed) = glyph_path.transform(transform) {
-                        text_path_builder.push_path(&path_transformed);
-                    }
+                let transform = Transform::from_row(1.0, 0.0, 0.0, 1.0, current_x, current_y);
+                if let Some(path_transformed) = glyph_path.transform(transform) {
+                    text_path_builder.push_path(&path_transformed);
                 }
             }
 
