@@ -206,10 +206,6 @@ pub struct Parser {
 
     /// Second lookahead token
     buf2: Option<Token>,
-
-    /// Optional reference resolver for resolving indirect references during parsing
-    /// This is needed when parsing streams with indirect /Length references
-    ref_resolver: Option<Box<dyn Fn(u32, u32) -> PDFResult<PDFObject>>>,
 }
 
 impl Parser {
@@ -219,21 +215,7 @@ impl Parser {
         let buf1 = Some(lexer.get_object()?);
         let buf2 = Some(lexer.get_object()?);
 
-        Ok(Parser {
-            lexer,
-            buf1,
-            buf2,
-            ref_resolver: None,
-        })
-    }
-
-    /// Sets a reference resolver function that can resolve indirect references.
-    /// This is needed when parsing streams with indirect /Length references.
-    pub fn set_ref_resolver<F>(&mut self, resolver: F)
-    where
-        F: Fn(u32, u32) -> PDFResult<PDFObject> + 'static,
-    {
-        self.ref_resolver = Some(Box::new(resolver));
+        Ok(Parser { lexer, buf1, buf2 })
     }
 
     /// Skips raw inline image data (bytes after `ID`) until `EI`.
@@ -529,38 +511,11 @@ impl Parser {
         let length: Option<usize> = match length_obj {
             Some(PDFObject::Number(n)) => Some(*n as usize),
             Some(PDFObject::Ref(ref_obj)) => {
-                // Length is an indirect reference - try to resolve it if we have a resolver
-                if let Some(ref resolver) = self.ref_resolver {
-                    match resolver(ref_obj.num, ref_obj.generation) {
-                        Ok(resolved) => match resolved {
-                            PDFObject::Number(n) => Some(n as usize),
-                            _ => {
-                                eprintln!(
-                                    "Warning: Resolved /Length is not a number, scanning for endstream"
-                                );
-                                None
-                            }
-                        },
-                        Err(e @ PDFError::DataMissing { .. }) => {
-                            // For progressive loading, propagate DataMissing errors
-                            // The retry loop will load the missing object and retry
-                            return Err(e);
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Warning: Failed to resolve /Length reference {} {} R: {:?}, scanning for endstream",
-                                ref_obj.num, ref_obj.generation, e
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    // No resolver available, fall back to scanning
-                    eprintln!(
-                        "Warning: /Length is an indirect reference but no resolver available, scanning for endstream"
-                    );
-                    None
-                }
+                eprintln!(
+                    "Warning: /Length is indirect ref {} {} R, scanning for endstream",
+                    ref_obj.num, ref_obj.generation
+                );
+                None
             }
             _ => None,
         };

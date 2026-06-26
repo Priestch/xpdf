@@ -687,8 +687,8 @@ fn parse_link_action(
 ) -> PDFResult<LinkAction> {
     // Check for action dictionary (/A)
     if let Some(action_obj) = dict.get("A") {
-        let action_dict = match xref.fetch_if_ref(action_obj)? {
-            PDFObject::Dictionary(dict) => dict,
+        let action_dict = match &*xref.fetch_if_ref(action_obj)? {
+            PDFObject::Dictionary(dict) => dict.clone(),
             _ => return Ok(LinkAction::Unknown),
         };
 

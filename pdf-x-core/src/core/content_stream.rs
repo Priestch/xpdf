@@ -591,7 +591,7 @@ impl ContentStreamEvaluator {
             let font_dict_obj = xref.fetch_if_ref(font_ref)?;
 
             // Create Font object
-            match Font::new(font_dict_obj, xref) {
+            match Font::new((*font_dict_obj).clone(), xref) {
                 Ok(font) => {
                     self.fonts.insert(font_name.clone(), font);
                 }
@@ -899,7 +899,9 @@ impl ContentStreamEvaluator {
                                         // (including text accumulated before and within this TJ)
                                         // and start a new run for remaining TJ content.
                                         if !accumulated_text.is_empty() {
-                                            self.text_state.run_accumulator.push_str(&accumulated_text);
+                                            self.text_state
+                                                .run_accumulator
+                                                .push_str(&accumulated_text);
                                             accumulated_text.clear();
                                             self.flush_text_run();
                                             self.start_new_run();

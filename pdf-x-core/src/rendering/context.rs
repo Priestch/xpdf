@@ -17,6 +17,7 @@ use crate::core::page::PageResolver;
 use crate::core::parser::PDFObject;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Runtime toggle for verbose text spacing traces (Tw/Tc/TJ/Tj).
@@ -755,17 +756,20 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         if let crate::core::parser::PDFObject::Name(name) = &args[0] {
             self.current_state_mut().font_name = Some(name.clone());
 
-            // Try to load the font from resources if not already loaded
-            // We only need to load it once per font name
-            // Extract resolver and resources to avoid borrow issues
+            // Skip font loading entirely if the device already has it (from a
+            // previous render or earlier in this render). This is the single most
+            // impactful render optimization: Type1/CFF parsing is ~2ms per font
+            // and a page may switch fonts dozens of times.
+            if self.device.has_font(name.as_str()) {
+                self.current_state_mut().font_size = Some(extract_number(args, 1)?);
+                return Ok(());
+            }
+
+            // Font not yet in device cache — load from resources.
             let (resolver_opt, resources_opt) = (self.resolver.take(), self.resources.clone());
             if let (Some(mut resolver), Some(resources)) = (resolver_opt, resources_opt) {
-                // Check if device already has this font (to avoid re-loading)
-                let font_key = name.as_str();
-                // We can't directly check the device's font cache, so we try to load
-                // and let the device handle duplicates
-                let result = self.load_font_from_resources(font_key, &resources, &mut *resolver);
-                // Restore resolver
+                let result =
+                    self.load_font_from_resources(name.as_str(), &resources, &mut *resolver);
                 self.resolver = Some(resolver);
                 result?;
             }
@@ -813,8 +817,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             Err(_) => return,
         };
 
-        let (dict, data) = match fetched {
-            PDFObject::Stream { dict, data } => (dict, data),
+        let (dict, data) = match &*fetched {
+            PDFObject::Stream { dict, data } => (dict.clone(), data.clone()),
             _ => return,
         };
 
@@ -856,7 +860,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             PDFObject::Dictionary(d) => d,
             PDFObject::Ref(ref_obj) => {
                 _fetched_font_dict = resolver.resolve_ref(ref_obj.num, ref_obj.generation)?;
-                match &_fetched_font_dict {
+                match &*_fetched_font_dict {
                     PDFObject::Dictionary(d) => d,
                     _ => return Ok(()),
                 }
@@ -878,11 +882,10 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         };
 
         // Fetch the font object (might be a reference)
-        let _fetched_font_obj: PDFObject;
         let font_obj = resolver.resolve_if_ref(font_obj_ref)?;
 
         // Parse the font dictionary
-        let font_dict_info = match crate::core::font::FontDict::from_pdf_object(&font_obj) {
+        let font_dict_info = match crate::core::font::FontDict::from_pdf_object(&*font_obj) {
             Ok(f) => f,
             Err(e) => {
                 #[cfg(feature = "debug-logging")]
@@ -932,13 +935,16 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             let encoding_obj = if let Some(enc) = &font_dict_info.encoding {
                 match resolver.resolve_if_ref(enc) {
                     Ok(fetched) => Some(fetched),
-                    Err(_) => Some(enc.clone()),
+                    Err(_) => Some(Arc::new(enc.clone())),
                 }
             } else {
                 None
             };
             let encoding_ref = encoding_obj.as_ref();
-            match self.device.load_font_data(font_name, data, encoding_ref) {
+            match self
+                .device
+                .load_font_data(font_name, data, encoding_ref.map(|v| &**v))
+            {
                 Ok(_) => {
                     if let (Some(first_char), Some(widths)) =
                         (font_dict_info.first_char, font_dict_info.widths.as_ref())
@@ -1019,7 +1025,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 PDFObject::Dictionary(d) => d,
                 PDFObject::Ref(r) => {
                     _fetched_descriptor = resolver.resolve_ref(r.num, r.generation).ok()?;
-                    match &_fetched_descriptor {
+                    match &*_fetched_descriptor {
                         PDFObject::Dictionary(d) => d,
                         _ => return None,
                     }
@@ -1071,7 +1077,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                     eprintln!("DEBUG: Found font file ref for '{}'", key);
                     // Fetch the font file stream
                     let font_file_obj = resolver.resolve_if_ref(font_file_ref).ok()?;
-                    if let PDFObject::Stream { dict, data } = font_file_obj {
+                    if let PDFObject::Stream { dict, data } = &*font_file_obj {
                         #[cfg(feature = "debug-logging")]
                         eprintln!("DEBUG: Font file stream found, data length: {}", data.len());
 
@@ -1718,7 +1724,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             }
         };
 
-        let ext_gstate_dict = match ext_gstate_dict_obj {
+        let ext_gstate_dict = match &*ext_gstate_dict_obj {
             PDFObject::Dictionary(dict) => dict,
             _ => {
                 self.resolver = Some(resolver);
@@ -1739,7 +1745,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             }
         };
 
-        if let PDFObject::Dictionary(gs_dict) = gs_obj {
+        if let PDFObject::Dictionary(gs_dict) = &*gs_obj {
             if let Some(mode) = gs_dict.get("BM").and_then(parse_blend_mode) {
                 self.current_state_mut().blend_mode = mode;
                 self.device.set_blend_mode(mode);
@@ -1800,7 +1806,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             PDFObject::Dictionary(d) => d,
             PDFObject::Ref(ref_obj) => {
                 _fetched_xobject_dict = resolver.resolve_ref(ref_obj.num, ref_obj.generation)?;
-                match &_fetched_xobject_dict {
+                match &*_fetched_xobject_dict {
                     PDFObject::Dictionary(d) => d,
                     _ => return Ok(()),
                 }
@@ -1817,7 +1823,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         let xobject = resolver.resolve_if_ref(xobject_ref)?;
 
         // XObjects are always stream objects.
-        let (xobject_dict, xobject_data) = match &xobject {
+        let (xobject_dict, xobject_data) = match &*xobject {
             PDFObject::Stream { dict, data } => (dict, data),
             _ => return Ok(()),
         };
@@ -2072,7 +2078,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                     };
                     fetched
                 }
-                _ => Some(resources_obj.clone()),
+                _ => Some(Arc::new(resources_obj.clone())),
             }
         } else {
             None
@@ -2112,7 +2118,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             }
 
             if let Some(resources_obj) = form_resources {
-                self.resources = Some(resources_obj);
+                self.resources = Some((*resources_obj).clone());
             }
 
             self.process_content_stream_bytes(decoded_data)

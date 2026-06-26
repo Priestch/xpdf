@@ -292,9 +292,9 @@ fn actual_path(golden: &PathBuf) -> PathBuf {
     let mut p = golden.clone();
     let stem = p.file_stem().unwrap_or_default().to_owned();
     let mut name = stem.to_os_string();
-    name.push(".actual");
+    name.push(".actual.png"); // full extension — `with_extension` would drop ".actual"
     p.set_file_name(name);
-    p.with_extension("png")
+    p
 }
 
 #[test]

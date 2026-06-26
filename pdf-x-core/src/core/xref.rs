@@ -6,9 +6,10 @@ use super::lexer::Lexer;
 use super::parser::{PDFObject, Parser};
 use super::stream::Stream;
 use lru::LruCache;
+use std::cell::RefCell;
 use std::collections::HashMap; // Still needed for String keys in dictionaries
 use std::num::NonZeroUsize;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Cross-reference table entry.
 ///
@@ -53,10 +54,14 @@ pub struct XRef {
     entries: Vec<Option<XRefEntry>>,
 
     /// Cache of parsed objects (object number -> PDFObject)
-    /// Uses Rc to avoid expensive cloning of large objects
+    /// Uses Arc to avoid expensive cloning of large objects
     /// Uses LRU cache with FxHashMap for bounded memory and fast access
     /// Default capacity: 1000 objects (~10MB for typical PDFs)
-    cache: LruCache<u32, Rc<PDFObject>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+    /// Wrapped in `RefCell` so the cache can be checked with `&self` (no `&mut self`
+    /// needed for a probe). Cache mutations through `RefCell` are never re-entrant, so
+    /// runtime panics from overlapping borrows do not occur.
+    cache:
+        RefCell<LruCache<u32, Arc<PDFObject>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>>,
 
     /// The trailer dictionary
     trailer: Option<PDFObject>,
@@ -129,7 +134,7 @@ impl XRef {
 
         XRef {
             entries: Vec::new(),
-            cache,
+            cache: RefCell::new(cache),
             trailer: None,
             stream,
             recovered: false,
@@ -287,7 +292,7 @@ impl XRef {
 
         // Reset any partial entries/cache left by the failed normal parse.
         self.entries.clear();
-        self.cache.clear();
+        self.cache.borrow_mut().clear();
 
         const TAB: u8 = 0x9;
         const LF: u8 = 0xa;
@@ -1063,8 +1068,8 @@ impl XRef {
     /// * `index` - The index of the object within the stream (0-based)
     ///
     /// # Returns
-    /// The requested object wrapped in Rc
-    fn fetch_compressed(&mut self, obj_stream_num: u32, index: u32) -> PDFResult<Rc<PDFObject>> {
+    /// The requested object wrapped in Arc
+    fn fetch_compressed(&mut self, obj_stream_num: u32, index: u32) -> PDFResult<Arc<PDFObject>> {
         // First, fetch the object stream itself (as an uncompressed object)
         let obj_stream_obj = self.fetch(obj_stream_num, 0)?;
 
@@ -1237,11 +1242,13 @@ impl XRef {
                 let mut obj_parser = Parser::new(obj_lexer)?;
 
                 // Parse the object (no "obj"/"endobj" wrappers in ObjStm)
-                let object = Rc::new(obj_parser.get_object()?);
+                let object = Arc::new(obj_parser.get_object()?);
 
                 // Cache it with the actual object number
                 let actual_obj_num = obj_nums[index as usize];
-                self.cache.put(actual_obj_num, Rc::clone(&object));
+                self.cache
+                    .borrow_mut()
+                    .put(actual_obj_num, Arc::clone(&object));
 
                 Ok(object)
             }
@@ -1261,13 +1268,13 @@ impl XRef {
     /// Fetches an indirect object by reference.
     ///
     /// This resolves an indirect reference like "5 0 R" to its actual object.
-    /// The object is cached after being parsed. Returns an Rc to avoid expensive cloning.
+    /// The object is cached after being parsed. Returns an Arc to avoid expensive cloning.
     ///
     /// **Lazy recovery:** if the fetch fails on a bad/stale offset (common in corrupt or
     /// regenerated PDFs whose xref parses but points at the wrong bytes), the first such
     /// failure triggers a full-file `recover_by_scan` once and retries — mirroring hayro's
     /// `get_with` → `repair()` model. Subsequent failures pass through.
-    pub fn fetch(&mut self, obj_num: u32, generation: u32) -> PDFResult<Rc<PDFObject>> {
+    pub fn fetch(&mut self, obj_num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
         // Circular-reference guard: a ref already being resolved on the stack (e.g. an
         // object whose indirect /Length refers back into its own dependency cycle) would
         // recurse unboundedly and overflow the stack. pdf.js's `_pendingRefs` returns a
@@ -1275,7 +1282,7 @@ impl XRef {
         let key = (obj_num, generation);
         if self.pending_refs.contains(&key) {
             eprintln!("Warning: ignoring circular object reference {obj_num} {generation} R");
-            return Ok(Rc::new(PDFObject::Null));
+            return Ok(Arc::new(PDFObject::Null));
         }
         self.pending_refs.insert(key);
         let result = self.fetch_inner(obj_num, generation);
@@ -1295,10 +1302,10 @@ impl XRef {
         }
     }
 
-    fn fetch_inner(&mut self, obj_num: u32, generation: u32) -> PDFResult<Rc<PDFObject>> {
-        // Check cache first - Rc::clone is cheap (just increments refcount)
-        if let Some(cached) = self.cache.get(&obj_num) {
-            return Ok(Rc::clone(cached));
+    fn fetch_inner(&mut self, obj_num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
+        // Check cache first - Arc::clone is cheap (just increments refcount)
+        if let Some(cached) = self.cache.borrow_mut().get(&obj_num) {
+            return Ok(Arc::clone(cached));
         }
 
         // Get xref entry
@@ -1347,32 +1354,6 @@ impl XRef {
                 // Format: N G obj ... endobj
                 let lexer = Lexer::new(sub_stream)?;
                 let mut parser = Parser::new(lexer)?;
-
-                // CRITICAL FIX: Set up a reference resolver so the parser can resolve
-                // indirect /Length references in streams. Without this, streams with
-                // /Length references fall back to scanning for "endstream" which can
-                // read incorrect boundaries and capture "endobj" as stream data.
-                //
-                // We create a closure that captures a mutable reference to self.
-                // This is safe because:
-                // 1. The resolver is only called during parser.get_object() below
-                // 2. We're not modifying the XRef entries during fetch (only reading/caching)
-                // 3. Rust's borrow checker ensures no other mutable borrows exist
-                //
-                // However, we can't directly capture &mut self in the closure because
-                // it would create a self-referential struct. Instead, we'll use an
-                // unsafe pointer cast. This is safe because:
-                // - The parser lifetime is scoped to this function
-                // - We ensure no re-entrant calls that could invalidate the pointer
-                // - The XRef object is not moved or dropped during parsing
-                let self_ptr = self as *mut XRef;
-                parser.set_ref_resolver(move |num, generation| {
-                    // SAFETY: This is safe because:
-                    // 1. self_ptr is valid for the duration of parser.get_object()
-                    // 2. No other code can modify or move the XRef during this time
-                    // 3. We're only calling fetch() which is part of XRef's public API
-                    unsafe { (*self_ptr).fetch(num, generation) }.map(|rc| (*rc).clone())
-                });
 
                 // Read object number
                 let num_obj = parser.get_object()?;
@@ -1435,12 +1416,14 @@ impl XRef {
                 } else {
                     object
                 };
-                let object_rc = Rc::new(object);
+                let object_arc = Arc::new(object);
 
-                // Cache the Rc - cheap clone
-                self.cache.put(obj_num, Rc::clone(&object_rc));
+                // Cache the Arc - cheap clone
+                self.cache
+                    .borrow_mut()
+                    .put(obj_num, Arc::clone(&object_arc));
 
-                Ok(object_rc)
+                Ok(object_arc)
             }
 
             XRefEntry::Compressed {
@@ -1453,17 +1436,26 @@ impl XRef {
         }
     }
 
+    /// Check the cache for an object without any I/O or stream access.
+    /// Returns `None` if the object isn't cached yet (caller should fall back to
+    /// [`fetch`](Self::fetch) which reads from the stream on a cache miss).
+    ///
+    /// This is the `&self`-compatible cache probe — part of the fetch split. Callers
+    /// that only need to check whether an object is already resolved (e.g. the
+    /// parser's /Length-resolver closure) use this instead of `fetch`, avoiding
+    /// the need for `&mut self`.
+    pub fn fetch_cached(&self, obj_num: u32) -> Option<Arc<PDFObject>> {
+        self.cache.borrow_mut().get(&obj_num).map(Arc::clone)
+    }
+
     /// Fetches an object if it's a reference, otherwise returns the object as-is.
     ///
-    /// Returns an owned PDFObject (cloned from Rc if fetched from cache).
-    /// Use `fetch()` directly if you want an Rc to avoid the clone.
-    pub fn fetch_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
+    /// Returns an Arc<PDFObject> — cheap clone (refcount inc) when fetching from cache.
+    /// For non-Ref objects, wraps in a new Arc.
+    pub fn fetch_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>> {
         match obj {
-            PDFObject::Ref(ref_obj) => {
-                let rc_obj = self.fetch(ref_obj.num, ref_obj.generation)?;
-                Ok((*rc_obj).clone())
-            }
-            _ => Ok(obj.clone()),
+            PDFObject::Ref(ref_obj) => self.fetch(ref_obj.num, ref_obj.generation),
+            _ => Ok(Arc::new(obj.clone())),
         }
     }
 
@@ -1499,7 +1491,7 @@ impl XRef {
                 .clone()
         };
 
-        // Fetch and dereference the Rc
+        // Fetch and dereference the Arc
         let rc_catalog = match &root_ref {
             PDFObject::Ref(ref_obj) => self.fetch(ref_obj.num, ref_obj.generation)?,
             _ => return Ok(root_ref),
@@ -1802,12 +1794,12 @@ mod tests {
         // Test with a reference
         let ref_obj = PDFObject::Ref(Ref::new(1, 0));
         let result = xref.fetch_if_ref(&ref_obj).unwrap();
-        assert_eq!(result, PDFObject::Number(42.0));
+        assert_eq!(*result, PDFObject::Number(42.0));
 
         // Test with a direct object
         let direct_obj = PDFObject::Number(100.0);
         let result = xref.fetch_if_ref(&direct_obj).unwrap();
-        assert_eq!(result, PDFObject::Number(100.0));
+        assert_eq!(*result, PDFObject::Number(100.0));
     }
 
     #[test]

@@ -28,6 +28,7 @@ use super::doc_store::DocStore;
 use super::error::{PDFError, PDFResult};
 use super::page::{Page, PageResolver};
 use super::parser::PDFObject;
+use std::sync::Arc;
 
 /// A fully-resolved, immutable, self-contained page model.
 ///
@@ -47,11 +48,12 @@ pub struct ResolvedPage {
     /// Pre-resolved snapshot of every object reachable from `/Resources` (fonts, xobjects,
     /// ext-gstate, color spaces, and their sub-objects, recursively). Captured during
     /// `resolve_page` so `interpret` needs no live `DocStore` — it reads from this frozen
-    /// map. Keyed by `(object_num, generation)`.
-    pub objects: std::collections::HashMap<(u32, u32), PDFObject>,
+    /// map. Keyed by `(object_num, generation)`. Uses `Arc<PDFObject>` so the snapshot
+    /// shares allocations with the XRef cache (no deep clone on capture).
+    pub objects: std::collections::HashMap<(u32, u32), Arc<PDFObject>>,
 }
 
-impl<'a> DocStore<'a> {
+impl DocStore {
     /// Resolve a page to an immutable, I/O-free [`ResolvedPage`] (`delta → base`).
     ///
     /// The page object (resolved by `PDFDocument::get_page`), `/Resources`, and
@@ -69,7 +71,7 @@ impl<'a> DocStore<'a> {
         // later refinement).
         let resources = match page.resources() {
             Some(r) => self.resolve_if_ref(r)?,
-            None => PDFObject::Null,
+            None => Arc::new(PDFObject::Null),
         };
 
         let contents = self.resolve_contents(page)?;
@@ -83,7 +85,7 @@ impl<'a> DocStore<'a> {
         Ok(ResolvedPage {
             view_box,
             rotation,
-            resources,
+            resources: (*resources).clone(),
             contents,
             objects,
         })
@@ -96,14 +98,14 @@ impl<'a> DocStore<'a> {
         };
         let resolved = self.resolve_if_ref(contents_obj)?;
         let mut out = Vec::new();
-        match &resolved {
+        match &*resolved {
             PDFObject::Stream { dict, data } => {
                 out.extend(decode_stream(dict, data)?);
             }
             PDFObject::Array(arr) => {
                 for obj in arr.iter() {
                     let entry = self.resolve_if_ref(obj.as_ref())?;
-                    match &entry {
+                    match &*entry {
                         PDFObject::Stream { dict, data } => {
                             out.extend(decode_stream(dict, data)?);
                         }
@@ -135,12 +137,13 @@ fn decode_stream(
 
 /// Resolve every object reachable from `root` (following indirect references recursively)
 /// into an immutable snapshot. `root` is typically the page's `/Resources` dictionary.
-/// This is the resolve-phase work that lets `interpret` be pure.
+/// This is the resolve-phase work that lets `interpret` be pure. Each captured object is
+/// stored as `Arc<PDFObject>`, sharing allocation with the XRef cache.
 fn capture_reachable(
     store: &mut DocStore,
     root: &PDFObject,
-) -> PDFResult<std::collections::HashMap<(u32, u32), PDFObject>> {
-    let mut snapshot: std::collections::HashMap<(u32, u32), PDFObject> =
+) -> PDFResult<std::collections::HashMap<(u32, u32), Arc<PDFObject>>> {
+    let mut snapshot: std::collections::HashMap<(u32, u32), Arc<PDFObject>> =
         std::collections::HashMap::new();
     let mut queue: Vec<(u32, u32)> = find_refs(root);
     while let Some(id) = queue.pop() {
@@ -161,7 +164,7 @@ fn capture_reachable(
                 continue;
             }
         };
-        queue.extend(find_refs(&obj));
+        queue.extend(find_refs(&*obj));
         snapshot.insert(id, obj);
     }
     Ok(snapshot)
@@ -204,28 +207,28 @@ fn collect_refs(obj: &PDFObject, out: &mut Vec<(u32, u32)>) {
 /// `as_xref_mut` is unreachable during interpretation (RenderingContext fetches only via
 /// `resolve_*`).
 pub struct SnapshotPageResolver<'o> {
-    objects: &'o std::collections::HashMap<(u32, u32), PDFObject>,
+    objects: &'o std::collections::HashMap<(u32, u32), Arc<PDFObject>>,
 }
 
 impl<'o> SnapshotPageResolver<'o> {
     /// Wrap a frozen object snapshot as a [`PageResolver`] for pure interpretation.
-    pub fn new(objects: &'o std::collections::HashMap<(u32, u32), PDFObject>) -> Self {
+    pub fn new(objects: &'o std::collections::HashMap<(u32, u32), Arc<PDFObject>>) -> Self {
         Self { objects }
     }
 }
 
 impl<'o> PageResolver for SnapshotPageResolver<'o> {
-    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>> {
         match obj {
             PDFObject::Ref(r) => self.resolve_ref(r.num, r.generation),
-            other => Ok(other.clone()),
+            other => Ok(Arc::new(other.clone())),
         }
     }
 
-    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<PDFObject> {
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
         self.objects
             .get(&(num, generation))
-            .cloned()
+            .map(|obj| Arc::clone(obj))
             .ok_or_else(|| {
                 PDFError::Generic(format!(
                     "object {num} {generation} not present in resolved snapshot"
@@ -385,7 +388,7 @@ mod tests {
         let mut dev_a = TestDevice::new(200.0, 300.0);
         {
             let mut store = doc_a.doc_store_mut();
-            page_a.render(&mut store, &mut dev_a).expect("live render");
+            page_a.render(store, &mut dev_a).expect("live render");
         }
 
         // Pure path: resolve_page → interpret.
@@ -456,8 +459,7 @@ mod tests {
         let mut baseline = TestDevice::new(200.0, 300.0);
         {
             let mut store = doc.doc_store_mut();
-            page.render(&mut store, &mut baseline)
-                .expect("baseline render");
+            page.render(store, &mut baseline).expect("baseline render");
         }
         let baseline_len = baseline.operations().len();
 
@@ -476,7 +478,7 @@ mod tests {
         let mut after = TestDevice::new(200.0, 300.0);
         {
             let mut store = doc.doc_store_mut();
-            page.render(&mut store, &mut after)
+            page.render(store, &mut after)
                 .expect("post-override render");
         }
 
@@ -553,8 +555,7 @@ mod tests {
         let mut baseline = TestDevice::new(200.0, 300.0);
         {
             let mut store = doc.doc_store_mut();
-            page.render(&mut store, &mut baseline)
-                .expect("baseline render");
+            page.render(store, &mut baseline).expect("baseline render");
         }
         let baseline_fills = baseline
             .operations()
@@ -591,7 +592,7 @@ mod tests {
         let mut after = TestDevice::new(200.0, 300.0);
         {
             let mut store = doc.doc_store_mut();
-            page.render(&mut store, &mut after)
+            page.render(store, &mut after)
                 .expect("post-override render");
         }
         let after_fills = after
@@ -622,7 +623,7 @@ mod tests {
         // Baseline: "q Q\n" has no text → empty extraction.
         let before = {
             let mut store = doc.doc_store_mut();
-            page.extract_text(&mut store).expect("baseline extract")
+            page.extract_text(store).expect("baseline extract")
         };
         assert!(before.is_empty(), "baseline 'q Q' content has no text");
 
@@ -640,8 +641,7 @@ mod tests {
 
         let after = {
             let mut store = doc.doc_store_mut();
-            page.extract_text(&mut store)
-                .expect("post-override extract")
+            page.extract_text(store).expect("post-override extract")
         };
         assert!(
             !after.is_empty(),

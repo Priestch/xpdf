@@ -209,7 +209,7 @@ impl Default for SkiaGraphicsState {
 }
 
 /// Font data storage with Arc for shared ownership
-struct StoredFont {
+pub struct StoredFont {
     /// The font data (kept alive to satisfy 'static requirement)
     _data: Arc<Vec<u8>>,
     /// Font type (TrueType or Type1)
@@ -709,7 +709,9 @@ pub struct SkiaDevice<'a> {
     pixmap: PixmapMut<'a>,
     state_stack: Vec<SkiaGraphicsState>,
     path_builder: PathBuilder,
-    font_cache: HashMap<String, StoredFont>,
+    /// Font cache — borrowed from PDFDocument's font_cache so parsed fonts
+    /// persist across renders. Keyed by resource name (e.g. "F1").
+    font_cache: &'a mut HashMap<String, StoredFont>,
     draw_count: usize,
     colors_seen: std::collections::HashMap<String, usize>,
 }
@@ -739,12 +741,12 @@ impl OutlineBuilder for PathConverter {
 }
 
 impl<'a> SkiaDevice<'a> {
-    pub fn new(pixmap: PixmapMut<'a>) -> Self {
+    pub fn new(pixmap: PixmapMut<'a>, font_cache: &'a mut HashMap<String, StoredFont>) -> Self {
         SkiaDevice {
             pixmap,
             state_stack: vec![SkiaGraphicsState::default()],
             path_builder: PathBuilder::new(),
-            font_cache: HashMap::new(),
+            font_cache,
             draw_count: 0,
             colors_seen: std::collections::HashMap::new(),
         }
@@ -1701,6 +1703,10 @@ impl<'a> Device for SkiaDevice<'a> {
         data: Vec<u8>,
         encoding: Option<&pdf_x_core::core::parser::PDFObject>,
     ) -> PDFResult<()> {
+        // Skip re-parsing if already cached (cross-render persistence).
+        if self.font_cache.contains_key(name) {
+            return Ok(());
+        }
         self.load_font(name, data, encoding)
     }
 
@@ -1725,5 +1731,9 @@ impl<'a> Device for SkiaDevice<'a> {
         }
 
         Ok(())
+    }
+
+    fn has_font(&self, name: &str) -> bool {
+        self.font_cache.contains_key(name)
     }
 }

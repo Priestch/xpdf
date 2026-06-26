@@ -66,15 +66,16 @@ tiny-skia = "0.11"
 name = "parsing"
 harness = false
 
+[[bench]]
+name = "perf"
+harness = false
+required-features = ["rendering"]
+
 [[test]]
 name = "rendering_tests"
 path = "tests/rendering_tests.rs"
 required-features = ["rendering"]
 
-[[test]]
-name = "render_pdf_example"
-path = "tests/render_pdf_example.rs"
-required-features = ["rendering"]
 
 [[test]]
 name = "coordinate_transform_test"

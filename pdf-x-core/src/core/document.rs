@@ -9,9 +9,12 @@ use super::page::{Page, PageTreeCache};
 use super::parser::PDFObject;
 use super::stream::Stream;
 use super::xref::XRef;
+use lru::LruCache;
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Information about a linearized PDF.
 #[derive(Debug, Clone)]
@@ -43,12 +46,8 @@ pub struct LinearizedInfo {
 ///
 /// Based on PDF.js's PDFDocument class.
 pub struct PDFDocument {
-    /// The cross-reference table
-    xref: XRef,
-
-    /// Edit delta layered over the base (`delta → base`). Empty in v1; the resolution
-    /// seam is live via [`PDFDocument::doc_store_mut`].
-    delta: DeltaLayer,
+    /// The `delta → base` resolution authority. Owns the `XRef` and `DeltaLayer`.
+    doc_store: DocStore,
 
     /// The document catalog (root dictionary)
     catalog: Option<PDFObject>,
@@ -68,6 +67,17 @@ pub struct PDFDocument {
 
     /// Whether the page reference cache has been built
     page_ref_cache_built: bool,
+
+    /// LRU cache of resolved pages (`Arc<ResolvedPage>`). `resolve_page` checks this
+    /// cache first and rebuilds on miss. Cleared when delta is modified.
+    /// Default capacity: 10 pages (viewer rarely navigates more than ~5 pages back).
+    page_resolved_cache: LruCache<usize, Arc<super::resolved_page::ResolvedPage>>,
+
+    /// Device-specific font parse arena (type-erased). The rendering backend (e.g.
+    /// tinyskia) stores `HashMap<u32, Arc<StoredFont>>` here, keyed by font object
+    /// number, so parsed fonts persist across renders. Core never touches the inner
+    /// type — it only holds the box.
+    font_cache: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Given a resolved page tree node, return the number of leaf pages in its subtree.
@@ -191,16 +201,18 @@ impl PDFDocument {
         // Delta layer over the base. Sized by the base object count so new objects
         // (Phase 2+) get fresh object numbers above the base range.
         let delta = DeltaLayer::new(xref.len() as u32);
+        let doc_store = DocStore::new(xref, delta);
 
         Ok(PDFDocument {
-            xref,
-            delta,
+            doc_store,
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
             encrypt_dict,
             page_ref_cache: FxHashMap::default(),
             page_ref_cache_built: false,
+            page_resolved_cache: LruCache::new(NonZeroUsize::new(10).unwrap()),
+            font_cache: None,
         })
     }
 
@@ -300,16 +312,18 @@ impl PDFDocument {
         // Delta layer over the base. Sized by the base object count so new objects
         // (Phase 2+) get fresh object numbers above the base range.
         let delta = DeltaLayer::new(xref.len() as u32);
+        let doc_store = DocStore::new(xref, delta);
 
         Ok(PDFDocument {
-            xref,
-            delta,
+            doc_store,
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
             encrypt_dict,
             page_ref_cache: FxHashMap::default(),
             page_ref_cache_built: false,
+            page_resolved_cache: LruCache::new(NonZeroUsize::new(10).unwrap()),
+            font_cache: None,
         })
     }
 
@@ -421,65 +435,94 @@ impl PDFDocument {
     }
 
     /// Returns a mutable reference to the xref table for fetching objects.
+    ///
+    /// Prefer [`doc_store_mut`](Self::doc_store_mut) for new code so that edits
+    /// (delta) are honored.
     pub fn xref_mut(&mut self) -> &mut XRef {
-        &mut self.xref
+        self.doc_store.xref_mut()
     }
 
-    /// Returns a [`DocStore`] — the single `delta → base` object-resolution authority,
-    /// borrowed over this document's `XRef` and `DeltaLayer`.
+    /// Returns a [`DocStore`] — the single `delta → base` object-resolution authority.
     ///
     /// All object resolution should go through the returned store (rather than
     /// [`PDFDocument::xref_mut`]) so that edits are honored. This is the editor-ready
     /// resolution seam (decision B); the delta is empty in v1.
-    pub fn doc_store_mut(&mut self) -> DocStore<'_> {
-        DocStore::new(&mut self.xref, &mut self.delta)
+    pub fn doc_store_mut(&mut self) -> &mut DocStore {
+        &mut self.doc_store
+    }
+
+    /// Mutable access to the device-specific font arena (type-erased).
+    ///
+    /// Device backends (e.g. tinyskia) initialize this on first use via
+    /// [`set_font_cache`] and downcast to their concrete cache type.
+    /// Core never inspects the inner type.
+    pub fn font_cache_mut(&mut self) -> &mut Option<Box<dyn std::any::Any + Send + Sync>> {
+        &mut self.font_cache
+    }
+
+    /// Initialize the font arena if not already set.
+    pub fn set_font_cache(&mut self, arena: Box<dyn std::any::Any + Send + Sync>) {
+        if self.font_cache.is_none() {
+            self.font_cache = Some(arena);
+        }
     }
 
     /// Resolve a page to an immutable, I/O-free [`ResolvedPage`] (`delta → base`).
     ///
-    /// Convenience wrapper: fetches the (delta-resolved) page, then resolves its
-    /// `/Resources` and `/Contents` through the [`DocStore`]. See
-    /// [`DocStore::resolve_page`](crate::core::DocStore::resolve_page).
+    /// Resolve a page to an immutable `ResolvedPage`, with caching.
     ///
-    /// *Step 4b skeleton*: this produces a `ResolvedPage` but the render pipeline is not
-    /// yet rewired to consume it; `render_page_to_image` still uses the legacy path.
+    /// Checks the LRU cache first; on miss, resolves through `DocStore::resolve_page`
+    /// (delta → base, BFS over reachable objects), then caches the result.
+    /// The cache is cleared when the delta is modified.
     pub fn resolve_page(
         &mut self,
         page_index: usize,
-    ) -> PDFResult<crate::core::resolved_page::ResolvedPage> {
+    ) -> PDFResult<Arc<crate::core::resolved_page::ResolvedPage>> {
+        // Fast path: cache hit.
+        if let Some(cached) = self.page_resolved_cache.get(&page_index) {
+            return Ok(Arc::clone(cached));
+        }
+
+        // Miss: resolve and cache.
         let page = self.get_page(page_index)?;
-        self.doc_store_mut().resolve_page(&page)
+        let resolved = Arc::new(self.doc_store_mut().resolve_page(&page)?);
+        self.page_resolved_cache
+            .put(page_index, Arc::clone(&resolved));
+        Ok(resolved)
     }
 
     /// Returns an immutable reference to the xref table.
     pub fn xref(&self) -> &XRef {
-        &self.xref
+        self.doc_store.xref()
     }
 
     /// Gets the /Pages dictionary from the catalog.
-    pub fn pages_dict(&mut self) -> PDFResult<PDFObject> {
-        let catalog = self
-            .catalog
-            .as_ref()
-            .ok_or_else(|| PDFError::Generic("No catalog".to_string()))?;
+    pub fn pages_dict(&mut self) -> PDFResult<Arc<PDFObject>> {
+        let pages_ref = {
+            let catalog = self
+                .catalog
+                .as_ref()
+                .ok_or_else(|| PDFError::Generic("No catalog".to_string()))?;
 
-        let catalog_dict = match catalog {
-            PDFObject::Dictionary(dict) => dict,
-            _ => return Err(PDFError::Generic("Catalog is not a dictionary".to_string())),
+            let catalog_dict = match catalog {
+                PDFObject::Dictionary(dict) => dict,
+                _ => return Err(PDFError::Generic("Catalog is not a dictionary".to_string())),
+            };
+
+            catalog_dict
+                .get("Pages")
+                .ok_or_else(|| PDFError::Generic("No /Pages in catalog".to_string()))?
+                .clone()
         };
 
-        let pages_ref = catalog_dict
-            .get("Pages")
-            .ok_or_else(|| PDFError::Generic("No /Pages in catalog".to_string()))?;
-
-        self.xref.fetch_if_ref(pages_ref)
+        self.xref_mut().fetch_if_ref(&pages_ref)
     }
 
     /// Gets the page count from the /Pages dictionary.
     pub fn page_count(&mut self) -> PDFResult<u32> {
         let pages_dict = self.pages_dict()?;
 
-        let pages_dict = match pages_dict {
+        let pages_dict = match &*pages_dict {
             PDFObject::Dictionary(dict) => dict,
             _ => return Err(PDFError::Generic("/Pages is not a dictionary".to_string())),
         };
@@ -510,13 +553,14 @@ impl PDFDocument {
         let root_pages = self.pages_dict()?;
 
         // Stack for depth-first traversal: (node, node_ref)
-        let mut nodes_to_visit: Vec<(PDFObject, Option<(u32, u32)>)> = vec![(root_pages, None)];
+        let mut nodes_to_visit: Vec<(Arc<PDFObject>, Option<(u32, u32)>)> =
+            vec![(root_pages, None)];
         let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
         let mut current_page_index = 0;
 
         while let Some((current_node, node_ref)) = nodes_to_visit.pop() {
             // Handle references
-            let (node_obj, obj_ref) = match &current_node {
+            let (node_obj, obj_ref) = match &*current_node {
                 PDFObject::Ref(ref_obj) => {
                     let ref_key = (ref_obj.num, ref_obj.generation);
 
@@ -529,15 +573,14 @@ impl PDFDocument {
                     visited_refs.insert(ref_key);
 
                     // Fetch the object
-                    let fetched = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
-                    let obj = (*fetched).clone();
+                    let obj = self.xref_mut().fetch(ref_obj.num, ref_obj.generation)?;
                     (obj, Some(ref_key))
                 }
-                _ => (current_node.clone(), node_ref),
+                _ => (current_node, node_ref),
             };
 
             // Check if this is a dictionary
-            let dict = match &node_obj {
+            let dict = match &*node_obj {
                 PDFObject::Dictionary(d) => d,
                 _ => continue,
             };
@@ -568,7 +611,7 @@ impl PDFDocument {
                 PDFObject::Array(arr) => arr.clone(),
                 PDFObject::Ref(ref_obj) => {
                     // Kids is a reference, fetch it
-                    let fetched = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
+                    let fetched = self.xref_mut().fetch(ref_obj.num, ref_obj.generation)?;
                     match &*fetched {
                         PDFObject::Array(arr) => arr.clone(),
                         _ => {
@@ -587,7 +630,7 @@ impl PDFDocument {
 
             // Add kids to stack in reverse order (to maintain order during DFS)
             for kid in kids_array.iter().rev() {
-                nodes_to_visit.push(((**kid).clone(), None));
+                nodes_to_visit.push((Arc::new((**kid).clone()), None));
             }
         }
 
@@ -632,7 +675,10 @@ impl PDFDocument {
     /// Cache: found pages are cached by ref in `PageTreeCache.page_refs`.
     /// `fully_built` is only set when the tree has been exhausted (page not found),
     /// preventing repeated failed traversals for out-of-bounds requests.
-    fn get_page_dict(&mut self, page_index: usize) -> PDFResult<(PDFObject, Option<(u32, u32)>)> {
+    fn get_page_dict(
+        &mut self,
+        page_index: usize,
+    ) -> PDFResult<(Arc<PDFObject>, Option<(u32, u32)>)> {
         // Fast path: check the forward ref cache.
         let cached_target = self.page_cache.get_page_ref(page_index);
         if let Some(cached_ref) = cached_target {
@@ -653,14 +699,14 @@ impl PDFDocument {
         let root_pages = self.pages_dict()?;
         let mut store = self.doc_store_mut();
 
-        let mut stack: Vec<(PDFObject, Option<(u32, u32)>)> = vec![(root_pages, None)];
+        let mut stack: Vec<(Arc<PDFObject>, Option<(u32, u32)>)> = vec![(root_pages, None)];
         let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
         let mut current_page_index = 0usize;
         let mut discovered: Vec<(usize, Option<(u32, u32)>)> = Vec::new();
 
         while let Some((current_node, node_ref)) = stack.pop() {
             // Resolve indirect references with cycle detection.
-            let (node_obj, resolved_ref) = match &current_node {
+            let (node_obj, resolved_ref) = match &*current_node {
                 PDFObject::Ref(ref_obj) => {
                     let ref_key = (ref_obj.num, ref_obj.generation);
                     if visited_refs.contains(&ref_key) {
@@ -672,10 +718,10 @@ impl PDFDocument {
                     let obj = store.resolve_ref(ref_obj.num, ref_obj.generation)?;
                     (obj, Some(ref_key))
                 }
-                _ => (current_node.clone(), node_ref),
+                _ => (current_node, node_ref),
             };
 
-            let dict = match &node_obj {
+            let dict = match &*node_obj {
                 PDFObject::Dictionary(d) => d,
                 _ => continue,
             };
@@ -712,7 +758,7 @@ impl PDFDocument {
                 PDFObject::Array(arr) => arr.clone(),
                 PDFObject::Ref(ref_obj) => {
                     let fetched = store.resolve_ref(ref_obj.num, ref_obj.generation)?;
-                    match &fetched {
+                    match &*fetched {
                         PDFObject::Array(arr) => arr.clone(),
                         _ => {
                             return Err(PDFError::Generic(
@@ -742,12 +788,12 @@ impl PDFDocument {
                     PDFObject::Ref(ref_obj) => {
                         let ref_key = (ref_obj.num, ref_obj.generation);
                         let resolved = store.resolve_ref(ref_obj.num, ref_obj.generation)?;
-                        let count = get_subtree_page_count(&resolved);
+                        let count = get_subtree_page_count(&*resolved);
                         (resolved, Some(ref_key), count)
                     }
                     _ => {
                         let count = get_subtree_page_count(kid);
-                        (kid.clone(), None, count)
+                        (Arc::new(kid.clone()), None, count)
                     }
                 };
 
@@ -852,7 +898,7 @@ impl PDFDocument {
         page_index: usize,
     ) -> PDFResult<Vec<crate::core::content_stream::TextItem>> {
         let page = self.get_page(page_index)?;
-        page.extract_text(&mut self.doc_store_mut())
+        page.extract_text(self.doc_store_mut())
     }
 
     /// Extracts text from a page as a single string.
@@ -866,7 +912,7 @@ impl PDFDocument {
     /// The extracted text as a single string
     pub fn extract_text_from_page_as_string(&mut self, page_index: usize) -> PDFResult<String> {
         let page = self.get_page(page_index)?;
-        page.extract_text_as_string(&mut self.doc_store_mut())
+        page.extract_text_as_string(self.doc_store_mut())
     }
 
     /// Render a page to RGBA pixel data.
@@ -913,7 +959,11 @@ impl PDFDocument {
     /// // Get MediaBox (might be inherited from parent)
     /// let media_box = doc.get_inheritable_property(&page, "MediaBox").ok();
     /// ```
-    pub fn get_inheritable_property(&mut self, page: &Page, key: &str) -> PDFResult<PDFObject> {
+    pub fn get_inheritable_property(
+        &mut self,
+        page: &Page,
+        key: &str,
+    ) -> PDFResult<Arc<PDFObject>> {
         let mut current_dict = page.dict().clone();
         let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
 
@@ -927,7 +977,7 @@ impl PDFDocument {
             // Check if this dictionary has the property
             if let Some(value) = dict.get(key) {
                 // Found it! Resolve if it's a reference
-                return self.xref.fetch_if_ref(value);
+                return self.xref_mut().fetch_if_ref(value);
             }
 
             // Not found, try parent
@@ -949,7 +999,7 @@ impl PDFDocument {
                     visited_refs.insert(ref_key);
 
                     // Fetch the parent dictionary
-                    let parent_obj = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
+                    let parent_obj = self.xref_mut().fetch(ref_obj.num, ref_obj.generation)?;
                     current_dict = (*parent_obj).clone();
                 }
                 _ => {
@@ -974,7 +1024,7 @@ impl PDFDocument {
     /// let page = doc.get_page(0).unwrap();
     /// let media_box = doc.get_media_box(&page).unwrap();
     /// ```
-    pub fn get_media_box(&mut self, page: &Page) -> PDFResult<PDFObject> {
+    pub fn get_media_box(&mut self, page: &Page) -> PDFResult<Arc<PDFObject>> {
         self.get_inheritable_property(page, "MediaBox")
     }
 
@@ -991,7 +1041,7 @@ impl PDFDocument {
     /// let page = doc.get_page(0).unwrap();
     /// let resources = doc.get_resources(&page).ok();
     /// ```
-    pub fn get_resources(&mut self, page: &Page) -> PDFResult<PDFObject> {
+    pub fn get_resources(&mut self, page: &Page) -> PDFResult<Arc<PDFObject>> {
         self.get_inheritable_property(page, "Resources")
     }
 
@@ -999,7 +1049,7 @@ impl PDFDocument {
     ///
     /// CropBox defines the region to which the contents of the page should be
     /// clipped when displayed or printed.
-    pub fn get_crop_box(&mut self, page: &Page) -> PDFResult<PDFObject> {
+    pub fn get_crop_box(&mut self, page: &Page) -> PDFResult<Arc<PDFObject>> {
         self.get_inheritable_property(page, "CropBox")
     }
 
@@ -1007,7 +1057,7 @@ impl PDFDocument {
     ///
     /// Rotate specifies the number of degrees by which the page should be
     /// rotated clockwise when displayed or printed. Must be a multiple of 90.
-    pub fn get_rotate(&mut self, page: &Page) -> PDFResult<PDFObject> {
+    pub fn get_rotate(&mut self, page: &Page) -> PDFResult<Arc<PDFObject>> {
         self.get_inheritable_property(page, "Rotate")
     }
 
@@ -1215,6 +1265,14 @@ impl PDFDocument {
     /// For PDF 2.0 (V=5), the file ID is not required. For earlier versions,
     /// the file ID must have been stored in the trailer during parsing.
     pub fn authenticate_with_password(&mut self, password: &[u8]) -> PDFResult<bool> {
+        // Pull the data we need from XRef up front so `self.encrypt_dict` can be
+        // mutably borrowed below without overlapping an immutable `self.xref()` borrow.
+        let file_id = self.xref().file_id()?;
+        let encrypt_obj_num = self.xref().get_encrypt_dict_ref().and_then(|r| match r {
+            PDFObject::Ref(r) => Some(r.num),
+            _ => None,
+        });
+
         if let Some(ref mut encrypt_dict) = self.encrypt_dict {
             let keyed = if matches!(
                 encrypt_dict.encryption_version(),
@@ -1223,17 +1281,15 @@ impl PDFDocument {
                 encrypt_dict.check_user_password(password)
             } else {
                 // Legacy (V=1/2/4) needs the file ID from the trailer.
-                let file_id = self.xref.file_id()?;
                 encrypt_dict.derive_encryption_key_with_file_id(password, &file_id)
             };
             if keyed {
                 // Install the decryptor so subsequent fetches decrypt streams/strings inline.
-                let encrypt_obj_num = self.xref.get_encrypt_dict_ref().and_then(|r| match r {
-                    PDFObject::Ref(r) => Some(r.num),
-                    _ => None,
-                });
-                self.xref
-                    .set_decryptor(Some(encrypt_dict.clone()), encrypt_obj_num);
+                // Clone the encrypt dict before the mutable `xref_mut` borrow so the
+                // two mutable borrows of `self` don't overlap.
+                let encrypt_clone = encrypt_dict.clone();
+                self.xref_mut()
+                    .set_decryptor(Some(encrypt_clone), encrypt_obj_num);
             }
             Ok(keyed)
         } else {
@@ -1265,18 +1321,18 @@ impl PDFDocument {
     /// This is a simplified implementation. A full implementation would use the
     /// hint table to load shared resources incrementally.
     pub fn get_first_page_linearized(&mut self) -> PDFResult<Option<Page>> {
-        let linearized_info = match &self.linearized {
-            Some(info) => info,
+        let first_page_obj_num = match &self.linearized {
+            Some(info) => info.first_page_obj_num,
             None => return Ok(None),
         };
 
         // For linearized PDFs, try to fetch the first page object directly
         // without parsing the entire page tree
-        match self.xref.fetch(linearized_info.first_page_obj_num, 0) {
+        match self.xref_mut().fetch(first_page_obj_num, 0) {
             Ok(page_obj) => {
                 // Create a page object with the first page index (0)
                 // We don't have the reference, so use None for page_ref
-                let page = Page::new(0, (*page_obj).clone(), None);
+                let page = Page::new(0, page_obj, None);
                 Ok(Some(page))
             }
             Err(_) => {
@@ -1294,16 +1350,16 @@ impl PDFDocument {
     /// The PDF version as a string (e.g., "1.4", "1.7"), or an error if not found.
     pub fn pdf_version(&mut self) -> PDFResult<String> {
         // Save current position
-        let current_pos = self.xref.stream_pos();
+        let current_pos = self.xref().stream_pos();
 
         // Move to start of file
-        self.xref.set_stream_pos(0)?;
+        self.xref_mut().set_stream_pos(0)?;
 
         // Read first 10 bytes to find header
-        let header_bytes = self.xref.get_bytes(0, 10)?;
+        let header_bytes = self.xref_mut().get_bytes(0, 10)?;
 
         // Restore position
-        self.xref.set_stream_pos(current_pos)?;
+        self.xref_mut().set_stream_pos(current_pos)?;
 
         // Check for "%PDF-" header
         let header_str = String::from_utf8_lossy(&header_bytes);
@@ -1326,9 +1382,9 @@ impl PDFDocument {
     ///
     /// # Returns
     /// `Some(PDFObject)` with the info dictionary, or `None` if not present.
-    pub fn document_info(&mut self) -> PDFResult<Option<PDFObject>> {
+    pub fn document_info(&mut self) -> PDFResult<Option<Arc<PDFObject>>> {
         let info_ref = {
-            let trailer = self.xref.trailer();
+            let trailer = self.xref().trailer();
 
             let trailer_dict = match trailer {
                 Some(PDFObject::Dictionary(dict)) => dict,
@@ -1343,7 +1399,7 @@ impl PDFDocument {
         };
 
         // Fetch the info object
-        let info_obj = self.xref.fetch_if_ref(&info_ref)?;
+        let info_obj = self.xref_mut().fetch_if_ref(&info_ref)?;
         Ok(Some(info_obj))
     }
 
@@ -1353,7 +1409,7 @@ impl PDFDocument {
     ///
     /// # Returns
     /// `Some(PDFObject)` with the outlines dictionary, or `None` if not present.
-    pub fn document_outline(&mut self) -> PDFResult<Option<PDFObject>> {
+    pub fn document_outline(&mut self) -> PDFResult<Option<Arc<PDFObject>>> {
         let outlines_ref = {
             let catalog = self.catalog();
 
@@ -1372,7 +1428,7 @@ impl PDFDocument {
             }
         };
 
-        let outlines = self.xref.fetch_if_ref(&outlines_ref)?;
+        let outlines = self.xref_mut().fetch_if_ref(&outlines_ref)?;
         Ok(Some(outlines))
     }
 
@@ -1396,7 +1452,7 @@ impl PDFDocument {
     ///
     /// # Returns
     /// `Some(PDFObject)` with the destinations dictionary, or `None` if not present.
-    pub fn document_dests(&mut self) -> PDFResult<Option<PDFObject>> {
+    pub fn document_dests(&mut self) -> PDFResult<Option<Arc<PDFObject>>> {
         let catalog = match self.catalog().cloned() {
             Some(c) => c,
             None => return Ok(None),
@@ -1405,7 +1461,7 @@ impl PDFDocument {
         if let PDFObject::Dictionary(cat_dict) = catalog {
             match cat_dict.get("Dests") {
                 Some(dests_ref) => {
-                    let dests = self.xref.fetch_if_ref(dests_ref)?;
+                    let dests = self.xref_mut().fetch_if_ref(dests_ref)?;
                     Ok(Some(dests))
                 }
                 None => Ok(None),
@@ -1437,7 +1493,7 @@ impl PDFDocument {
 
         // /Dests can be a dictionary or a Name tree
         // For now, we only support the dictionary format
-        if let PDFObject::Dictionary(dests_dict) = dests {
+        if let PDFObject::Dictionary(dests_dict) = &*dests {
             // Look up the destination by name
             // Names in /Dests are stored as Name objects or strings
             let dest_obj = dests_dict.get(name).or_else(|| {
@@ -1448,14 +1504,14 @@ impl PDFDocument {
             match dest_obj {
                 Some(dest) => {
                     // Resolve the destination
-                    let dest = self.xref.fetch_if_ref(dest)?;
+                    let dest = self.xref_mut().fetch_if_ref(dest)?;
 
                     // Destinations can be:
                     // 1. An array: [page_ref, /Type, params...]
                     // 2. A string: name of another destination (not supported yet)
                     // 3. A reference to another destination
 
-                    match dest {
+                    match &*dest {
                         PDFObject::Array(arr) => {
                             if arr.is_empty() {
                                 return Ok(None);
@@ -1494,7 +1550,8 @@ impl PDFDocument {
                         }
                         PDFObject::Ref(ref_obj) => {
                             // Fetch the referenced destination
-                            let resolved_dest = self.xref.fetch(ref_obj.num, ref_obj.generation)?;
+                            let resolved_dest =
+                                self.xref_mut().fetch(ref_obj.num, ref_obj.generation)?;
                             match &*resolved_dest {
                                 PDFObject::Array(arr) => {
                                     if arr.is_empty() {
@@ -1549,7 +1606,7 @@ impl PDFDocument {
     ///
     /// # Returns
     /// `Some(PDFObject)` with the page labels number tree, or `None` if not present.
-    pub fn page_labels(&mut self) -> PDFResult<Option<PDFObject>> {
+    pub fn page_labels(&mut self) -> PDFResult<Option<Arc<PDFObject>>> {
         let catalog = match self.catalog().cloned() {
             Some(c) => c,
             None => return Ok(None),
@@ -1558,7 +1615,7 @@ impl PDFDocument {
         if let PDFObject::Dictionary(cat_dict) = catalog {
             match cat_dict.get("PageLabels") {
                 Some(labels_ref) => {
-                    let labels = self.xref.fetch_if_ref(labels_ref)?;
+                    let labels = self.xref_mut().fetch_if_ref(labels_ref)?;
                     Ok(Some(labels))
                 }
                 None => Ok(None),
@@ -1589,10 +1646,10 @@ impl PDFDocument {
 
         // PageLabels can be a number tree (dictionary with /Kids or /Nums)
         // For now, we'll handle the simple dictionary case with /Nums array
-        if let PDFObject::Dictionary(labels_dict) = labels_obj {
+        if let PDFObject::Dictionary(labels_dict) = &*labels_obj {
             if let Some(nums_obj) = labels_dict.get("Nums") {
-                let nums = match self.xref.fetch_if_ref(nums_obj)? {
-                    PDFObject::Array(arr) => arr,
+                let nums = match &*self.xref_mut().fetch_if_ref(nums_obj)? {
+                    PDFObject::Array(arr) => arr.clone(),
                     _ => return Ok(default_label),
                 };
 
@@ -1625,7 +1682,7 @@ impl PDFDocument {
                             dict
                         }
                         PDFObject::Ref(ref_obj) => {
-                            match self.xref.fetch(ref_obj.num, ref_obj.generation) {
+                            match self.xref_mut().fetch(ref_obj.num, ref_obj.generation) {
                                 Ok(obj) => match &*obj {
                                     PDFObject::Dictionary(_) => {
                                         // We need to convert from &HashMap<_, _, RandomState> to use
@@ -1821,7 +1878,7 @@ mod tests {
 
         let pages = doc.pages_dict().unwrap();
 
-        match pages {
+        match &*pages {
             PDFObject::Dictionary(dict) => {
                 assert_eq!(
                     dict.get("Type"),
@@ -2142,7 +2199,7 @@ startxref
 
         // But we can get it via inheritance
         let media_box = doc.get_media_box(&page).unwrap();
-        match media_box {
+        match &*media_box {
             PDFObject::Array(arr) => {
                 assert_eq!(arr.len(), 4);
                 assert_eq!(*arr[0], PDFObject::Number(0.0));
@@ -2184,7 +2241,7 @@ startxref
 
         // Get Resources via inheritance
         let resources = doc.get_resources(&page).unwrap();
-        match resources {
+        match &*resources {
             PDFObject::Dictionary(dict) => {
                 assert!(dict.contains_key("Font"));
             }
@@ -2223,7 +2280,7 @@ startxref
 
         // Should get the page-level MediaBox (300x400), not the inherited one (612x792)
         let media_box = doc.get_media_box(&page).unwrap();
-        match media_box {
+        match &*media_box {
             PDFObject::Array(arr) => {
                 assert_eq!(*arr[2], PDFObject::Number(300.0));
                 assert_eq!(*arr[3], PDFObject::Number(400.0));
@@ -2271,7 +2328,7 @@ startxref
         for i in 0..2 {
             let page = doc.get_page(i).unwrap();
             let media_box = doc.get_media_box(&page).unwrap();
-            match media_box {
+            match &*media_box {
                 PDFObject::Array(arr) => {
                     assert_eq!(*arr[2], PDFObject::Number(612.0));
                     assert_eq!(*arr[3], PDFObject::Number(792.0));

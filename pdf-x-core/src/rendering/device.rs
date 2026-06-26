@@ -238,6 +238,15 @@ pub trait Device {
         let _ = default_width;
         Ok(())
     }
+
+    /// Check whether a font has already been loaded into the device.
+    ///
+    /// Called by the rendering context before extracting and parsing font data,
+    /// so that fonts loaded in a previous render are reused without re-parsing.
+    /// Devices that don't support text rendering return `false` (default).
+    fn has_font(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 /// A simple CPU-based device implementation for testing.

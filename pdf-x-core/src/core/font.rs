@@ -17,6 +17,7 @@ use crate::core::encoding::Encoding;
 use crate::core::error::{PDFError, PDFResult};
 use crate::core::parser::PDFObject;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 /// PDF font type enumeration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,7 +219,7 @@ impl Font {
         let encoding = if let Some(enc_obj) = &dict.encoding {
             let fetched = xref
                 .fetch_if_ref(enc_obj)
-                .unwrap_or_else(|_| enc_obj.clone());
+                .unwrap_or_else(|_| Arc::new(enc_obj.clone()));
             Encoding::from_pdf_object(&fetched).unwrap_or(Encoding::Standard)
         } else {
             // No encoding specified - default to StandardEncoding for simple fonts
@@ -227,7 +228,7 @@ impl Font {
 
         // Parse ToUnicode CMap if present
         let cmap = if let Some(to_unicode_ref) = &dict.to_unicode {
-            match xref.fetch_if_ref(to_unicode_ref)? {
+            match &*xref.fetch_if_ref(to_unicode_ref)? {
                 PDFObject::Stream {
                     dict: stream_dict,
                     data,
@@ -289,8 +290,8 @@ impl Font {
     ) -> PDFResult<Option<Vec<u8>>> {
         let descriptor = xref.fetch_if_ref(descriptor_ref)?;
 
-        let descriptor_dict = match descriptor {
-            PDFObject::Dictionary(d) => d,
+        let descriptor_dict = match &*descriptor {
+            PDFObject::Dictionary(d) => d.clone(),
             _ => return Ok(None),
         };
 
@@ -320,7 +321,7 @@ impl Font {
     ) -> PDFResult<Option<Vec<u8>>> {
         let stream_obj = xref.fetch_if_ref(stream_ref)?;
 
-        match stream_obj {
+        match &*stream_obj {
             PDFObject::Stream { dict, data } => {
                 // Decompress the stream
                 let filter_name = dict.get("Filter").and_then(|f| match f {

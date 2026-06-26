@@ -3,6 +3,7 @@ use super::error::{PDFError, PDFResult};
 use super::parser::PDFObject;
 use super::{ContentStreamEvaluator, Lexer, Stream};
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 /// A single page in a PDF document.
 ///
@@ -35,30 +36,30 @@ pub struct Page {
 /// through the resolver (e.g. stream positioning).
 pub trait PageResolver {
     /// Resolve `obj` if it is an indirect reference (delta-aware where supported).
-    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject>;
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>>;
     /// Resolve object `(num, generation)` (delta-aware where supported).
-    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<PDFObject>;
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<Arc<PDFObject>>;
     /// Base `XRef` for XRef-specific operations not expressed through the resolver.
     fn as_xref_mut(&mut self) -> &mut super::xref::XRef;
 }
 
 impl PageResolver for super::xref::XRef {
-    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>> {
         self.fetch_if_ref(obj)
     }
-    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<PDFObject> {
-        self.fetch(num, generation).map(|r| (*r).clone())
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
+        self.fetch(num, generation)
     }
     fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
         self
     }
 }
 
-impl<'a> PageResolver for super::doc_store::DocStore<'a> {
-    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
+impl PageResolver for super::doc_store::DocStore {
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>> {
         super::doc_store::DocStore::resolve_if_ref(self, obj)
     }
-    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<PDFObject> {
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
         super::doc_store::DocStore::resolve_ref(self, num, generation)
     }
     fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
@@ -73,10 +74,10 @@ impl Page {
     /// * `page_index` - The 0-based index of this page in the document
     /// * `page_dict` - The page dictionary object
     /// * `page_ref` - Optional indirect reference (obj_num, generation) for this page
-    pub fn new(page_index: usize, page_dict: PDFObject, page_ref: Option<(u32, u32)>) -> Self {
+    pub fn new(page_index: usize, page_dict: Arc<PDFObject>, page_ref: Option<(u32, u32)>) -> Self {
         Page {
             page_index,
-            page_dict,
+            page_dict: (*page_dict).clone(),
             page_ref,
         }
     }
@@ -147,11 +148,11 @@ impl Page {
         xref: &mut super::xref::XRef,
         key: &str,
         stop_when_found: bool,
-    ) -> PDFResult<Option<PDFObject>> {
+    ) -> PDFResult<Option<Arc<PDFObject>>> {
         let mut current = self.page_dict.clone();
         let mut visited_refs: std::collections::HashSet<(u32, u32)> =
             std::collections::HashSet::new();
-        let mut values: Vec<PDFObject> = Vec::new();
+        let mut values: Vec<Arc<PDFObject>> = Vec::new();
 
         loop {
             let dict = match &current {
@@ -195,13 +196,17 @@ impl Page {
         }
 
         if values.len() == 1 {
-            return Ok(Some(values.remove(0)));
+            return Ok(Some(Arc::clone(&values.remove(0))));
         }
 
-        match values.first() {
-            Some(PDFObject::Dictionary(_)) => Ok(Some(Self::merge_dict_values(values))),
-            Some(first) => Ok(Some(first.clone())),
-            None => Ok(None),
+        // For Dictionary values, merge keys across the inheritance chain. For all
+        // other types (Array, Number, etc.) the closest value wins — mirrors pdf.js
+        // `inherit` behavior for non-dict properties like MediaBox.
+        match &*values[0] {
+            PDFObject::Dictionary(_) => Ok(Some(Arc::new(Self::merge_dict_values(
+                values.into_iter().map(|a| (*a).clone()).collect(),
+            )))),
+            _ => Ok(Some(Arc::clone(&values[0]))),
         }
     }
 
@@ -253,13 +258,13 @@ impl Page {
         let media_box = self
             .get_inheritable_property(xref, "MediaBox", false)
             .ok()
-            .and_then(|value| value.as_ref().and_then(Self::resolve_rect))
+            .and_then(|value| value.as_deref().and_then(Self::resolve_rect))
             .unwrap_or([0.0, 0.0, 612.0, 792.0]);
 
         let crop_box = self
             .get_inheritable_property(xref, "CropBox", false)
             .ok()
-            .and_then(|value| value.as_ref().and_then(Self::resolve_rect))
+            .and_then(|value| value.as_deref().and_then(Self::resolve_rect))
             .unwrap_or(media_box);
 
         let intersect = [
@@ -283,7 +288,7 @@ impl Page {
             .get_inheritable_property(xref, "Rotate", false)
             .ok()
             .and_then(|value| {
-                value.as_ref().and_then(|obj| match obj {
+                value.as_deref().and_then(|obj| match obj {
                     PDFObject::Number(n) => Some(*n as i32),
                     _ => None,
                 })
@@ -304,7 +309,7 @@ impl Page {
     pub(crate) fn get_inheritable_resources(
         &self,
         xref: &mut super::xref::XRef,
-    ) -> PDFResult<Option<PDFObject>> {
+    ) -> PDFResult<Option<Arc<PDFObject>>> {
         // Reference: pdf.js/src/core/document.js - Page.resources
         self.get_inheritable_property(xref, "Resources", false)
     }
@@ -313,13 +318,13 @@ impl Page {
         &self,
         xref: &mut super::xref::XRef,
         stream_resources: Option<&PDFObject>,
-        page_resources: &Option<PDFObject>,
+        page_resources: &Option<Arc<PDFObject>>,
     ) -> PDFResult<Option<PDFObject>> {
         // Reference: pdf.js/src/core/document.js - #getMergedResources
         let local_resources = match stream_resources {
-            Some(value) => match xref.fetch_if_ref(value)? {
+            Some(value) => match &*xref.fetch_if_ref(value)? {
                 PDFObject::Dictionary(dict) if !dict.is_empty() => {
-                    Some(PDFObject::Dictionary(dict))
+                    Some(PDFObject::Dictionary(dict.clone()))
                 }
                 _ => None,
             },
@@ -328,11 +333,11 @@ impl Page {
 
         match (local_resources, page_resources) {
             (Some(local), Some(page)) => {
-                let merged = Self::merge_dict_values(vec![local, page.clone()]);
+                let merged = Self::merge_dict_values(vec![local, (**page).clone()]);
                 Ok(Some(merged))
             }
             (Some(local), None) => Ok(Some(local)),
-            (None, Some(page)) => Ok(Some(page.clone())),
+            (None, Some(page)) => Ok(Some((**page).clone())),
             (None, None) => Ok(None),
         }
     }
@@ -359,14 +364,14 @@ impl Page {
             None => return Ok(()),
         };
 
-        let font_dict = match xref.fetch_if_ref(font_entry)? {
-            PDFObject::Dictionary(d) => d,
+        let font_dict = match &*xref.fetch_if_ref(font_entry)? {
+            PDFObject::Dictionary(d) => d.clone(),
             _ => return Ok(()),
         };
 
         for (font_name, font_ref) in font_dict {
             if let Ok(font_obj) = xref.fetch_if_ref(&font_ref) {
-                if let Ok(pdf_font) = super::font::Font::new(font_obj, xref) {
+                if let Ok(pdf_font) = super::font::Font::new((*font_obj).clone(), xref) {
                     if let Some(embedded_data) = pdf_font.embedded_font {
                         if let Err(e) = device.load_font_data(&font_name, embedded_data, None) {
                             if !e.to_string().contains("UnknownMagic") {
@@ -431,17 +436,17 @@ impl Page {
         let mut all_text_items = Vec::new();
 
         // Handle single content stream
-        let content_streams = match contents {
+        let content_streams = match &*contents {
             PDFObject::Stream { dict, data } => {
                 vec![(dict.clone(), data.clone())]
             }
             PDFObject::Array(arr) => {
                 // Multiple content streams - fetch each one
                 let mut streams = Vec::new();
-                for content_obj in &arr {
-                    match resolver.resolve_if_ref(content_obj)? {
+                for content_obj in arr.iter() {
+                    match &*resolver.resolve_if_ref(content_obj)? {
                         PDFObject::Stream { dict, data } => {
-                            streams.push((dict, data));
+                            streams.push((dict.clone(), data.clone()));
                         }
                         _ => {
                             return Err(super::PDFError::Generic(
@@ -558,8 +563,8 @@ impl Page {
             Some(o) => o,
             None => return Ok(()),
         };
-        let xobject_dict = match resolver.resolve_if_ref(xobject_obj)? {
-            PDFObject::Dictionary(d) => d,
+        let xobject_dict = match &*resolver.resolve_if_ref(xobject_obj)? {
+            PDFObject::Dictionary(d) => d.clone(),
             _ => return Ok(()),
         };
 
@@ -570,8 +575,8 @@ impl Page {
         };
         let xobject = resolver.resolve_if_ref(xobject_ref)?;
 
-        let (form_dict, form_data) = match xobject {
-            PDFObject::Stream { dict, data } => (dict, data),
+        let (form_dict, form_data) = match &*xobject {
+            PDFObject::Stream { dict, data } => (dict.clone(), data.clone()),
             _ => return Ok(()),
         };
 
@@ -608,7 +613,7 @@ impl Page {
         let form_resources = if let Some(res_obj) = form_dict.get("Resources") {
             resolver.resolve_if_ref(res_obj).ok()
         } else {
-            Some(resources.clone())
+            Some(Arc::new(resources.clone()))
         };
         if let Some(ref form_res) = form_resources {
             let _ = evaluator.load_fonts(form_res, resolver.as_xref_mut());
@@ -660,7 +665,47 @@ impl Page {
             .filter_map(|t| t.font_size)
             .fold(2.0_f64, |m, fs| m.max(fs * 0.5));
 
-        Ok(Self::cluster_and_join(text_items, line_threshold))
+        Ok(Self::decompose_ligatures(&Self::cluster_and_join(
+            text_items,
+            line_threshold,
+        )))
+    }
+
+    /// Replace Unicode ligature codepoints with their ASCII equivalents.
+    /// PDF fonts often encode ﬁ, ﬂ, ﬀ, etc. as single codepoints; pdftotext
+    /// and pdf.js decompose them for plain-text output.
+    fn decompose_ligatures(s: &str) -> String {
+        s.replace('\u{FB00}', "ff")
+            .replace('\u{FB01}', "fi")
+            .replace('\u{FB02}', "fl")
+            .replace('\u{FB03}', "ffi")
+            .replace('\u{FB04}', "ffl")
+            .replace('\u{FB05}', "st")
+            .replace('\u{FB06}', "st")
+    }
+
+    /// Merge hyphenated line breaks: "word-\nword" → "wordword".
+    /// Only when `-` is preceded by a letter and `\n` is followed by a
+    /// lowercase letter (the common hyphenation pattern in English text).
+    fn dehyphenate(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut result = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if i + 2 < chars.len()
+                && chars[i] == '-'
+                && chars[i + 1] == '\n'
+                && chars[i + 2].is_ascii_lowercase()
+                && i > 0
+                && chars[i - 1].is_alphabetic()
+            {
+                i += 2;
+                continue;
+            }
+            result.push(chars[i]);
+            i += 1;
+        }
+        result
     }
 
     /// Join pre-clustered lines in per-char mode (running average gap detection).
@@ -782,20 +827,27 @@ impl Page {
             }
         };
 
-        // Multi-column detection: find the MODAL gap midpoint across all Y‑lines.
-        // Only gaps where x1 > 120pt are considered — this excludes start‑of‑line
-        // (left‑margin) items, so the gap between the LAST left‑column item and the
-        // FIRST right‑column item drives the boundary rather than the full page‑span
-        // gap from X=54 to X=317.
+        // Multi-column detection: find the MODAL gap midpoint across all Y-lines.
+        // For each line, only the LARGEST gap participates — the column gap is
+        // always the widest intra-line gap.  This avoids false positives from
+        // word-spacing gaps while not requiring an arbitrary X threshold that
+        // would exclude left-column items starting near x=54.
         let mut midpoints: Vec<f64> = Vec::new();
         for line in &lines {
+            let mut best_gap: Option<(f64, f64)> = None; // (gap, midpoint)
             for pair in line.windows(2) {
                 if let (Some((x1, _)), Some((x2, _))) = (pair[0].position, pair[1].position) {
                     let gap = x2 - x1;
-                    if gap >= 60.0 && x1 > 120.0 {
-                        midpoints.push((x1 + x2) / 2.0);
+                    if gap >= 60.0 {
+                        let mid = (x1 + x2) / 2.0;
+                        if best_gap.is_none_or(|(g, _)| gap > g) {
+                            best_gap = Some((gap, mid));
+                        }
                     }
                 }
+            }
+            if let Some((_, mid)) = best_gap {
+                midpoints.push(mid);
             }
         }
         let col_boundary = if midpoints.len() >= 6 {
@@ -821,7 +873,7 @@ impl Page {
             // Single column: standard join.
             let all_single_char = lines.iter().flatten().all(|t| t.text.chars().count() == 1);
             if all_single_char {
-                return Self::join_per_char(&lines, line_threshold);
+                return Self::dehyphenate(&Self::join_per_char(&lines, line_threshold));
             } else {
                 let mut result = String::new();
                 for line in &lines {
@@ -835,70 +887,32 @@ impl Page {
                         result.push_str(&item.text);
                     }
                 }
-                return result;
+                return Self::dehyphenate(&result);
             }
         }
 
-        // Multi-column: split lines with a column gap (>60pt), and route
-        // single‑cluster lines to the appropriate column by their X position.
+        // Multi-column: partition each line's items by the global column boundary.
+        // Items with x < col_boundary go left, items with x >= col_boundary go right.
+        // This handles lines with any number of items on either side (e.g. multi-item
+        // reference entries with hanging-indent continuation lines).
         let mut col_lines: [Vec<Vec<&TextItem>>; 2] = [Vec::new(), Vec::new()];
 
         for line in &lines {
-            // Column-break detection: find the gap whose midpoint is closest to the
-            // global column boundary.  A genuine column break has ≤1 item on the right
-            // side of the gap (the rest of the right‑column row); a word‑spacing gap
-            // within a single‑column line (e.g. a centered title) has 2+ items after it
-            // (the remaining words on the same line).
-            let col_gap_idx = line
-                .windows(2)
-                .enumerate()
-                .filter_map(|(idx, pair)| {
-                    let x1 = pair[0].position?.0;
-                    let x2 = pair[1].position?.0;
-                    let mid = (x1 + x2) / 2.0;
-                    let gap = x2 - x1;
-                    // 150pt tolerance captures both short-gap column breaks (gap ≈ 94
-                    // on extended left‑col lines) and wide‑gap body rows (gap ≈ 263).
-                    if gap >= 60.0 && (mid - col_boundary).abs() < 150.0 {
-                        Some((idx, gap, mid))
-                    } else {
-                        None
-                    }
-                })
-                .min_by(|(_, _, a), (_, _, b)| {
-                    (a - col_boundary)
-                        .abs()
-                        .partial_cmp(&(b - col_boundary).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            let has_col_break = col_gap_idx.is_some_and(|(idx, _, _)| {
-                // Only a column break if ≤1 item remains after the gap (right column).
-                line.len() - (idx + 1) <= 1
-            });
-
-            if has_col_break {
-                if let Some((split_at, _, _)) = col_gap_idx {
-                    let left: Vec<&TextItem> = line.iter().take(split_at + 1).copied().collect();
-                    let right: Vec<&TextItem> = line.iter().skip(split_at + 1).copied().collect();
-                    if !left.is_empty() {
-                        col_lines[0].push(left);
-                    }
-                    if !right.is_empty() {
-                        col_lines[1].push(right);
-                    }
+            let mut left: Vec<&TextItem> = Vec::new();
+            let mut right: Vec<&TextItem> = Vec::new();
+            for item in line {
+                let is_right = item.position.is_some_and(|p| p.0 >= col_boundary);
+                if is_right {
+                    right.push(item);
                 } else {
-                    col_lines[0].push(line.iter().copied().collect());
+                    left.push(item);
                 }
-            } else {
-                // Single‑cluster line: all items go to one column.
-                let all_right = line
-                    .iter()
-                    .all(|t| t.position.map(|p| p.0 >= col_boundary).unwrap_or(false));
-                if all_right {
-                    col_lines[1].push(line.iter().copied().collect());
-                } else {
-                    col_lines[0].push(line.iter().copied().collect());
-                }
+            }
+            if !left.is_empty() {
+                col_lines[0].push(left);
+            }
+            if !right.is_empty() {
+                col_lines[1].push(right);
             }
         }
 
@@ -918,7 +932,7 @@ impl Page {
 
         col_groups
             .into_iter()
-            .map(|g| g.join("\n"))
+            .map(|g| Self::dehyphenate(&g.join("\n")))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -977,7 +991,7 @@ impl Page {
         let contents = resolver.resolve_if_ref(contents)?;
 
         // Handle single content stream or array of streams
-        let content_streams = match contents {
+        let content_streams = match &*contents {
             PDFObject::Stream { dict, data } => {
                 vec![(dict.clone(), data.clone())]
             }
@@ -985,7 +999,7 @@ impl Page {
                 // Multiple content streams - fetch each one
                 let mut streams = Vec::new();
                 let mut seen_streams = std::collections::HashSet::new();
-                for content_obj in &arr {
+                for content_obj in arr.iter() {
                     // Track which object references we've already processed
                     // to avoid duplicate rendering (common in some PDFs)
                     let obj_key = match content_obj.as_ref() {
@@ -1002,9 +1016,9 @@ impl Page {
                     }
                     seen_streams.insert(obj_key);
 
-                    match resolver.resolve_if_ref(content_obj)? {
+                    match &*resolver.resolve_if_ref(content_obj)? {
                         PDFObject::Stream { dict, data } => {
-                            streams.push((dict, data));
+                            streams.push((dict.clone(), data.clone()));
                         }
                         _ => {
                             return Err(super::PDFError::Generic(
@@ -1154,8 +1168,8 @@ impl Page {
             None => return Ok(Vec::new()),
         };
 
-        let resources_dict = match resources {
-            PDFObject::Dictionary(d) => d,
+        let resources_dict = match &*resources {
+            PDFObject::Dictionary(d) => d.clone(),
             _ => return Ok(Vec::new()),
         };
 
@@ -1164,7 +1178,7 @@ impl Page {
             None => return Ok(Vec::new()),
         };
 
-        match font_dict {
+        match &*font_dict {
             PDFObject::Dictionary(d) => {
                 let mut fonts = Vec::new();
                 for (name, font_ref) in d.iter() {
@@ -1202,7 +1216,7 @@ impl Page {
             match xref.fetch_if_ref(&font_ref) {
                 Ok(font_obj) => {
                     // Try to create a Font and extract embedded data
-                    match super::font::Font::new(font_obj, xref) {
+                    match super::font::Font::new((*font_obj).clone(), xref) {
                         Ok(pdf_font) => {
                             // If we have embedded font data, load it
                             if let Some(embedded_data) = pdf_font.embedded_font {

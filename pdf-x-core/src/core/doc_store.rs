@@ -1,69 +1,60 @@
 //! `DocStore` — the single `delta → base` object-resolution authority.
 //!
-//! This is the **Phase 0 decision B** type from `CLAUDE.md`. Every object lookup goes
-//! through [`DocStore::resolve_ref`] / [`DocStore::resolve_if_ref`]: the delta is checked
-//! first (cheap, local — and it may even *avoid* a base fetch), then the base `XRef`.
+//! This is the **decision B** type from `CLAUDE.md`. Every object lookup goes through
+//! [`DocStore::resolve_ref`] / [`DocStore::resolve_if_ref`]: the delta is checked first
+//! (cheap, local — and it may even *avoid* a base fetch), then the base `XRef`.
 //!
-//! ## Step 2 scope
-//!
-//! `DocStore` is introduced as a **borrowed view** over `(&mut XRef, &mut DeltaLayer)`,
-//! owned by [`crate::core::PDFDocument`] and obtained via `PDFDocument::doc_store_mut()`.
-//! It is *not* the owner of the `XRef` yet — that ownership move is a later step, to keep
-//! this step behavior-preserving and low-risk (the 29 existing `self.xref` sites are left
-//! untouched). The resolution seam is nonetheless **live**: page-tree object resolution in
-//! `PDFDocument::get_page_dict` routes through `resolve_ref`, so the delta is consulted
-//! for real from day one (delta is empty in v1, so behavior is identical to the base).
-//!
-//! Deeply-nested helpers in `page.rs` still take `&mut XRef` directly for now; migrating
-//! every fetch site is a later, incremental step. Because the delta is empty, this is
-//! behavior-preserving.
+//! `DocStore` owns the `XRef` and `DeltaLayer` directly (Phase 1 migration: was a borrowed
+//! view over `(&mut XRef, &mut DeltaLayer)`). Owned by [`crate::core::PDFDocument`].
 
 use super::delta::DeltaLayer;
 use super::error::{PDFError, PDFResult};
 use super::parser::{PDFObject, Ref};
 use super::xref::XRef;
+use std::sync::Arc;
 
-/// The `delta → base` object-resolution authority, borrowed over a document's
-/// `XRef` (base) and `DeltaLayer` (edits).
+/// The `delta → base` object-resolution authority.
 ///
-/// Constructed via [`PDFDocument::doc_store_mut`](crate::core::PDFDocument::doc_store_mut).
-/// All object resolution should go through this type rather than through `XRef` directly,
-/// so that edits are honored.
-pub struct DocStore<'a> {
-    xref: &'a mut XRef,
-    delta: &'a mut DeltaLayer,
+/// Owns the base `XRef` and the edit `DeltaLayer`. Constructed by
+/// [`crate::core::PDFDocument`] and accessed via
+/// [`crate::core::PDFDocument::doc_store_mut`].
+pub struct DocStore {
+    /// The base cross-reference table (owns the stream + cache + all object data).
+    xref: XRef,
+    /// The edit delta overlaid on the base (empty in v1; seam is live).
+    delta: DeltaLayer,
 }
 
-impl<'a> DocStore<'a> {
-    /// Borrow the base `XRef` and the `DeltaLayer` as a resolution authority.
-    pub fn new(xref: &'a mut XRef, delta: &'a mut DeltaLayer) -> Self {
+impl DocStore {
+    /// Take ownership of the base `XRef` and the edit `DeltaLayer`.
+    pub fn new(xref: XRef, delta: DeltaLayer) -> Self {
         Self { xref, delta }
     }
 
     /// Resolve an indirect object reference: `delta → base`.
     ///
     /// Order: deleted (deletion wins — `delete_object` also clears any prior modification)
-    /// → modified/new override → base `XRef` fetch. Returns a **cloned** owned object.
-    pub fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<PDFObject> {
+    /// → modified/new override → base `XRef` fetch. Returns an `Arc<PDFObject>` — cheap
+    /// clone (refcount inc) from the XRef cache; delta overrides are Arc-wrapped clones.
+    pub fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
         let key = Ref::new(num, generation);
         if self.delta.is_deleted(&key) {
             return Err(PDFError::ObjectDeleted { num, generation });
         }
         if let Some(delta_obj) = self.delta.get(&key) {
-            return Ok(delta_obj.object.clone());
+            return Ok(Arc::new(delta_obj.object.clone()));
         }
         // Fall back to the base PDF (progressive loading lives inside XRef today).
-        let fetched = self.xref.fetch(num, generation)?;
-        Ok((*fetched).clone())
+        self.xref.fetch(num, generation)
     }
 
-    /// Resolve `obj` if it is an indirect reference; otherwise return a clone as-is.
+    /// Resolve `obj` if it is an indirect reference; otherwise wrap in an Arc.
     ///
     /// Mirrors `XRef::fetch_if_ref`, but delta-aware.
-    pub fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<PDFObject> {
+    pub fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>> {
         match obj {
             PDFObject::Ref(r) => self.resolve_ref(r.num, r.generation),
-            other => Ok(other.clone()),
+            other => Ok(Arc::new(other.clone())),
         }
     }
 
@@ -72,22 +63,22 @@ impl<'a> DocStore<'a> {
     /// The delta is empty in v1, so consulting the base directly is behavior-preserving.
     /// New code should prefer `resolve_ref` / `resolve_if_ref`.
     pub fn xref(&self) -> &XRef {
-        self.xref
+        &self.xref
     }
 
     /// Mutable escape hatch to the base `XRef`.
     pub fn xref_mut(&mut self) -> &mut XRef {
-        self.xref
+        &mut self.xref
     }
 
     /// The edit surface (commands write here). Local-only; never serialized/merged.
     pub fn delta(&self) -> &DeltaLayer {
-        self.delta
+        &self.delta
     }
 
     /// Mutable edit surface.
     pub fn delta_mut(&mut self) -> &mut DeltaLayer {
-        self.delta
+        &mut self.delta
     }
 }
 
@@ -148,7 +139,7 @@ mod tests {
             .resolve_ref(num, 0)
             .expect("resolve_ref should return the base object (delta empty)");
         assert_eq!(
-            resolved, base_obj,
+            *resolved, base_obj,
             "delta empty → resolve must equal base fetch"
         );
     }
@@ -172,7 +163,7 @@ mod tests {
             .resolve_ref(num, 0)
             .expect("resolve_ref should return the delta override");
         assert_eq!(
-            resolved,
+            *resolved,
             PDFObject::Boolean(true),
             "delta override must win over base"
         );
@@ -198,7 +189,7 @@ mod tests {
         let mut store = doc.doc_store_mut();
         // A non-Ref object is returned as-is.
         let passthrough = store.resolve_if_ref(&PDFObject::Number(42.0)).unwrap();
-        assert_eq!(passthrough, PDFObject::Number(42.0));
+        assert_eq!(*passthrough, PDFObject::Number(42.0));
     }
 
     #[test]

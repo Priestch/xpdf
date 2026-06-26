@@ -485,12 +485,14 @@ fn extract_page_images(page: &Page, doc: &mut PDFDocument, total_size: &mut usiz
             if let Some(xobject_obj) = xobject_dict.get("XObject") {
                 // Follow reference if needed
                 let xobject_dict = match doc.xref_mut().fetch_if_ref(xobject_obj) {
-                    Ok(PDFObject::Dictionary(dict)) => dict,
-                    Ok(PDFObject::Stream { dict, .. }) => dict,
-                    Ok(_) => {
-                        println!("  ⚠️  XObject is not a dictionary or stream");
-                        return 0;
-                    }
+                    Ok(obj) => match &*obj {
+                        PDFObject::Dictionary(dict) => dict.clone(),
+                        PDFObject::Stream { dict, .. } => dict.clone(),
+                        _ => {
+                            println!("  ⚠️  XObject is not a dictionary or stream");
+                            return 0;
+                        }
+                    },
                     Err(e) => {
                         println!("  ⚠️  Error fetching XObject: {:?}", e);
                         return 0;
@@ -511,7 +513,7 @@ fn extract_page_images(page: &Page, doc: &mut PDFDocument, total_size: &mut usiz
                     };
 
                     // Check if it's an image stream
-                    if let PDFObject::Stream { dict, data } = xobject {
+                    if let PDFObject::Stream { dict, data } = &*xobject {
                         // Check if it's an image XObject
                         if let Some(subtype) = dict.get("Subtype") {
                             if let PDFObject::Name(subtype_name) = subtype {
@@ -1005,10 +1007,12 @@ fn extract_fonts(doc: &mut PDFDocument) {
                     if let Some(font_obj) = res_dict.get("Font") {
                         // Follow reference if needed
                         let font_dict = match doc.xref_mut().fetch_if_ref(font_obj) {
-                            Ok(PDFObject::Dictionary(dict)) => dict,
-                            Ok(_) => {
-                                continue;
-                            }
+                            Ok(obj) => match &*obj {
+                                PDFObject::Dictionary(dict) => dict.clone(),
+                                _ => {
+                                    continue;
+                                }
+                            },
                             Err(_) => continue,
                         };
 
@@ -1410,7 +1414,7 @@ fn count_fonts(doc: &mut PDFDocument) -> usize {
                 if let PDFObject::Dictionary(res_dict) = resources {
                     if let Some(font_obj) = res_dict.get("Font") {
                         if let Ok(font_dict) = doc.xref_mut().fetch_if_ref(font_obj) {
-                            if let PDFObject::Dictionary(dict) = font_dict {
+                            if let PDFObject::Dictionary(dict) = &*font_dict {
                                 for (font_name, _) in dict {
                                     font_set.insert(font_name.clone());
                                 }
