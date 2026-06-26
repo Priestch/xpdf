@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tiny_skia::PathBuilder;
 
 #[cfg(feature = "hayro-font")]
-use hayro_font::{type1::Table as Type1Table, OutlineBuilder as HayroOutlineBuilder};
+use hayro_font::{OutlineBuilder as HayroOutlineBuilder, type1::Table as Type1Table};
 
 /// Font variant - either Type1 or CFF
 #[cfg(feature = "hayro-font")]

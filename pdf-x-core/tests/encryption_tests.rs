@@ -30,7 +30,8 @@ fn v5_aes256_empty_password_opens() {
     );
     // Catalog lives in an ObjStm — must be decrypted on fetch.
     assert_eq!(doc.page_count().expect("page_count"), 1);
-    doc.get_page(0).expect("page 0 resolves (ObjStm decrypted on fetch)");
+    doc.get_page(0)
+        .expect("page 0 resolves (ObjStm decrypted on fetch)");
 }
 
 #[test]
@@ -58,7 +59,8 @@ fn v2_rc4_password_installs_decryptor() {
         "user password 'test' must authenticate"
     );
     assert_eq!(doc.page_count().expect("page_count"), 3);
-    doc.get_page(0).expect("page resolves after decryptor install");
+    doc.get_page(0)
+        .expect("page resolves after decryptor install");
 }
 
 #[test]
@@ -69,5 +71,6 @@ fn v4_aes128_password_installs_decryptor() {
     assert!(doc.is_encrypted());
     assert!(doc.authenticate_with_password(b"test").expect("auth"));
     assert_eq!(doc.page_count().expect("page_count"), 3);
-    doc.get_page(0).expect("page resolves after AES-128 decryptor install");
+    doc.get_page(0)
+        .expect("page resolves after AES-128 decryptor install");
 }

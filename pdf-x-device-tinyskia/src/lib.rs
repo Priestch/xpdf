@@ -19,9 +19,9 @@ mod type1_font;
 
 pub use skia_device::SkiaDevice;
 
-use pdf_x_core::core::error::{PDFError, PDFResult};
 use pdf_x_core::core::PDFDocument;
-use pdf_x_core::rendering::{interpret, Device};
+use pdf_x_core::core::error::{PDFError, PDFResult};
+use pdf_x_core::rendering::{Device, interpret};
 
 /// Render a page of a [`PDFDocument`] to RGBA pixels using the tiny-skia backend.
 ///
@@ -109,8 +109,12 @@ impl RenderToImage for PDFDocument {
             rotate_b * scale as f64,
             rotate_c * scale as f64,
             rotate_d * scale as f64,
-            offset_canvas_x - rotate_a * scale as f64 * center_x - rotate_c * scale as f64 * center_y,
-            offset_canvas_y - rotate_b * scale as f64 * center_x - rotate_d * scale as f64 * center_y,
+            offset_canvas_x
+                - rotate_a * scale as f64 * center_x
+                - rotate_c * scale as f64 * center_y,
+            offset_canvas_y
+                - rotate_b * scale as f64 * center_x
+                - rotate_d * scale as f64 * center_y,
         ]);
 
         // Render via the pure interpret path: resolve to a snapshot (delta-aware), then

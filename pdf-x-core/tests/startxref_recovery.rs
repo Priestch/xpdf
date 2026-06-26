@@ -9,5 +9,8 @@ fn sample_pdf_opens_after_startxref_recovery() {
     // The recovery's job is to land the parser on a valid xref/object header so `open`
     // succeeds; deeper per-object parse robustness on this particular fixture is tracked
     // separately.
-    assert!(doc.page_count().is_ok(), "page_count should not error after open");
+    assert!(
+        doc.page_count().is_ok(),
+        "page_count should not error after open"
+    );
 }

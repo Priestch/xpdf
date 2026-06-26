@@ -495,8 +495,8 @@ impl Page {
                 let _ = evaluator.load_fonts(&resources, resolver.as_xref_mut());
             }
 
-                // Extract text from this stream
-                let text_items = evaluator.extract_text()?;
+            // Extract text from this stream
+            let text_items = evaluator.extract_text()?;
             all_text_items.extend(text_items);
 
             // Recurse into Form XObjects referenced by `Do` in this stream — text
@@ -516,7 +516,10 @@ impl Page {
                             &mut all_text_items,
                             0,
                         ) {
-                            eprintln!("Warning: Form XObject '{}' text extraction failed: {:?}", name, e);
+                            eprintln!(
+                                "Warning: Form XObject '{}' text extraction failed: {:?}",
+                                name, e
+                            );
                         }
                     }
                 }
@@ -619,13 +622,8 @@ impl Page {
         let nested_names = evaluator.take_form_xobject_names();
         for name in nested_names {
             if let Some(ref form_res) = form_resources {
-                let _ = self.extract_text_from_form_xobject(
-                    &name,
-                    form_res,
-                    resolver,
-                    out,
-                    depth + 1,
-                );
+                let _ =
+                    self.extract_text_from_form_xobject(&name, form_res, resolver, out, depth + 1);
             }
         }
 
@@ -650,45 +648,95 @@ impl Page {
     /// let text = page.extract_text_as_string(&mut doc.xref_mut()).unwrap();
     /// println!("Page text:\n{}", text);
     /// ```
+    /// Same as `extract_text` but returns all text as a single string.
+    ///
+    /// This is the method called from the CLI.
     pub fn extract_text_as_string<R: PageResolver>(&self, resolver: &mut R) -> PDFResult<String> {
-        let mut text_items = self.extract_text(resolver)?;
+        let text_items = self.extract_text(resolver)?;
 
-        // Group text items into lines by Y-position clustering.
-        //
-        // Strategy: cluster items whose Y positions are within a common
-        // line-height tolerance, then sort each cluster by X (left→right).
-        // This avoids the problem of items on the same visual line but
-        // with slightly different Y baselines getting sorted by Y first
-        // (e.g. "Chapter 1" at Y=713.7 vs dots at Y=714.52 in basicapi).
-        //
         // Determine line threshold: use the largest font size * 0.5, min 2.0.
         let line_threshold = text_items
             .iter()
             .filter_map(|t| t.font_size)
             .fold(2.0_f64, |m, fs| m.max(fs * 0.5));
 
-        // Sort by Y descending (top→bottom) so we can cluster linearly.
-        text_items.sort_by(|a, b| {
-            match (a.position, b.position) {
-                (Some((_, y1)), Some((_, y2))) => {
-                    y2.partial_cmp(&y1).unwrap_or(std::cmp::Ordering::Equal)
-                }
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
+        Ok(Self::cluster_and_join(text_items, line_threshold))
+    }
+
+    /// Join pre-clustered lines in per-char mode (running average gap detection).
+    fn join_per_char(lines: &[Vec<&TextItem>], line_threshold: f64) -> String {
+        let mut result = String::new();
+        let mut last_y: Option<f64> = None;
+        let mut last_x: Option<f64> = None;
+        let mut avg_gap: f64 = 0.0;
+        let mut has_avg: bool = false;
+
+        for line in lines {
+            if !result.is_empty() {
+                result.push('\n');
             }
+            for item in line {
+                if let Some(pos) = item.position {
+                    if let Some(prev_y) = last_y {
+                        if (pos.1 - prev_y).abs() > line_threshold {
+                            result.push('\n');
+                            avg_gap = 0.0;
+                            has_avg = false;
+                        } else if let Some(prev_x) = last_x {
+                            let gap = pos.0 - prev_x;
+                            if has_avg {
+                                if gap > avg_gap * 1.35
+                                    && !result.is_empty()
+                                    && !result.ends_with(' ')
+                                {
+                                    result.push(' ');
+                                    has_avg = false;
+                                } else {
+                                    avg_gap = avg_gap * 0.6 + gap * 0.4;
+                                }
+                            } else if gap > 0.0 {
+                                avg_gap = gap;
+                                has_avg = true;
+                            }
+                        }
+                    }
+                    last_y = Some(pos.1);
+                    last_x = Some(pos.0);
+                }
+                result.push_str(&item.text);
+            }
+        }
+        result
+    }
+
+    /// Cluster text items by Y proximity, sort each cluster by X, then join.
+    ///
+    /// In multi-column layouts, items from different columns at the same Y end up
+    /// in the same line. We detect large X-gaps within each line and insert newlines
+    /// to separate columns, producing row-major output.
+    fn cluster_and_join(items: Vec<TextItem>, line_threshold: f64) -> String {
+        if items.is_empty() {
+            return String::new();
+        }
+
+        // Y-cluster items into lines by Y proximity, then sort each line by X.
+        let mut sorted: Vec<&TextItem> = items.iter().collect();
+        sorted.sort_by(|a, b| match (a.position, b.position) {
+            (Some((_, y1)), Some((_, y2))) => {
+                y2.partial_cmp(&y1).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
         });
 
-        // Cluster into lines
         let mut lines: Vec<Vec<&TextItem>> = Vec::new();
-        for item in &text_items {
+        for item in sorted.into_iter() {
             let y = item.position.map(|p| p.1);
             let placed = lines.last_mut().and_then(|line| {
                 line.first()
                     .and_then(|f| f.position.map(|p| p.1))
-                    .and_then(|first_y| {
-                        y.map(|iy| (iy - first_y).abs() <= line_threshold)
-                    })
+                    .and_then(|first_y| y.map(|iy| (iy - first_y).abs() <= line_threshold))
             });
             if placed == Some(true) {
                 lines.last_mut().unwrap().push(item);
@@ -696,85 +744,183 @@ impl Page {
                 lines.push(vec![item]);
             }
         }
-
-        // Sort each line by X (ascending, left→right)
         for line in &mut lines {
-            line.sort_by(|a, b| {
-                match (a.position, b.position) {
-                    (Some((x1, _)), Some((x2, _))) => {
-                        x1.partial_cmp(&x2).unwrap_or(std::cmp::Ordering::Equal)
-                    }
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
+            line.sort_by(|a, b| match (a.position, b.position) {
+                (Some((x1, _)), Some((x2, _))) => {
+                    x1.partial_cmp(&x2).unwrap_or(std::cmp::Ordering::Equal)
                 }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
             });
         }
 
-        // Two joining strategies:
-        //   1) Per-char mode (all items single-char): join using positional X-gap
-        //      running average. Gaps > 1.4× the running average are word boundaries.
-        //   2) Normal mode (any multi-char item): standard space join between items.
-        let all_single_char = text_items.iter().all(|t| t.text.chars().count() == 1);
-
-        if all_single_char {
-            let mut result = String::new();
-            let mut last_y: Option<f64> = None;
-            let mut last_x: Option<f64> = None;
-            let mut avg_gap: f64 = 0.0;
-            let mut has_avg: bool = false;
-
+        // Compute a dynamic column-gap threshold from the median X-gap.
+        let column_threshold = {
+            let mut gaps: Vec<f64> = Vec::new();
             for line in &lines {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                for item in line {
-                    if let Some(pos) = item.position {
-                        if let Some(prev_y) = last_y {
-                            if (pos.1 - prev_y).abs() > line_threshold {
-                                result.push('\n');
-                                avg_gap = 0.0;
-                                has_avg = false;
-                            } else if let Some(prev_x) = last_x {
-                                let gap = pos.0 - prev_x;
-                                if has_avg {
-                                    if gap > avg_gap * 1.35
-                                        && !result.is_empty()
-                                        && !result.ends_with(' ')
-                                    {
-                                        result.push(' ');
-                                        has_avg = false;
-                                    } else {
-                                        avg_gap = avg_gap * 0.6 + gap * 0.4;
-                                    }
-                                } else if gap > 0.0 {
-                                    avg_gap = gap;
-                                    has_avg = true;
-                                }
-                            }
+                for pair in line.windows(2) {
+                    if let (Some((x1, _)), Some((x2, _))) = (pair[0].position, pair[1].position) {
+                        let gap = x2 - x1;
+                        if gap > 0.0 {
+                            gaps.push(gap);
                         }
-                        last_y = Some(pos.1);
-                        last_x = Some(pos.0);
                     }
-                    result.push_str(&item.text);
                 }
             }
-            Ok(result)
-        } else {
-            let mut result = String::new();
-            for line in &lines {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                for (i, item) in line.iter().enumerate() {
-                    if i > 0 && !item.text.starts_with(' ') && !result.ends_with(' ') {
-                        result.push(' ');
+            if gaps.is_empty() {
+                50.0
+            } else {
+                gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mid = gaps.len() / 2;
+                let med = if gaps.len() % 2 == 0 {
+                    (gaps[mid - 1] + gaps[mid]) / 2.0
+                } else {
+                    gaps[mid]
+                };
+                (med * 3.0).max(80.0).min(150.0)
+            }
+        };
+
+        // Multi-column detection: find the MODAL gap midpoint across all Y‑lines.
+        // Only gaps where x1 > 120pt are considered — this excludes start‑of‑line
+        // (left‑margin) items, so the gap between the LAST left‑column item and the
+        // FIRST right‑column item drives the boundary rather than the full page‑span
+        // gap from X=54 to X=317.
+        let mut midpoints: Vec<f64> = Vec::new();
+        for line in &lines {
+            for pair in line.windows(2) {
+                if let (Some((x1, _)), Some((x2, _))) = (pair[0].position, pair[1].position) {
+                    let gap = x2 - x1;
+                    if gap >= 60.0 && x1 > 120.0 {
+                        midpoints.push((x1 + x2) / 2.0);
                     }
-                    result.push_str(&item.text);
                 }
             }
-            Ok(result)
         }
+        let col_boundary = if midpoints.len() >= 6 {
+            midpoints.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // Sliding 25‑pt window: find the densest region.
+            let window = 25.0;
+            let mut best_count = 0usize;
+            let mut best_mid = 0.0;
+            for (i, &start) in midpoints.iter().enumerate() {
+                let limit = start + window;
+                let count = midpoints[i..].iter().take_while(|&&m| m <= limit).count();
+                if count > best_count {
+                    best_count = count;
+                    best_mid = start + window / 2.0;
+                }
+            }
+            if best_count >= 3 { best_mid } else { f64::MAX }
+        } else {
+            f64::MAX
+        };
+
+        if col_boundary == f64::MAX {
+            // Single column: standard join.
+            let all_single_char = lines.iter().flatten().all(|t| t.text.chars().count() == 1);
+            if all_single_char {
+                return Self::join_per_char(&lines, line_threshold);
+            } else {
+                let mut result = String::new();
+                for line in &lines {
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    for (i, item) in line.iter().enumerate() {
+                        if i > 0 && !item.text.starts_with(' ') && !result.ends_with(' ') {
+                            result.push(' ');
+                        }
+                        result.push_str(&item.text);
+                    }
+                }
+                return result;
+            }
+        }
+
+        // Multi-column: split lines with a column gap (>60pt), and route
+        // single‑cluster lines to the appropriate column by their X position.
+        let mut col_lines: [Vec<Vec<&TextItem>>; 2] = [Vec::new(), Vec::new()];
+
+        for line in &lines {
+            // Column-break detection: find the gap whose midpoint is closest to the
+            // global column boundary.  A genuine column break has ≤1 item on the right
+            // side of the gap (the rest of the right‑column row); a word‑spacing gap
+            // within a single‑column line (e.g. a centered title) has 2+ items after it
+            // (the remaining words on the same line).
+            let col_gap_idx = line
+                .windows(2)
+                .enumerate()
+                .filter_map(|(idx, pair)| {
+                    let x1 = pair[0].position?.0;
+                    let x2 = pair[1].position?.0;
+                    let mid = (x1 + x2) / 2.0;
+                    let gap = x2 - x1;
+                    // 150pt tolerance captures both short-gap column breaks (gap ≈ 94
+                    // on extended left‑col lines) and wide‑gap body rows (gap ≈ 263).
+                    if gap >= 60.0 && (mid - col_boundary).abs() < 150.0 {
+                        Some((idx, gap, mid))
+                    } else {
+                        None
+                    }
+                })
+                .min_by(|(_, _, a), (_, _, b)| {
+                    (a - col_boundary)
+                        .abs()
+                        .partial_cmp(&(b - col_boundary).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            let has_col_break = col_gap_idx.is_some_and(|(idx, _, _)| {
+                // Only a column break if ≤1 item remains after the gap (right column).
+                line.len() - (idx + 1) <= 1
+            });
+
+            if has_col_break {
+                if let Some((split_at, _, _)) = col_gap_idx {
+                    let left: Vec<&TextItem> = line.iter().take(split_at + 1).copied().collect();
+                    let right: Vec<&TextItem> = line.iter().skip(split_at + 1).copied().collect();
+                    if !left.is_empty() {
+                        col_lines[0].push(left);
+                    }
+                    if !right.is_empty() {
+                        col_lines[1].push(right);
+                    }
+                } else {
+                    col_lines[0].push(line.iter().copied().collect());
+                }
+            } else {
+                // Single‑cluster line: all items go to one column.
+                let all_right = line
+                    .iter()
+                    .all(|t| t.position.map(|p| p.0 >= col_boundary).unwrap_or(false));
+                if all_right {
+                    col_lines[1].push(line.iter().copied().collect());
+                } else {
+                    col_lines[0].push(line.iter().copied().collect());
+                }
+            }
+        }
+
+        let mut col_groups: Vec<Vec<String>> = vec![Vec::new(), Vec::new()];
+        for (ci, lines_for_col) in col_lines.iter().enumerate() {
+            for items in lines_for_col {
+                let mut s = String::new();
+                for (i, t) in items.iter().enumerate() {
+                    if i > 0 && !t.text.starts_with(' ') && !s.ends_with(' ') {
+                        s.push(' ');
+                    }
+                    s.push_str(&t.text);
+                }
+                col_groups[ci].push(s);
+            }
+        }
+
+        col_groups
+            .into_iter()
+            .map(|g| g.join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Renders this page to a rendering device.
@@ -927,12 +1073,19 @@ impl Page {
 
             // Merge any stream-level Resources with page-level Resources.
             // Reference: pdf.js/src/core/document.js - #getMergedResources
-            let resources =
-                self.merge_stream_resources(resolver.as_xref_mut(), dict.get("Resources"), &page_resources)?;
+            let resources = self.merge_stream_resources(
+                resolver.as_xref_mut(),
+                dict.get("Resources"),
+                &page_resources,
+            )?;
 
             // Load fonts from merged resources (for proper text rendering)
             #[cfg(feature = "rendering")]
-            self.load_fonts_for_rendering_with_resources(resolver.as_xref_mut(), device, resources.as_ref())?;
+            self.load_fonts_for_rendering_with_resources(
+                resolver.as_xref_mut(),
+                device,
+                resources.as_ref(),
+            )?;
 
             // Create a rendering context to process operations
             let mut ctx = RenderingContext::new(device);

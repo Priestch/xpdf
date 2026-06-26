@@ -123,7 +123,10 @@ impl<'a> DocStore<'a> {
 }
 
 /// Apply the stream's `/Filter` (if any) to its bytes.
-fn decode_stream(dict: &std::collections::HashMap<String, PDFObject>, data: &[u8]) -> PDFResult<Vec<u8>> {
+fn decode_stream(
+    dict: &std::collections::HashMap<String, PDFObject>,
+    data: &[u8],
+) -> PDFResult<Vec<u8>> {
     match dict.get("Filter") {
         Some(f) => decode::apply_filters(data, f),
         None => Ok(data.to_vec()),
@@ -240,8 +243,8 @@ impl<'o> PageResolver for SnapshotPageResolver<'o> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::parser::Ref;
     use crate::core::PDFDocument;
+    use crate::core::parser::Ref;
     use std::collections::HashMap;
 
     /// A one-page PDF whose page has a `/Contents` stream, so `resolve_page` exercises
@@ -287,10 +290,20 @@ mod tests {
             .resolve_page(&page)
             .expect("resolve_page should produce a ResolvedPage");
 
-        assert_eq!(resolved.view_box, [0.0, 0.0, 200.0, 300.0], "MediaBox resolved");
+        assert_eq!(
+            resolved.view_box,
+            [0.0, 0.0, 200.0, 300.0],
+            "MediaBox resolved"
+        );
         assert_eq!(resolved.rotation, 0);
-        assert!(matches!(resolved.resources, PDFObject::Null), "no /Resources → Null");
-        assert_eq!(resolved.contents, b"q Q\n", "content stream decoded (no filter)");
+        assert!(
+            matches!(resolved.resources, PDFObject::Null),
+            "no /Resources → Null"
+        );
+        assert_eq!(
+            resolved.contents, b"q Q\n",
+            "content stream decoded (no filter)"
+        );
     }
 
     #[test]
@@ -302,7 +315,10 @@ mod tests {
         let page = doc.get_page(0).expect("page 0 should resolve");
 
         // Baseline.
-        let before = doc.doc_store_mut().resolve_page(&page).expect("baseline resolve");
+        let before = doc
+            .doc_store_mut()
+            .resolve_page(&page)
+            .expect("baseline resolve");
         assert_eq!(before.contents, b"q Q\n");
 
         // Override object 4 with a different content stream.
@@ -340,7 +356,7 @@ mod tests {
         // Decision C purity contract: interpretation runs over a ResolvedPage + Device
         // with NO DocStore/Need in scope. This test fails to compile if `interpret` ever
         // gains a DocStore parameter or fetches objects.
-        use crate::rendering::{interpret, TestDevice};
+        use crate::rendering::{TestDevice, interpret};
 
         let page = ResolvedPage {
             view_box: [0.0, 0.0, 10.0, 10.0],
@@ -359,7 +375,7 @@ mod tests {
         // same drawing for the same page (this is what makes rewiring render_page_to_image
         // to resolve_page → interpret safe). Compare meaningful drawing (fills), ignoring
         // the per-stream save/restore wrapper that only Page::render emits.
-        use crate::rendering::{interpret, TestDevice};
+        use crate::rendering::{TestDevice, interpret};
 
         let data = form_xobject_pdf(b"10 10 50 50 re f");
 
@@ -401,7 +417,7 @@ mod tests {
         // purely from it (no live DocStore). The Form XObject override is in the base
         // here (no delta); resolve_page walks /Resources and snapshots the form object,
         // and interpret's snapshot resolver fetches it.
-        use crate::rendering::{interpret, TestDevice};
+        use crate::rendering::{TestDevice, interpret};
 
         let mut doc = PDFDocument::open(form_xobject_pdf(b"10 10 50 50 re f"))
             .expect("pdf should parse and open");
@@ -440,7 +456,8 @@ mod tests {
         let mut baseline = TestDevice::new(200.0, 300.0);
         {
             let mut store = doc.doc_store_mut();
-            page.render(&mut store, &mut baseline).expect("baseline render");
+            page.render(&mut store, &mut baseline)
+                .expect("baseline render");
         }
         let baseline_len = baseline.operations().len();
 
@@ -459,7 +476,8 @@ mod tests {
         let mut after = TestDevice::new(200.0, 300.0);
         {
             let mut store = doc.doc_store_mut();
-            page.render(&mut store, &mut after).expect("post-override render");
+            page.render(&mut store, &mut after)
+                .expect("post-override render");
         }
 
         // The delta override changed rendered output: the q (save_state) + Q (restore_state)
@@ -535,7 +553,8 @@ mod tests {
         let mut baseline = TestDevice::new(200.0, 300.0);
         {
             let mut store = doc.doc_store_mut();
-            page.render(&mut store, &mut baseline).expect("baseline render");
+            page.render(&mut store, &mut baseline)
+                .expect("baseline render");
         }
         let baseline_fills = baseline
             .operations()
@@ -548,13 +567,19 @@ mod tests {
         let mut dict: HashMap<String, PDFObject> = HashMap::new();
         dict.insert("Type".to_string(), PDFObject::Name("XObject".into()));
         dict.insert("Subtype".to_string(), PDFObject::Name("Form".into()));
-        dict.insert("BBox".to_string(), PDFObject::Array(
-            [10.0, 10.0, 50.0, 50.0]
-                .iter()
-                .map(|n| Box::new(PDFObject::Number(*n)))
-                .collect(),
-        ));
-        dict.insert("Length".to_string(), PDFObject::Number(form_body.len() as f64));
+        dict.insert(
+            "BBox".to_string(),
+            PDFObject::Array(
+                [10.0, 10.0, 50.0, 50.0]
+                    .iter()
+                    .map(|n| Box::new(PDFObject::Number(*n)))
+                    .collect(),
+            ),
+        );
+        dict.insert(
+            "Length".to_string(),
+            PDFObject::Number(form_body.len() as f64),
+        );
         let form_override = PDFObject::Stream {
             dict,
             data: form_body.to_vec(),
@@ -566,7 +591,8 @@ mod tests {
         let mut after = TestDevice::new(200.0, 300.0);
         {
             let mut store = doc.doc_store_mut();
-            page.render(&mut store, &mut after).expect("post-override render");
+            page.render(&mut store, &mut after)
+                .expect("post-override render");
         }
         let after_fills = after
             .operations()
@@ -614,12 +640,16 @@ mod tests {
 
         let after = {
             let mut store = doc.doc_store_mut();
-            page.extract_text(&mut store).expect("post-override extract")
+            page.extract_text(&mut store)
+                .expect("post-override extract")
         };
         assert!(
             !after.is_empty(),
             "delta override with a Tj operator must yield text items"
         );
-        assert_eq!(after[0].text, "Hello", "extracted text reflects the delta override");
+        assert_eq!(
+            after[0].text, "Hello",
+            "extracted text reflects the delta override"
+        );
     }
 }

@@ -12,8 +12,8 @@
 #[cfg(test)]
 mod text_transform_tests {
     use pdf_x_core::rendering::device::Device;
-    use pdf_x_device_tinyskia::SkiaDevice;
     use pdf_x_core::rendering::{Color, Paint};
+    use pdf_x_device_tinyskia::SkiaDevice;
     use tiny_skia::{Pixmap, Transform};
 
     #[test]

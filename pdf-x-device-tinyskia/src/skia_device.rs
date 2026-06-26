@@ -1,15 +1,15 @@
 //! A tiny-skia based rendering device.
 
+use crate::type1_font::Type1Font;
 use pdf_x_core::core::error::{PDFError, PDFResult};
 use pdf_x_core::rendering::device::{Device, ImageData, Paint, PathDrawMode};
-use crate::type1_font::Type1Font;
 use pdf_x_core::rendering::{BlendMode, Color, FillRule, LineCap, LineJoin, StrokeProps};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tiny_skia::{
-    BlendMode as SkiaBlendMode,
-    FillRule as SkiaFillRule, LineCap as SkiaLineCap, LineJoin as SkiaLineJoin, Mask,
-    Paint as SkiaPaint, PathBuilder, Pixmap, PixmapMut, Rect, Stroke, Transform,
+    BlendMode as SkiaBlendMode, FillRule as SkiaFillRule, LineCap as SkiaLineCap,
+    LineJoin as SkiaLineJoin, Mask, Paint as SkiaPaint, PathBuilder, Pixmap, PixmapMut, Rect,
+    Stroke, Transform,
 };
 use ttf_parser::OutlineBuilder;
 

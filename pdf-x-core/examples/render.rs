@@ -9,8 +9,8 @@
 //!     cargo run --example render --features rendering -- test.pdf output.png 0
 
 use pdf_x_core::rendering::Device; // Import Device trait for concat_matrix
-use pdf_x_device_tinyskia::SkiaDevice;
 use pdf_x_core::{PDFDocument, Page};
+use pdf_x_device_tinyskia::SkiaDevice;
 use std::env;
 use std::path::Path;
 use tiny_skia::Pixmap;

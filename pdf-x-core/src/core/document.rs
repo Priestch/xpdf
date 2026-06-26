@@ -167,7 +167,10 @@ impl PDFDocument {
             xref.recover_by_scan().map_err(|_| {
                 PDFError::Generic(format!(
                     "Failed to parse xref{} and full-file recovery scan failed",
-                    startxref.as_ref().map(|s| format!(" at startxref offset {s}")).unwrap_or_default()
+                    startxref
+                        .as_ref()
+                        .map(|s| format!(" at startxref offset {s}"))
+                        .unwrap_or_default()
                 ))
             })?;
         }
@@ -250,7 +253,8 @@ impl PDFDocument {
         let search_data = stream.get_byte_range(startxref_search_start, file_length)?;
 
         // Find startxref in the tail of the file (tolerate missing → recovery scan below).
-        let startxref_opt = Self::find_startxref_in_bytes(&search_data, startxref_search_start).ok();
+        let startxref_opt =
+            Self::find_startxref_in_bytes(&search_data, startxref_search_start).ok();
 
         // Create xref with the chunked stream
         let boxed_stream = Box::new(stream) as Box<dyn BaseStream>;
@@ -439,7 +443,10 @@ impl PDFDocument {
     ///
     /// *Step 4b skeleton*: this produces a `ResolvedPage` but the render pipeline is not
     /// yet rewired to consume it; `render_page_to_image` still uses the legacy path.
-    pub fn resolve_page(&mut self, page_index: usize) -> PDFResult<crate::core::resolved_page::ResolvedPage> {
+    pub fn resolve_page(
+        &mut self,
+        page_index: usize,
+    ) -> PDFResult<crate::core::resolved_page::ResolvedPage> {
         let page = self.get_page(page_index)?;
         self.doc_store_mut().resolve_page(&page)
     }
@@ -697,9 +704,9 @@ impl PDFDocument {
             }
 
             // Pages node: get Kids array.
-            let kids = dict.get("Kids").ok_or_else(|| {
-                PDFError::Generic("Pages node missing Kids array".to_string())
-            })?;
+            let kids = dict
+                .get("Kids")
+                .ok_or_else(|| PDFError::Generic("Pages node missing Kids array".to_string()))?;
 
             let kids_array = match kids {
                 PDFObject::Array(arr) => arr.clone(),
@@ -1221,10 +1228,10 @@ impl PDFDocument {
             };
             if keyed {
                 // Install the decryptor so subsequent fetches decrypt streams/strings inline.
-                let encrypt_obj_num = self
-                    .xref
-                    .get_encrypt_dict_ref()
-                    .and_then(|r| match r { PDFObject::Ref(r) => Some(r.num), _ => None });
+                let encrypt_obj_num = self.xref.get_encrypt_dict_ref().and_then(|r| match r {
+                    PDFObject::Ref(r) => Some(r.num),
+                    _ => None,
+                });
                 self.xref
                     .set_decryptor(Some(encrypt_dict.clone()), encrypt_obj_num);
             }

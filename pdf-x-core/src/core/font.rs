@@ -216,7 +216,9 @@ impl Font {
         // fetch it so Ref-encoded custom encodings (common in Type1 fonts) are
         // honored instead of falling back to StandardEncoding.
         let encoding = if let Some(enc_obj) = &dict.encoding {
-            let fetched = xref.fetch_if_ref(enc_obj).unwrap_or_else(|_| enc_obj.clone());
+            let fetched = xref
+                .fetch_if_ref(enc_obj)
+                .unwrap_or_else(|_| enc_obj.clone());
             Encoding::from_pdf_object(&fetched).unwrap_or(Encoding::Standard)
         } else {
             // No encoding specified - default to StandardEncoding for simple fonts
@@ -234,8 +236,9 @@ impl Font {
                     // Name and as an Array (e.g. [/FlateDecode]) work — same fix as
                     // the content-stream path.
                     let decompressed = if let Some(filter) = stream_dict.get("Filter") {
-                        decode::apply_filters(&data, filter)
-                            .map_err(|e| PDFError::Generic(format!("ToUnicode stream decode error: {}", e)))?
+                        decode::apply_filters(&data, filter).map_err(|e| {
+                            PDFError::Generic(format!("ToUnicode stream decode error: {}", e))
+                        })?
                     } else {
                         data.to_vec()
                     };

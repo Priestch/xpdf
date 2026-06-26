@@ -236,6 +236,14 @@ impl Parser {
         self.ref_resolver = Some(Box::new(resolver));
     }
 
+    /// Skips raw inline image data (bytes after `ID`) until `EI`.
+    /// Resets internal buffers so the next `get_object` reads fresh.
+    pub fn skip_inline_image_data(&mut self) -> PDFResult<()> {
+        self.buf1 = None;
+        self.buf2 = None;
+        self.lexer.skip_inline_image_data()
+    }
+
     /// Shifts the token buffer, advancing to the next token.
     ///
     /// This moves buf2 -> buf1 and reads a new token into buf2.

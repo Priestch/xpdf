@@ -333,7 +333,10 @@ mod tests {
     fn memory_source_needs_out_of_bounds() {
         let mut src = MemoryByteSource::from_bytes(b"abc");
         // 3-byte buffer, request 10 → Need (drive would turn this into a no-progress error).
-        assert!(matches!(src.get(0, 10), Err(Need::Range { pos: 0, len: 10 })));
+        assert!(matches!(
+            src.get(0, 10),
+            Err(Need::Range { pos: 0, len: 10 })
+        ));
         // beyond EOF at a non-zero offset
         assert!(matches!(src.get(2, 5), Err(Need::Range { pos: 2, len: 5 })));
     }
@@ -381,10 +384,7 @@ mod tests {
                 .checked_add(len)
                 .ok_or_else(|| PDFError::Generic(format!("ensure_range length {len} overflows")))?;
             if end > self.data.len() {
-                return Err(PDFError::InvalidByteRange {
-                    begin: start,
-                    end,
-                });
+                return Err(PDFError::InvalidByteRange { begin: start, end });
             }
             for i in start..end {
                 self.loaded[i] = true;
@@ -445,7 +445,9 @@ mod tests {
         // Request a range beyond EOF: ensure_range fails, so the same Need repeats and
         // drive's no-progress guard converts it into an error (no infinite loop).
         let mut src = LazySource::new(b"abc".to_vec());
-        let op = |s: &mut LazySource| -> Result<(), StepErr> { s.get(0, 99).map(drop).map_err(StepErr::from) };
+        let op = |s: &mut LazySource| -> Result<(), StepErr> {
+            s.get(0, 99).map(drop).map_err(StepErr::from)
+        };
         let err = drive(&mut src, op).expect_err("out-of-EOF drive must error");
         let _ = err; // no infinite loop; test passes by terminating
     }
@@ -499,9 +501,7 @@ mod tests {
         let o1 = buf.len();
         buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
         let o2 = buf.len();
-        buf.extend_from_slice(
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-        );
+        buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
         let o3 = buf.len();
         buf.extend_from_slice(
             b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
@@ -570,7 +570,11 @@ mod tests {
         // Minimality / no-whole-file-read: the operation read only the header (5 bytes)
         // and the tail (≤ 1024 bytes), never the middle. For a file this size that is a
         // strict subset — proof the protocol fetches only what it needs.
-        assert_eq!(src.requested.len(), 2, "exactly two ranges read (header + tail)");
+        assert_eq!(
+            src.requested.len(),
+            2,
+            "exactly two ranges read (header + tail)"
+        );
         assert_eq!(src.requested[0], (0, 5), "first read is the header");
         let (tp, tl) = src.requested[1];
         assert_eq!(tp, total.saturating_sub(1024), "second read is the tail");
@@ -594,7 +598,8 @@ mod tests {
         assert_eq!(header, b"%PDF-");
         assert_eq!(src.len() as usize, data.len());
         // In-memory base stream is fully loaded, so ensure_range is a no-op.
-        src.ensure_range(0, 5).expect("ensure_range is a no-op on a loaded base stream");
+        src.ensure_range(0, 5)
+            .expect("ensure_range is a no-op on a loaded base stream");
     }
 
     #[test]
@@ -609,8 +614,7 @@ mod tests {
         // is the entry count).
         assert_eq!(Loadable::len(&xref), data.len() as u64);
         // In-memory backing stream is fully loaded → ensure_range delegates as a no-op.
-        xref
-            .ensure_range(0, 5)
+        xref.ensure_range(0, 5)
             .expect("ensure_range delegates as a no-op on a loaded backing stream");
     }
 }

@@ -111,7 +111,9 @@ mod tests {
         buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
 
         let o3 = buf.len();
-        buf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n");
+        buf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
 
         let xref_offset = buf.len();
         buf.extend_from_slice(b"xref\n0 4\n");
@@ -145,14 +147,21 @@ mod tests {
         let resolved = store
             .resolve_ref(num, 0)
             .expect("resolve_ref should return the base object (delta empty)");
-        assert_eq!(resolved, base_obj, "delta empty → resolve must equal base fetch");
+        assert_eq!(
+            resolved, base_obj,
+            "delta empty → resolve must equal base fetch"
+        );
     }
 
     #[test]
     fn resolve_ref_returns_delta_override() {
         let mut doc = PDFDocument::open(minimal_pdf()).expect("minimal pdf should parse and open");
         let (num, base_obj) = first_fetchable_object(&mut doc);
-        assert_ne!(base_obj, PDFObject::Boolean(true), "sanity: base differs from override");
+        assert_ne!(
+            base_obj,
+            PDFObject::Boolean(true),
+            "sanity: base differs from override"
+        );
 
         let mut store = doc.doc_store_mut();
         store
@@ -162,7 +171,11 @@ mod tests {
         let resolved = store
             .resolve_ref(num, 0)
             .expect("resolve_ref should return the delta override");
-        assert_eq!(resolved, PDFObject::Boolean(true), "delta override must win over base");
+        assert_eq!(
+            resolved,
+            PDFObject::Boolean(true),
+            "delta override must win over base"
+        );
     }
 
     #[test]
@@ -173,7 +186,9 @@ mod tests {
         let mut store = doc.doc_store_mut();
         store.delta_mut().delete_object(Ref::new(num, 0));
 
-        let err = store.resolve_ref(num, 0).expect_err("deleted object must not resolve");
+        let err = store
+            .resolve_ref(num, 0)
+            .expect_err("deleted object must not resolve");
         assert!(matches!(err, PDFError::ObjectDeleted { num: n, .. } if n == num));
     }
 
@@ -193,7 +208,10 @@ mod tests {
         let mut doc = PDFDocument::open(minimal_pdf()).expect("minimal pdf should parse and open");
         let page = doc.get_page(0).expect("page 0 should resolve via DocStore");
         assert_eq!(page.index(), 0);
-        assert!(page.media_box().is_some(), "page inherited/fetched a MediaBox");
+        assert!(
+            page.media_box().is_some(),
+            "page inherited/fetched a MediaBox"
+        );
     }
 
     #[test]
@@ -220,7 +238,9 @@ mod tests {
 
         let mut doc = PDFDocument::open_file(tmp.path(), None, None)
             .expect("open_file should drive the progressive load to completion");
-        let page = doc.get_page(0).expect("page 0 should resolve after the driven load");
+        let page = doc
+            .get_page(0)
+            .expect("page 0 should resolve after the driven load");
         assert_eq!(page.index(), 0);
     }
 }

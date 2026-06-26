@@ -54,8 +54,10 @@ impl Encoding {
                     // PDF spec §9.6.6: Type1 fonts with no explicit BaseEncoding
                     // default to StandardEncoding. Ported from pdf.js evaluator.js
                     // translateFont() which does the same for simple non-CID fonts.
-                    encoding_table_from_name(Some(&crate::core::parser::PDFObject::Name("StandardEncoding".into())))
-                        .unwrap_or_else(|| vec![0u16; 256])
+                    encoding_table_from_name(Some(&crate::core::parser::PDFObject::Name(
+                        "StandardEncoding".into(),
+                    )))
+                    .unwrap_or_else(|| vec![0u16; 256])
                 };
                 if let Some(diff) = d.get("Differences") {
                     if let crate::core::parser::PDFObject::Array(arr) = diff {
@@ -132,13 +134,8 @@ fn encoding_table_from_name(obj: Option<&crate::core::parser::PDFObject>) -> Opt
 /// only covered A-Z/a-z + ~12 punctuation, so glyphs like `less`/`greater`
 /// (`<`/`>`) mapped to nothing — causing `<email>` to render as `f email g`.
 fn name_to_unicode(name: &str) -> Option<u16> {
-    super::glyphlist::name_to_unicode(name).and_then(|cp| {
-        if cp <= 0xFFFF {
-            Some(cp as u16)
-        } else {
-            None
-        }
-    })
+    super::glyphlist::name_to_unicode(name)
+        .and_then(|cp| if cp <= 0xFFFF { Some(cp as u16) } else { None })
 }
 
 /// Standard encoding as defined in Adobe Technical Note #5176.

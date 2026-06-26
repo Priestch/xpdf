@@ -1,5 +1,5 @@
-use pdf_x_core::rendering::TestDevice;
 use pdf_x_core::PDFDocument;
+use pdf_x_core::rendering::TestDevice;
 
 fn push_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, number: u32, body: &[u8]) {
     offsets.push(pdf.len());

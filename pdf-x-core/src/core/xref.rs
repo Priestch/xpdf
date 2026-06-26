@@ -94,8 +94,9 @@ pub struct XRef {
 /// `XRef` implements [`Loadable`], not the full [`ByteSource`](crate::core::byte_source::ByteSource).
 impl Loadable for XRef {
     fn ensure_range(&mut self, pos: u64, len: usize) -> PDFResult<()> {
-        let pos = usize::try_from(pos)
-            .map_err(|_| PDFError::Generic(format!("ensure_range position {pos} overflows usize")))?;
+        let pos = usize::try_from(pos).map_err(|_| {
+            PDFError::Generic(format!("ensure_range position {pos} overflows usize"))
+        })?;
         self.stream.ensure_range(pos, len)
     }
 
@@ -411,7 +412,10 @@ impl XRef {
     /// if it doesn't parse as `trailer << ... >>`.
     fn parse_trailer_dict_at(&mut self, offset: usize) -> Option<PDFObject> {
         let length = self.stream.length();
-        let sub = self.stream.make_sub_stream(offset, length.saturating_sub(offset)).ok()?;
+        let sub = self
+            .stream
+            .make_sub_stream(offset, length.saturating_sub(offset))
+            .ok()?;
         let lexer = Lexer::new(sub).ok()?;
         let mut parser = Parser::new(lexer).ok()?;
         let kw = parser.get_object().ok()?;
@@ -619,7 +623,10 @@ impl XRef {
     fn parse_one_xref_section(&mut self, pos: usize) -> PDFResult<PDFObject> {
         self.stream.set_pos(pos)?;
 
-        let lexer = Lexer::new(self.stream.make_sub_stream(pos, self.stream.length() - pos)?)?;
+        let lexer = Lexer::new(
+            self.stream
+                .make_sub_stream(pos, self.stream.length() - pos)?,
+        )?;
         let mut parser = Parser::new(lexer)?;
 
         let obj = parser.get_object()?;
@@ -666,9 +673,7 @@ impl XRef {
                         PDFObject::Dictionary(dict)
                     }
                     _ => {
-                        return Err(PDFError::Generic(
-                            "Expected XRef stream object".to_string(),
-                        ));
+                        return Err(PDFError::Generic("Expected XRef stream object".to_string()));
                     }
                 }
             }
@@ -1269,9 +1274,7 @@ impl XRef {
         // CIRCULAR_REF; we return the null object.
         let key = (obj_num, generation);
         if self.pending_refs.contains(&key) {
-            eprintln!(
-                "Warning: ignoring circular object reference {obj_num} {generation} R"
-            );
+            eprintln!("Warning: ignoring circular object reference {obj_num} {generation} R");
             return Ok(Rc::new(PDFObject::Null));
         }
         self.pending_refs.insert(key);
@@ -1588,7 +1591,10 @@ impl XRef {
                     PDFObject::Stream { dict, data }
                 } else {
                     let decrypted = decryptor.decrypt_stream(&data, obj_num, generation)?;
-                    PDFObject::Stream { dict: std::mem::take(&mut dict), data: decrypted }
+                    PDFObject::Stream {
+                        dict: std::mem::take(&mut dict),
+                        data: decrypted,
+                    }
                 }
             }
             PDFObject::String(bytes) => {
@@ -1995,7 +2001,8 @@ mod tests {
 
         // A trailer was selected and /Root resolves to a catalog.
         assert!(xref.trailer().is_some(), "recovery selected a trailer");
-        xref.catalog().expect("catalog resolves via recovered trailer");
+        xref.catalog()
+            .expect("catalog resolves via recovered trailer");
     }
 
     /// A circular object reference (A's /Length is `B R`, B's /Length is `A R`) must NOT
@@ -2076,12 +2083,17 @@ fn parse_obj_header(token: &[u8]) -> Option<(u32, u32)> {
     if i == num_start {
         return None;
     }
-    let num: u32 = std::str::from_utf8(&token[num_start..i]).ok()?.parse().ok()?;
+    let num: u32 = std::str::from_utf8(&token[num_start..i])
+        .ok()?
+        .parse()
+        .ok()?;
     // required whitespace
     if i >= token.len() || !token[i].is_ascii_whitespace() {
         return None;
     }
-    while i < token.len() && (token[i] == b' ' || token[i] == b'\t' || token[i] == b'\r' || token[i] == b'\n') {
+    while i < token.len()
+        && (token[i] == b' ' || token[i] == b'\t' || token[i] == b'\r' || token[i] == b'\n')
+    {
         i += 1;
     }
     let gen_start = i;
@@ -2091,11 +2103,16 @@ fn parse_obj_header(token: &[u8]) -> Option<(u32, u32)> {
     if i == gen_start {
         return None;
     }
-    let generation: u32 = std::str::from_utf8(&token[gen_start..i]).ok()?.parse().ok()?;
+    let generation: u32 = std::str::from_utf8(&token[gen_start..i])
+        .ok()?
+        .parse()
+        .ok()?;
     if i >= token.len() || !token[i].is_ascii_whitespace() {
         return None;
     }
-    while i < token.len() && (token[i] == b' ' || token[i] == b'\t' || token[i] == b'\r' || token[i] == b'\n') {
+    while i < token.len()
+        && (token[i] == b' ' || token[i] == b'\t' || token[i] == b'\r' || token[i] == b'\n')
+    {
         i += 1;
     }
     // "obj" + word boundary

@@ -13,7 +13,7 @@ pub mod graphics_state;
 pub mod path;
 
 // Re-export key types
-pub use context::{is_text_trace_enabled, set_text_trace_enabled, RenderingContext};
+pub use context::{RenderingContext, is_text_trace_enabled, set_text_trace_enabled};
 pub use device::{Device, ImageData, Paint, PathDrawMode, TestDevice};
 pub use graphics_state::{
     BlendMode, Color, FillRule, GraphicsState, LineCap, LineJoin, StrokeProps, TextRenderingMode,

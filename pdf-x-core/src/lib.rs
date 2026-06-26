@@ -107,11 +107,9 @@ pub use core::{
     Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags, AnnotationRect,
     AnnotationType, BaseStream, ByteSource, DeltaLayer, DestinationType, DocStore,
     FileAttachmentAnnotation, FileChunkedStream, FormFieldType, ImageDecoder, ImageFormat, Lexer,
-    LinearizedInfo, LinkAction,
-    LinkAnnotation, MemoryByteSource, Need, OutlineDestination, OutlineItem, PDFDocument, PDFError,
-    PDFObject, Page, Parser,
-    PopupAnnotation, ResolvedPage, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef,
-    XRefEntry,
+    LinearizedInfo, LinkAction, LinkAnnotation, MemoryByteSource, Need, OutlineDestination,
+    OutlineItem, PDFDocument, PDFError, PDFObject, Page, Parser, PopupAnnotation, ResolvedPage,
+    Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef, XRefEntry,
 };
 
 // Re-export rendering types. The `Device` trait + `RenderingContext` + `interpret`

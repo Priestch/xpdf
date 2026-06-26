@@ -16,7 +16,10 @@ fn fixtures_pdfs() -> std::path::PathBuf {
 /// Strip everything from the last `startxref` onward (simulating a truncated tail:
 /// no xref, no startxref, no %%EOF).
 fn truncate_at_last_startxref(data: &[u8]) -> Vec<u8> {
-    if let Some(i) = data.windows(b"startxref".len()).rposition(|w| w == b"startxref") {
+    if let Some(i) = data
+        .windows(b"startxref".len())
+        .rposition(|w| w == b"startxref")
+    {
         data[..i].to_vec()
     } else {
         data.to_vec()
@@ -41,7 +44,9 @@ fn truncated_pdf_opens_via_recovery_scan() {
         "truncation should have removed the tail"
     );
     assert!(
-        !truncated.windows(b"startxref".len()).any(|w| w == b"startxref"),
+        !truncated
+            .windows(b"startxref".len())
+            .any(|w| w == b"startxref"),
         "truncated buffer must have no startxref"
     );
 

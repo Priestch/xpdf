@@ -167,10 +167,8 @@ pub enum OpCode {
     // Inline Image Operators
     /// BI - Begin inline image
     BeginInlineImage = 63,
-    /// ID - Begin inline image data
-    BeginImageData = 64,
     /// EI - End inline image
-    EndInlineImage = 65,
+    EndInlineImage = 64,
 
     // XObject Operator
     /// Do - Paint XObject
@@ -290,7 +288,6 @@ impl OpCode {
 
             // Inline images
             "BI" => Ok(OpCode::BeginInlineImage),
-            "ID" => Ok(OpCode::BeginImageData),
             "EI" => Ok(OpCode::EndInlineImage),
 
             // XObject
@@ -379,7 +376,6 @@ impl OpCode {
             OpCode::SetFillCMYKColor => "k",
             OpCode::ShadingFill => "sh",
             OpCode::BeginInlineImage => "BI",
-            OpCode::BeginImageData => "ID",
             OpCode::EndInlineImage => "EI",
             OpCode::PaintXObject => "Do",
             OpCode::MarkPoint => "MP",
@@ -494,6 +490,28 @@ struct TextExtractionState {
     /// Extracted text items
     extracted_text: Vec<TextItem>,
 
+    /// Accumulated text for the current text run (consecutive Tj/TJ on same line).
+    /// Instead of pushing a TextItem per Tj/TJ, we accumulate across same-line
+    /// operations and flush to extracted_text only when the line changes (significant
+    /// Ty change via Td/Tm/T*/ET). This keeps superscript markers, font-change text,
+    /// and horizontally-offset text attached to their base word.
+    run_accumulator: String,
+
+    /// Position of the first operation in the current text run
+    run_start_position: Option<(f64, f64)>,
+
+    /// Font name at the start of the current text run
+    run_start_font_name: Option<String>,
+
+    /// Font size at the start of the current text run
+    run_start_font_size: Option<f64>,
+
+    /// Rendering mode at the start of the current text run
+    run_start_rendering_mode: Option<i32>,
+
+    /// Y position for line-change detection (used instead of storing Ty separately)
+    /// — stored as the Ty component of run_start_position.
+
     /// Form XObject names encountered via `Do` during this extraction. The caller
     /// (Page::extract_text) drains this after the run and recursively extracts text
     /// from each Form XObject, so text inside Form XObjects is not silently lost.
@@ -512,6 +530,11 @@ impl Default for TextExtractionState {
             leading: 0.0,
             in_text_object: false,
             extracted_text: Vec::new(),
+            run_accumulator: String::new(),
+            run_start_position: None,
+            run_start_font_name: None,
+            run_start_font_size: None,
+            run_start_rendering_mode: None,
             form_xobject_names: Vec::new(),
         }
     }
@@ -606,6 +629,60 @@ impl ContentStreamEvaluator {
     ///     println!("Text: '{}' at position {:?}", item.text, item.position);
     /// }
     /// ```
+
+    /// Flush the accumulated text run as a single TextItem.
+    /// Consumes the run accumulator and appends to extracted_text.
+    fn flush_text_run(&mut self) {
+        let s = &mut self.text_state;
+        if !s.run_accumulator.is_empty() {
+            s.extracted_text.push(TextItem {
+                text: std::mem::take(&mut s.run_accumulator),
+                font_name: s.run_start_font_name.clone(),
+                font_size: s.run_start_font_size,
+                position: s.run_start_position,
+                rendering_mode: s.run_start_rendering_mode,
+            });
+        }
+        s.run_start_position = None;
+    }
+
+    /// Start a new text run at the current text matrix position.
+    /// Clears the accumulator and captures current font/position state.
+    fn start_new_run(&mut self) {
+        let s = &mut self.text_state;
+        s.run_accumulator.clear();
+        s.run_start_position = Some((s.text_matrix[4], s.text_matrix[5]));
+        s.run_start_font_name = s.current_font_name.clone();
+        s.run_start_font_size = s.current_font_size;
+        s.run_start_rendering_mode = s.text_rendering_mode;
+    }
+
+    /// Check if the current text position's Y has moved far enough from
+    /// the run's start Y that we should flush and start a new run.
+    fn should_flush_run(&self) -> bool {
+        let s = &self.text_state;
+        let Some(start_pos) = s.run_start_position else {
+            return false;
+        };
+        let current_y = s.text_matrix[5];
+        let dy = (current_y - start_pos.1).abs();
+        let threshold = s
+            .run_start_font_size
+            .unwrap_or(12.0)
+            .max(s.current_font_size.unwrap_or(12.0))
+            * 0.5;
+        dy > threshold
+    }
+
+    /// Flush the run if the Y position has changed significantly, then
+    /// start a new run at the current text matrix position.
+    fn maybe_flush_and_start_run(&mut self) {
+        if self.should_flush_run() {
+            self.flush_text_run();
+            self.start_new_run();
+        }
+    }
+
     pub fn extract_text(&mut self) -> PDFResult<Vec<TextItem>> {
         // Reset text state
         self.text_state = TextExtractionState::default();
@@ -614,6 +691,9 @@ impl ContentStreamEvaluator {
         while let Some(op) = self.read_operation()? {
             self.process_text_operation(&op)?;
         }
+
+        // Flush any remaining accumulated text
+        self.flush_text_run();
 
         Ok(self.text_state.extracted_text.clone())
     }
@@ -630,12 +710,15 @@ impl ContentStreamEvaluator {
     fn process_text_operation(&mut self, op: &Operation) -> PDFResult<()> {
         match op.op {
             OpCode::BeginText => {
+                self.flush_text_run();
                 self.text_state.in_text_object = true;
                 // Initialize text matrices
                 self.text_state.text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
                 self.text_state.text_line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+                self.start_new_run();
             }
             OpCode::EndText => {
+                self.flush_text_run();
                 self.text_state.in_text_object = false;
             }
             OpCode::SetFont => {
@@ -664,6 +747,8 @@ impl ContentStreamEvaluator {
                 }
             }
             OpCode::SetTextMatrix => {
+                // Tm — absolute text positioning (always a new text run)
+                self.flush_text_run();
                 if op.args.len() >= 6 {
                     // Set text matrix from 6 numbers [a b c d e f]
                     for i in 0..6 {
@@ -673,6 +758,7 @@ impl ContentStreamEvaluator {
                         }
                     }
                 }
+                self.start_new_run();
             }
             OpCode::MoveText => {
                 if op.args.len() >= 2 && self.text_state.in_text_object {
@@ -685,6 +771,8 @@ impl ContentStreamEvaluator {
                         self.text_state.text_line_matrix[5] += ty;
                         // Copy to text matrix
                         self.text_state.text_matrix = self.text_state.text_line_matrix;
+                        // Check if this is a line change (significant Ty shift)
+                        self.maybe_flush_and_start_run();
                     }
                 }
             }
@@ -694,6 +782,7 @@ impl ContentStreamEvaluator {
                     self.text_state.text_line_matrix[4] = 0.0;
                     self.text_state.text_line_matrix[5] -= self.text_state.leading;
                     self.text_state.text_matrix = self.text_state.text_line_matrix;
+                    self.maybe_flush_and_start_run();
                 }
             }
             OpCode::SetLeadingMoveText => {
@@ -706,29 +795,27 @@ impl ContentStreamEvaluator {
                         self.text_state.text_line_matrix[4] += tx;
                         self.text_state.text_line_matrix[5] += ty;
                         self.text_state.text_matrix = self.text_state.text_line_matrix;
+                        self.maybe_flush_and_start_run();
                     }
                 }
             }
             OpCode::ShowText => {
                 // Tj - show text string
                 if op.args.len() >= 1 && self.text_state.in_text_object {
+                    self.maybe_flush_and_start_run();
                     match &op.args[0] {
                         PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
                             let text = self.decode_text(text_bytes);
-                            let position = Some((
-                                self.text_state.text_matrix[4],
-                                self.text_state.text_matrix[5],
-                            ));
-
-                            let text_item = TextItem {
-                                text,
-                                font_name: self.text_state.current_font_name.clone(),
-                                font_size: self.text_state.current_font_size,
-                                position,
-                                rendering_mode: self.text_state.text_rendering_mode,
-                            };
-
-                            self.text_state.extracted_text.push(text_item);
+                            let s = &mut self.text_state;
+                            if !s.run_accumulator.is_empty() && !s.run_accumulator.ends_with(' ') {
+                                // Insert space before alphanumeric-starting items (words).
+                                // Items starting with punctuation/symbols (superscript markers,
+                                // commas, etc.) are attached without space.
+                                if text.starts_with(|c: char| c.is_alphanumeric()) {
+                                    s.run_accumulator.push(' ');
+                                }
+                            }
+                            s.run_accumulator.push_str(&text);
                         }
                         _ => {}
                     }
@@ -740,11 +827,21 @@ impl ContentStreamEvaluator {
                 // Format: [(string1) -100 (string2) 50 (string3)] where numbers are spacing adjustments
                 if op.args.len() >= 1 && self.text_state.in_text_object {
                     if let PDFObject::Array(items) = &op.args[0] {
+                        self.maybe_flush_and_start_run();
+
+                        // Pre-scan: detect word-based TJ arrays (at least one multi-char
+                        // string). Per-char arrays like issue6961's [(P) -207 (a) ...] use
+                        // spacing as glyph advances; word-based arrays insert word spaces.
+                        let has_multi_char = items.iter().any(|item| {
+                            match &**item {
+                                // byte-length > 1 is a reliable approximation for Latin
+                                // fonts; multi-byte CJK won't falsely trigger per-char
+                                // detection since CJK rarely uses glyph-advance arrays.
+                                PDFObject::String(b) | PDFObject::HexString(b) => b.len() > 1,
+                                _ => false,
+                            }
+                        });
                         let mut accumulated_text = String::new();
-                        let start_position = Some((
-                            self.text_state.text_matrix[4],
-                            self.text_state.text_matrix[5],
-                        ));
 
                         // Track whether the last string in the array was a full word
                         // or punctuation. Only spacing values following a multi-char
@@ -758,20 +855,33 @@ impl ContentStreamEvaluator {
 
                         for item in items {
                             match &**item {
-                                PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
+                                PDFObject::String(text_bytes)
+                                | PDFObject::HexString(text_bytes) => {
                                     // Decode text using font encoding (CMap)
                                     let text = self.decode_text(text_bytes);
                                     let count = text.chars().count();
                                     last_was_word_or_punct = count > 1
-                                        || count == 1 && text.chars().next().is_some_and(|c| {
-                                            c == ',' || c == '.' || c == ';' || c == ':'
-                                                || c == '!' || c == '?' || c == ')'
-                                                || c == ']' || c == '}' || c == '%'
-                                        });
-                                    if count > 1 { seen_word = true; }
+                                        || count == 1
+                                            && text.chars().next().is_some_and(|c| {
+                                                c == ','
+                                                    || c == '.'
+                                                    || c == ';'
+                                                    || c == ':'
+                                                    || c == '!'
+                                                    || c == '?'
+                                                    || c == ')'
+                                                    || c == ']'
+                                                    || c == '}'
+                                                    || c == '%'
+                                            });
+                                    // In a word-based TJ array, even single-char items
+                                    // like "A" or "I" are real words, so mark seen_word.
+                                    if count > 1 || (has_multi_char && count == 1) {
+                                        seen_word = true;
+                                    }
                                     accumulated_text.push_str(&text);
                                 }
-                                 PDFObject::Number(spacing) => {
+                                PDFObject::Number(spacing) => {
                                     // Spacing adjustment in 1/1000ths of a text space unit.
                                     // Negative values move subsequent glyphs right (gap), positive
                                     // values move left (tightening / kerning).
@@ -785,21 +895,15 @@ impl ContentStreamEvaluator {
                                     // Gaps < -600 are too large — flush as a separate item.
                                     // Gaps ≥ -102 are kerning — no space.
                                     if *spacing < -600.0 {
-                                        // Large gap — flush current text as a separate item
+                                        // Large gap — paragraph break: flush the current run
+                                        // (including text accumulated before and within this TJ)
+                                        // and start a new run for remaining TJ content.
                                         if !accumulated_text.is_empty() {
-                                            let text_item = TextItem {
-                                                text: accumulated_text,
-                                                font_name: self.text_state.current_font_name.clone(),
-                                                font_size: self.text_state.current_font_size,
-                                                position: Some((
-                                                    self.text_state.text_matrix[4],
-                                                    self.text_state.text_matrix[5],
-                                                )),
-                                                rendering_mode: self.text_state.text_rendering_mode,
-                                            };
-                                            self.text_state.extracted_text.push(text_item);
+                                            self.text_state.run_accumulator.push_str(&accumulated_text);
+                                            accumulated_text.clear();
+                                            self.flush_text_run();
+                                            self.start_new_run();
                                         }
-                                        accumulated_text = String::new();
                                     } else if *spacing < -102.0
                                         && (last_was_word_or_punct || seen_word)
                                     {
@@ -819,17 +923,18 @@ impl ContentStreamEvaluator {
                             }
                         }
 
-                        // Create a single text item for the entire TJ operation
+                        // Append accumulated TJ text to the run accumulator.
+                        // Insert a space before alphanumeric-starting text if the
+                        // run already has content (word boundary). Punctuation/symbol
+                        // items (superscript markers, commas) attach without space.
                         if !accumulated_text.is_empty() {
-                            let text_item = TextItem {
-                                text: accumulated_text,
-                                font_name: self.text_state.current_font_name.clone(),
-                                font_size: self.text_state.current_font_size,
-                                position: start_position,
-                                rendering_mode: self.text_state.text_rendering_mode,
-                            };
-
-                            self.text_state.extracted_text.push(text_item);
+                            let s = &mut self.text_state;
+                            if !s.run_accumulator.is_empty() && !s.run_accumulator.ends_with(' ') {
+                                if accumulated_text.starts_with(|c: char| c.is_alphanumeric()) {
+                                    s.run_accumulator.push(' ');
+                                }
+                            }
+                            s.run_accumulator.push_str(&accumulated_text);
                         }
                     }
                 }
@@ -837,24 +942,15 @@ impl ContentStreamEvaluator {
             OpCode::NextLineShowText => {
                 // ' - move to next line and show text (T* + Tj)
                 if op.args.len() >= 1 && self.text_state.in_text_object {
+                    self.flush_text_run();
+                    self.text_state.text_line_matrix[4] = 0.0;
+                    self.text_state.text_line_matrix[5] -= self.text_state.leading;
+                    self.text_state.text_matrix = self.text_state.text_line_matrix;
+                    self.start_new_run();
                     match &op.args[0] {
                         PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
-                            self.text_state.text_line_matrix[4] = 0.0;
-                            self.text_state.text_line_matrix[5] -= self.text_state.leading;
-                            self.text_state.text_matrix = self.text_state.text_line_matrix;
                             let text = self.decode_text(text_bytes);
-                            let position = Some((
-                                self.text_state.text_matrix[4],
-                                self.text_state.text_matrix[5],
-                            ));
-                            let text_item = TextItem {
-                                text,
-                                font_name: self.text_state.current_font_name.clone(),
-                                font_size: self.text_state.current_font_size,
-                                position,
-                                rendering_mode: self.text_state.text_rendering_mode,
-                            };
-                            self.text_state.extracted_text.push(text_item);
+                            self.text_state.run_accumulator.push_str(&text);
                         }
                         _ => {}
                     }
@@ -864,24 +960,15 @@ impl ContentStreamEvaluator {
                 // " - set word/char spacing, move to next line, and show text
                 // args: word_spacing char_spacing text_string
                 if op.args.len() >= 3 && self.text_state.in_text_object {
+                    self.flush_text_run();
+                    self.text_state.text_line_matrix[4] = 0.0;
+                    self.text_state.text_line_matrix[5] -= self.text_state.leading;
+                    self.text_state.text_matrix = self.text_state.text_line_matrix;
+                    self.start_new_run();
                     match &op.args[2] {
                         PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
-                            self.text_state.text_line_matrix[4] = 0.0;
-                            self.text_state.text_line_matrix[5] -= self.text_state.leading;
-                            self.text_state.text_matrix = self.text_state.text_line_matrix;
                             let text = self.decode_text(text_bytes);
-                            let position = Some((
-                                self.text_state.text_matrix[4],
-                                self.text_state.text_matrix[5],
-                            ));
-                            let text_item = TextItem {
-                                text,
-                                font_name: self.text_state.current_font_name.clone(),
-                                font_size: self.text_state.current_font_size,
-                                position,
-                                rendering_mode: self.text_state.text_rendering_mode,
-                            };
-                            self.text_state.extracted_text.push(text_item);
+                            self.text_state.run_accumulator.push_str(&text);
                         }
                         _ => {}
                     }
@@ -1017,6 +1104,7 @@ impl ContentStreamEvaluator {
                 obj if obj.is_command_like() => {
                     // Extract command string
                     let cmd_str = self.extract_command(&obj)?;
+
                     let op = OpCode::from_command(&cmd_str)?;
                     return Ok(Some(Operation::new(op, args)));
                 }

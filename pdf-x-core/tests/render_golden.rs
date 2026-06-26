@@ -60,38 +60,102 @@ struct Case {
 /// reason); if it ever starts rendering, the test flags the flip so a golden
 /// can be added — it never silently passes.
 static CASES: &[Case] = &[
-    Case { fixture: "annotation-border-styles.pdf", page: 0, expect: Expect::Ok },
+    Case {
+        fixture: "annotation-border-styles.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
     // Renders after lazy fetch-time recovery: this fixture's xref has stale object offsets
     // (parses fine, but offsets point at wrong bytes); the first failing fetch triggers a
     // full-file xref rebuild, then the page renders.
-    Case { fixture: "annotation-text.pdf", page: 0, expect: Expect::Ok },
-    Case { fixture: "asciihexdecode.pdf", page: 0, expect: Expect::Ok },
+    Case {
+        fixture: "annotation-text.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
+    Case {
+        fixture: "asciihexdecode.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
     // Open fail: malformed xref (offset 999999 beyond 427-byte stream) — this
     // fixture is a parser-robustness probe, not a renderable page.
-    Case { fixture: "bad-xref.pdf", page: 0, expect: Expect::Skip },
-    Case { fixture: "basicapi.pdf", page: 0, expect: Expect::Ok },
+    Case {
+        fixture: "bad-xref.pdf",
+        page: 0,
+        expect: Expect::Skip,
+    },
+    Case {
+        fixture: "basicapi.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
     // V=5/R=6 AES-256, empty user password, catalog in an ObjStm — proves end-to-end
     // decryption (open → auto-auth empty password → decrypt streams/strings on fetch).
-    Case { fixture: "catalog-in-objstm-aes.pdf", page: 0, expect: Expect::Ok },
+    Case {
+        fixture: "catalog-in-objstm-aes.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
     // Opens via full-file recovery + ObjStm indexing (page_count resolves to 1), but render
     // fails further on the separate content-stream bug ("Expected object number, got
     // Command('obj')") — the same bug blocking annotation-text/flatedecode/issue3115.
-    Case { fixture: "compressed-object-stream.pdf", page: 0, expect: Expect::Skip },
-    Case { fixture: "empty.pdf", page: 0, expect: Expect::Ok },
+    Case {
+        fixture: "compressed-object-stream.pdf",
+        page: 0,
+        expect: Expect::Skip,
+    },
+    Case {
+        fixture: "empty.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
     // Renders after lazy fetch-time recovery (stale xref offsets, like annotation-text).
-    Case { fixture: "flatedecode.pdf", page: 0, expect: Expect::Ok },
+    Case {
+        fixture: "flatedecode.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
     // Renders after lazy fetch-time recovery (stale xref offsets, like annotation-text).
-    Case { fixture: "issue3115.pdf", page: 0, expect: Expect::Ok },
+    Case {
+        fixture: "issue3115.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
     // Opens + renders: linearization detection was made tolerant — /O may be an indirect
     // ref, and missing linearization fields now degrade gracefully instead of aborting open.
-    Case { fixture: "linearized.pdf", page: 0, expect: Expect::Ok },
-    Case { fixture: "rotation.pdf", page: 0, expect: Expect::Ok },
-    Case { fixture: "simpletype3font.pdf", page: 0, expect: Expect::Ok },
-    Case { fixture: "tracemonkey.pdf", page: 0, expect: Expect::Ok },
-    Case { fixture: "TrueType_without_cmap.pdf", page: 0, expect: Expect::Ok },
+    Case {
+        fixture: "linearized.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
+    Case {
+        fixture: "rotation.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
+    Case {
+        fixture: "simpletype3font.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
+    Case {
+        fixture: "tracemonkey.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
+    Case {
+        fixture: "TrueType_without_cmap.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
     // Opens via full-file recovery scan (was Skip: malformed `/Type /XRef` stream that
     // normal parse rejects; recovery rebuilds entries from real object offsets).
-    Case { fixture: "xref-stream.pdf", page: 0, expect: Expect::Ok },
+    Case {
+        fixture: "xref-stream.pdf",
+        page: 0,
+        expect: Expect::Ok,
+    },
 ];
 
 /// Workspace `tests/fixtures` directory (one level above `pdf-x-core`).
@@ -135,9 +199,7 @@ fn write_png(path: &PathBuf, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> 
 /// Decode a PNG to (width, height, RGBA).
 fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let dec = png::Decoder::new(Cursor::new(bytes));
-    let mut reader = dec
-        .read_info()
-        .map_err(|e| format!("png decode: {}", e))?;
+    let mut reader = dec.read_info().map_err(|e| format!("png decode: {}", e))?;
     let (w, h) = (reader.info().width, reader.info().height);
     let mut buf = vec![0u8; reader.output_buffer_size()];
     reader

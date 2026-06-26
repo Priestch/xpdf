@@ -3,9 +3,7 @@
 //! This test directly constructs vector graphics using the Device trait
 //! to verify that the rendering pipeline works independently of PDF parsing.
 
-use pdf_x_core::rendering::{
-    Color, Device, FillRule, Paint, PathDrawMode, StrokeProps,
-};
+use pdf_x_core::rendering::{Color, Device, FillRule, Paint, PathDrawMode, StrokeProps};
 use pdf_x_device_tinyskia::SkiaDevice;
 use tiny_skia::Pixmap;
 

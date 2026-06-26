@@ -633,6 +633,16 @@ impl Lexer {
             }
 
             self.cmd_buf.push(ch as u8 as char);
+
+            // The `ID` operator (inline image data start) is followed
+            // immediately by raw binary data (PDF 32000-1 §7.4.4).
+            // Skip the image data here so the parser never sees it.
+            if self.cmd_buf == "ID" {
+                self.skip_inline_image_data()?;
+                // After skipping past EI, return the next real token
+                return self.get_object();
+            }
+
             ch = self.next_char()?;
         }
 
@@ -649,6 +659,32 @@ impl Lexer {
 
         // Otherwise it's a command/operator - clone the buffer into token
         Ok(Token::Command(self.cmd_buf.clone()))
+    }
+
+    /// Skips raw inline image data (after `ID`) until `EI` is found.
+    ///
+    /// Inline image data is raw binary (not valid PDF syntax). We scan
+    /// byte-by-byte for the two-byte sequence `EI` that ends the data.
+    /// After returning, the stream is positioned past the `I` of `EI`.
+    pub fn skip_inline_image_data(&mut self) -> PDFResult<()> {
+        loop {
+            let b = self.next_char()?;
+            if b < 0 {
+                return Ok(()); // EOF reached without finding EI
+            }
+            if b as u8 == b'E' {
+                match self.next_char() {
+                    Ok(next_b) if next_b >= 0 && next_b as u8 == b'I' => {
+                        // Consume the byte past "I" so the stream is positioned
+                        // past the `EI` marker.
+                        let _ = self.next_char();
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Ok(()),
+                }
+            }
+        }
     }
 
     /// Skips the end-of-line marker after the 'stream' keyword.
