@@ -915,23 +915,6 @@ impl PDFDocument {
         page.extract_text_as_string(self.doc_store_mut())
     }
 
-    /// Render a page to RGBA pixel data.
-    ///
-    /// **Moved to the `pdf-x-device-tinyskia` adapter crate** (Phase 0 decision A: the
-    /// tiny-skia backend is an adapter, not a core dependency). To render to pixels,
-    /// depend on `pdf-x-device-tinyskia` and use its `RenderToImage` extension trait:
-    ///
-    /// ```ignore
-    /// use pdf_x_core::PDFDocument;
-    /// use pdf_x_device_tinyskia::RenderToImage;
-    ///
-    /// let mut doc = PDFDocument::open(std::fs::read("document.pdf").unwrap()).unwrap();
-    /// let (width, height, pixels) = doc.render_page_to_image(0, Some(2.0)).unwrap();
-    /// ```
-    ///
-    /// Core itself stays backend-free; this type only exposes the pure
-    /// [`rendering::interpret`](crate::rendering::interpret) over a `ResolvedPage`.
-
     /// Gets an inheritable property from a page dictionary.
     ///
     /// PDF pages can inherit certain properties from parent Pages nodes in the

@@ -35,12 +35,15 @@ pub struct Page {
 /// delta overrides. `as_xref_mut` exposes the base `XRef` only for operations not expressed
 /// through the resolver (e.g. stream positioning).
 pub trait PageResolver {
-    /// Resolve `obj` if it is an indirect reference (delta-aware where supported).
+    /// Resolve `obj` if it is an indirect Reference (delta-aware where supported).
     fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>>;
     /// Resolve object `(num, generation)` (delta-aware where supported).
     fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<Arc<PDFObject>>;
-    /// Base `XRef` for XRef-specific operations not expressed through the resolver.
-    fn as_xref_mut(&mut self) -> &mut super::xref::XRef;
+    /// Base `XRef` for legacy operations not yet migrated to the resolver trait.
+    /// Panics for snapshot-backed resolvers (no live XRef).
+    fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
+        unimplemented!("this resolver has no live XRef")
+    }
 }
 
 impl PageResolver for super::xref::XRef {
@@ -74,7 +77,11 @@ impl Page {
     /// * `page_index` - The 0-based index of this page in the document
     /// * `page_dict` - The page dictionary object
     /// * `page_ref` - Optional indirect reference (obj_num, generation) for this page
-    pub fn new(page_index: usize, page_dict: Arc<PDFObject>, page_ref: Option<(u32, u32)>) -> Self {
+    pub(crate) fn new(
+        page_index: usize,
+        page_dict: Arc<PDFObject>,
+        page_ref: Option<(u32, u32)>,
+    ) -> Self {
         Page {
             page_index,
             page_dict: (*page_dict).clone(),
@@ -408,13 +415,13 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// let pdf_data = std::fs::read("document.pdf").unwrap();
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
     ///
-    /// let text_items = page.extract_text(&mut doc).unwrap();
+    /// let text_items = page.extract_text(doc.doc_store_mut()).unwrap();
     /// for item in text_items {
     ///     println!("Text: '{}' at {:?}", item.text, item.position);
     /// }
@@ -645,12 +652,12 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// let mut doc = PDFDocument::open_file("document.pdf", None, None).unwrap();
     /// let page = doc.get_page(0).unwrap();
     ///
-    /// let text = page.extract_text_as_string(&mut doc.xref_mut()).unwrap();
+    /// let text = page.extract_text_as_string(doc.doc_store_mut()).unwrap();
     /// println!("Page text:\n{}", text);
     /// ```
     /// Same as `extract_text` but returns all text as a single string.
@@ -963,10 +970,11 @@ impl Page {
     ///
     /// // Create a pixmap for rendering
     /// let mut pixmap = Pixmap::new(800, 600).unwrap();
-    /// let mut device = SkiaDevice::new(pixmap.as_mut());
+    /// let mut font_cache = Default::default();
+    /// let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
     ///
     /// // Render the page
-    /// page.render(&mut doc.xref_mut(), &mut device).unwrap();
+    /// page.render(doc.doc_store_mut(), &mut device).unwrap();
     ///
     /// // Save the result
     /// pixmap.save_png("page1.png").unwrap();

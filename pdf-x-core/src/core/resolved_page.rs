@@ -235,12 +235,6 @@ impl<'o> PageResolver for SnapshotPageResolver<'o> {
                 ))
             })
     }
-
-    fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
-        // RenderingContext never calls this during interpret — all fetches go through
-        // resolve_*. Unreachable.
-        unimplemented!("SnapshotPageResolver has no live XRef")
-    }
 }
 
 #[cfg(test)]

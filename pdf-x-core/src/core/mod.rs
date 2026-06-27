@@ -48,7 +48,7 @@ pub use doc_store::DocStore;
 pub use document::{LinearizedInfo, PDFDocument};
 pub use encoding::Encoding;
 pub use encryption::{EncryptDict, EncryptionAlgorithm, EncryptionVersion, PDFPermissions};
-pub use error::PDFError;
+pub use error::{PDFError, PDFResult};
 pub use file_chunked_stream::FileChunkedStream;
 pub use font::{Font, FontDict, FontType};
 pub use image::{
@@ -56,7 +56,7 @@ pub use image::{
 };
 pub use lexer::{Lexer, Token};
 pub use outline::{DestinationType, OutlineDestination, OutlineItem};
-pub use page::{Page, PageTreeCache};
+pub use page::{Page, PageResolver};
 pub use parser::{PDFObject, Parser, Ref};
 pub use pdf_writer::PDFWriter;
 pub use resolved_page::{ResolvedPage, SnapshotPageResolver};

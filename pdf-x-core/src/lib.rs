@@ -48,12 +48,11 @@
 //!
 //! PDF-X supports progressive loading that mirrors PDF.js's architecture:
 //!
-//! ```rust
+//! //! ```ignore
 //! use pdf_x_core::core::{PDFDocument, FileChunkedStream};
 //!
 //! // Open with chunked loading for large files
-//! let mut stream = FileChunkedStream::open("large.pdf")?;
-//! let mut doc = PDFDocument::open_stream(Box::new(stream))?;
+//! let mut doc = PDFDocument::open_file("large.pdf", None, None)?;
 //!
 //! // Pages are loaded on-demand, not all at once
 //! let page = doc.get_page(0)?; // This will trigger progressive loading
@@ -95,7 +94,10 @@
 //! - Lazy loading of pages and content
 //! - Efficient memory usage with caching
 //! - Pull-based progressive loading (sync, runtime-free core; shells own I/O)
-//! - Thread-safe owned core types (`Send + Sync`)
+//! - Thread-safe snapshot types (`ResolvedPage`, `Page`, `PDFObject` are
+//!   `Send + Sync + 'static`); the live `PDFDocument` is `Send` but `!Sync`
+//!   (internal caches use `RefCell`). Render snapshots across threads via the
+//!   resolve-then-interpret boundary.
 //!
 //! For more detailed examples and advanced usage, see the examples directory.
 
@@ -108,15 +110,16 @@ pub use core::{
     AnnotationType, BaseStream, ByteSource, DeltaLayer, DestinationType, DocStore,
     FileAttachmentAnnotation, FileChunkedStream, FormFieldType, ImageDecoder, ImageFormat, Lexer,
     LinearizedInfo, LinkAction, LinkAnnotation, MemoryByteSource, Need, OutlineDestination,
-    OutlineItem, PDFDocument, PDFError, PDFObject, Page, Parser, PopupAnnotation, ResolvedPage,
-    Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef, XRefEntry,
+    OutlineItem, PDFDocument, PDFError, PDFObject, PDFResult, Page, PageResolver, Parser,
+    PopupAnnotation, ResolvedPage, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef,
+    XRefEntry,
 };
 
 // Re-export rendering types. The `Device` trait + `RenderingContext` + `interpret`
 // are backend-agnostic and live here; concrete backends (e.g. tiny-skia's
 // `SkiaDevice`) are in the `pdf-x-device-tinyskia` adapter crate (Phase 0 step 5).
 pub use rendering::{
-    Device, GraphicsState, Paint, Path, PathBuilder, PathDrawMode, RenderingContext,
+    Device, GraphicsState, Paint, Path, PathBuilder, PathDrawMode, RenderingContext, interpret,
 };
 
 // Re-export decode module

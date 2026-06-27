@@ -27,7 +27,7 @@ pub struct DocStore {
 
 impl DocStore {
     /// Take ownership of the base `XRef` and the edit `DeltaLayer`.
-    pub fn new(xref: XRef, delta: DeltaLayer) -> Self {
+    pub(crate) fn new(xref: XRef, delta: DeltaLayer) -> Self {
         Self { xref, delta }
     }
 

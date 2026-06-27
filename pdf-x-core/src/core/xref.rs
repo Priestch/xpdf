@@ -154,7 +154,7 @@ impl XRef {
     /// This is used with the retry_on_data_missing! macro to implement
     /// exception-driven progressive loading where missing data is loaded
     /// on-demand and operations are retried.
-    pub fn stream_mut(&mut self) -> &mut Box<dyn BaseStream> {
+    pub(crate) fn stream_mut(&mut self) -> &mut Box<dyn BaseStream> {
         &mut self.stream
     }
 
@@ -284,7 +284,7 @@ impl XRef {
     /// **Progressive-loading exception:** this reads the whole file
     /// (`stream.get_byte_range(0, length)`) — the documented last-resort recovery path,
     /// exactly as pdf.js does (`stream.getBytes()`). The normal path never calls this.
-    pub fn recover_by_scan(&mut self) -> PDFResult<()> {
+    pub(crate) fn recover_by_scan(&mut self) -> PDFResult<()> {
         let length = self.stream.length();
         let buf = self.stream.get_byte_range(0, length)?;
         let buf = buf.as_slice();
@@ -1615,7 +1615,7 @@ impl XRef {
     }
 
     /// Gets bytes from the stream at a specific position without changing current position.
-    pub fn get_bytes(&mut self, pos: usize, length: usize) -> PDFResult<Vec<u8>> {
+    pub(crate) fn get_bytes(&mut self, pos: usize, length: usize) -> PDFResult<Vec<u8>> {
         // Save current position
         let current_pos = self.stream.pos();
 
