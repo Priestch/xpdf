@@ -1462,11 +1462,11 @@ impl Page {
 
         // Get the Resources dictionary from the page
         let resources = match self.resources() {
-            Some(res) => self.fetch_if_ref(res, xref)?,
+            Some(res) => xref.fetch_if_ref(res)?,
             None => return Ok(images), // No resources
         };
 
-        let resources_dict = match resources {
+        let resources_dict = match &*resources {
             PDFObject::Dictionary(dict) => dict,
             _ => return Ok(images), // Resources is not a dictionary
         };
@@ -1477,18 +1477,19 @@ impl Page {
             None => return Ok(images), // No XObjects
         };
 
-        let xobject_dict = match self.fetch_if_ref(xobject_entry, xref)? {
+        let xobject_obj = xref.fetch_if_ref(xobject_entry)?;
+        let xobject_dict = match &*xobject_obj {
             PDFObject::Dictionary(dict) => dict,
             _ => return Ok(images), // XObject is not a dictionary
         };
 
         // Iterate through all XObjects
-        for (name, xobject_ref) in &xobject_dict {
+        for (name, xobject_ref) in xobject_dict {
             // Resolve the XObject reference
-            let xobject = self.fetch_if_ref(xobject_ref, xref)?;
+            let xobject = xref.fetch_if_ref(xobject_ref)?;
 
             // Check if it's an image (Subtype == /Image)
-            if let PDFObject::Stream { dict, data } = xobject {
+            if let PDFObject::Stream { dict, data } = &*xobject {
                 // Check Subtype
                 let is_image = dict
                     .get("Subtype")
@@ -1638,11 +1639,11 @@ impl Page {
 
         // Get the Resources dictionary from the page
         let resources = match self.resources() {
-            Some(res) => self.fetch_if_ref(res, xref)?,
+            Some(res) => xref.fetch_if_ref(res)?,
             None => return Ok(decoded_images), // No resources
         };
 
-        let resources_dict = match resources {
+        let resources_dict = match &*resources {
             PDFObject::Dictionary(dict) => dict,
             _ => return Ok(decoded_images), // Resources is not a dictionary
         };
@@ -1653,18 +1654,19 @@ impl Page {
             None => return Ok(decoded_images), // No XObjects
         };
 
-        let xobject_dict = match self.fetch_if_ref(xobject_entry, xref)? {
+        let xobject_obj = xref.fetch_if_ref(xobject_entry)?;
+        let xobject_dict = match &*xobject_obj {
             PDFObject::Dictionary(dict) => dict,
             _ => return Ok(decoded_images), // XObject is not a dictionary
         };
 
         // Iterate through all XObjects
-        for (name, xobject_ref) in &xobject_dict {
+        for (name, xobject_ref) in xobject_dict {
             // Resolve the XObject reference
-            let xobject = self.fetch_if_ref(xobject_ref, xref)?;
+            let xobject = xref.fetch_if_ref(xobject_ref)?;
 
             // Check if it's an image (Subtype == /Image)
-            if let PDFObject::Stream { dict, data } = xobject {
+            if let PDFObject::Stream { dict, data } = &*xobject {
                 // Check Subtype
                 let is_image = dict
                     .get("Subtype")
@@ -1863,22 +1865,6 @@ impl Page {
 }
 
 impl Page {
-    /// Helper method to fetch an object, following references if needed.
-    /// This provides access to the document's xref table for resolving object references.
-    /// Note: This is a simplified implementation that requires document context.
-    pub fn fetch_if_ref(
-        &self,
-        obj: &PDFObject,
-        xref: &mut super::xref::XRef,
-    ) -> PDFResult<PDFObject> {
-        match obj {
-            PDFObject::Ref(ref_obj) => match xref.fetch(ref_obj.num, ref_obj.generation)? {
-                rc_obj => Ok((*rc_obj).clone()),
-            },
-            _ => Ok(obj.clone()),
-        }
-    }
-
     /// Helper method to get XObject data by name.
     /// This retrieves the actual image data from the page's XObject resources.
     pub fn get_xobject_data(&self, name: &str, xref: &mut super::xref::XRef) -> PDFResult<Vec<u8>> {
@@ -1889,7 +1875,8 @@ impl Page {
                 // Check if there's an XObject entry
                 if let Some(xobject_entry) = xobject_dict.get("XObject") {
                     // Follow reference if needed
-                    let xobject_dict = match self.fetch_if_ref(xobject_entry, xref)? {
+                    let xobject_obj = xref.fetch_if_ref(xobject_entry)?;
+                    let xobject_dict = match &*xobject_obj {
                         PDFObject::Dictionary(dict) => dict,
                         _ => {
                             return Err(PDFError::Generic(
@@ -1902,11 +1889,11 @@ impl Page {
                     for (name_key, xobject_ref) in xobject_dict {
                         if name_key == name {
                             // Follow the reference to get the actual XObject
-                            let xobject = self.fetch_if_ref(&xobject_ref, xref)?;
+                            let xobject = xref.fetch_if_ref(xobject_ref)?;
 
                             // Check if it's an image stream and return the data
-                            if let PDFObject::Stream { dict: _, data } = xobject {
-                                return Ok(data);
+                            if let PDFObject::Stream { dict: _, data } = &*xobject {
+                                return Ok(data.clone());
                             } else {
                                 return Err(PDFError::Generic(format!(
                                     "XObject '{}' is not a stream",

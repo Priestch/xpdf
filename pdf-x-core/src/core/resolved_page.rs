@@ -38,19 +38,42 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ResolvedPage {
     /// Intersection of MediaBox/CropBox in PDF user-space coordinates `[x0, y0, x1, y1]`.
-    pub view_box: [f64; 4],
+    view_box: [f64; 4],
     /// Page rotation in degrees, normalized to `{0, 90, 180, 270}`.
-    pub rotation: i32,
+    rotation: i32,
     /// Resolved `/Resources` dictionary (`delta → base`). [`PDFObject::Null`] if absent.
-    pub resources: PDFObject,
+    resources: PDFObject,
     /// Decoded content-stream bytes (all content streams concatenated, filters applied).
-    pub contents: Vec<u8>,
+    contents: Vec<u8>,
     /// Pre-resolved snapshot of every object reachable from `/Resources` (fonts, xobjects,
     /// ext-gstate, color spaces, and their sub-objects, recursively). Captured during
     /// `resolve_page` so `interpret` needs no live `DocStore` — it reads from this frozen
     /// map. Keyed by `(object_num, generation)`. Uses `Arc<PDFObject>` so the snapshot
     /// shares allocations with the XRef cache (no deep clone on capture).
-    pub objects: std::collections::HashMap<(u32, u32), Arc<PDFObject>>,
+    objects: std::collections::HashMap<(u32, u32), Arc<PDFObject>>,
+}
+
+impl ResolvedPage {
+    /// Intersection of MediaBox/CropBox `[x0, y0, x1, y1]`.
+    pub fn view_box(&self) -> [f64; 4] {
+        self.view_box
+    }
+    /// Page rotation in degrees (`{0, 90, 180, 270}`).
+    pub fn rotation(&self) -> i32 {
+        self.rotation
+    }
+    /// Resolved `/Resources` dictionary.
+    pub fn resources(&self) -> &PDFObject {
+        &self.resources
+    }
+    /// Decoded content-stream bytes.
+    pub fn contents(&self) -> &[u8] {
+        &self.contents
+    }
+    /// Pre-resolved object snapshot (for `SnapshotPageResolver`).
+    pub fn objects(&self) -> &std::collections::HashMap<(u32, u32), Arc<PDFObject>> {
+        &self.objects
+    }
 }
 
 impl DocStore {
@@ -288,17 +311,18 @@ mod tests {
             .expect("resolve_page should produce a ResolvedPage");
 
         assert_eq!(
-            resolved.view_box,
+            resolved.view_box(),
             [0.0, 0.0, 200.0, 300.0],
             "MediaBox resolved"
         );
-        assert_eq!(resolved.rotation, 0);
+        assert_eq!(resolved.rotation(), 0);
         assert!(
-            matches!(resolved.resources, PDFObject::Null),
+            matches!(resolved.resources(), PDFObject::Null),
             "no /Resources → Null"
         );
         assert_eq!(
-            resolved.contents, b"q Q\n",
+            resolved.contents(),
+            b"q Q\n",
             "content stream decoded (no filter)"
         );
     }
@@ -316,7 +340,7 @@ mod tests {
             .doc_store_mut()
             .resolve_page(&page)
             .expect("baseline resolve");
-        assert_eq!(before.contents, b"q Q\n");
+        assert_eq!(before.contents(), b"q Q\n");
 
         // Override object 4 with a different content stream.
         let mut dict: HashMap<String, PDFObject> = HashMap::new();
@@ -334,7 +358,8 @@ mod tests {
             .resolve_page(&page)
             .expect("post-override resolve");
         assert_eq!(
-            after.contents, b"Q q",
+            after.contents(),
+            b"Q q",
             "delta override of /Contents must be reflected in the resolved page"
         );
     }

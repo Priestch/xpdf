@@ -142,8 +142,8 @@ fn render_resolved_page(
     font_cache: &mut FontCache,
 ) -> PDFResult<(u32, u32, Vec<u8>)> {
     // Reference: pdf.js/src/core/document.js - Page.view and Page.rotate
-    let [x0, y0, x1, y1] = resolved.view_box;
-    let rotation = resolved.rotation;
+    let [x0, y0, x1, y1] = resolved.view_box();
+    let rotation = resolved.rotation();
 
     let page_width = x1 - x0;
     let page_height = y1 - y0;

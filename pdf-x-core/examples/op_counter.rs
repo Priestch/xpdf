@@ -13,7 +13,7 @@ fn main() {
     let mut doc = PDFDocument::open(data).expect("open");
     let resolved = doc.resolve_page(page).expect("resolve");
 
-    let stream = Box::new(Stream::from_bytes(resolved.contents.clone())) as Box<dyn BaseStream>;
+    let stream = Box::new(Stream::from_bytes(resolved.contents().to_vec())) as Box<dyn BaseStream>;
     let lexer = Lexer::new(stream).expect("lexer");
     let parser = Parser::new(lexer).expect("parser");
     let mut evaluator = ContentStreamEvaluator::new(parser);

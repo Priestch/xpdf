@@ -46,7 +46,7 @@ pub fn interpret<D: Device>(
     use crate::rendering::graphics_state::FillRule;
 
     // Clip to the view box (matches Page::render's pre-amble).
-    let [x0, y0, x1, y1] = page.view_box;
+    let [x0, y0, x1, y1] = page.view_box();
     device.begin_path();
     device.move_to(x0, y0);
     device.line_to(x1, y0);
@@ -56,7 +56,7 @@ pub fn interpret<D: Device>(
     device.clip_path(FillRule::NonZero)?;
 
     // Parse the decoded content stream into operations.
-    let stream = Box::new(Stream::from_bytes(page.contents.clone())) as Box<dyn BaseStream>;
+    let stream = Box::new(Stream::from_bytes(page.contents().to_vec())) as Box<dyn BaseStream>;
     let lexer = Lexer::new(stream)?;
     let parser = Parser::new(lexer)?;
     let mut evaluator = ContentStreamEvaluator::new(parser);
@@ -64,10 +64,10 @@ pub fn interpret<D: Device>(
     // Pure interpretation: drive RenderingContext with a snapshot-backed resolver — no
     // live DocStore, no fetches beyond the frozen `objects` map. (No explicit save/restore:
     // interpret is a single pass, and the content's own q/Q ops manage graphics state.)
-    let mut resolver = SnapshotPageResolver::new(&page.objects);
+    let mut resolver = SnapshotPageResolver::new(page.objects());
     let mut ctx = RenderingContext::new(device);
-    if !matches!(page.resources, PDFObject::Null) {
-        ctx.set_xobject_resources(&mut resolver, &page.resources);
+    if !matches!(page.resources(), PDFObject::Null) {
+        ctx.set_xobject_resources(&mut resolver, page.resources());
     }
 
     loop {
