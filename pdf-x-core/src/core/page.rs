@@ -150,9 +150,9 @@ impl Page {
 
     /// Resolve an inheritable page property, merging dictionaries across the page tree.
     /// Reference: pdf.js/src/core/core_utils.js - getInheritableProperty
-    fn get_inheritable_property(
+    fn get_inheritable_property<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         key: &str,
         stop_when_found: bool,
     ) -> PDFResult<Option<Arc<PDFObject>>> {
@@ -168,7 +168,7 @@ impl Page {
             };
 
             if let Some(value) = dict.get(key) {
-                let resolved = xref.fetch_if_ref(value)?;
+                let resolved = resolver.resolve_if_ref(value)?;
                 if stop_when_found {
                     return Ok(Some(resolved));
                 }
@@ -189,7 +189,7 @@ impl Page {
                         ));
                     }
                     visited_refs.insert(ref_key);
-                    let parent_obj = xref.fetch(ref_obj.num, ref_obj.generation)?;
+                    let parent_obj = resolver.resolve_ref(ref_obj.num, ref_obj.generation)?;
                     current = (*parent_obj).clone();
                 }
                 _ => {
@@ -260,16 +260,15 @@ impl Page {
     ///
     /// Public so a `Device` backend adapter (e.g. `pdf-x-device-tinyskia`) can size
     /// its raster target without core knowing about any specific backend.
-    pub fn resolve_view_box_for_rendering(&self, xref: &mut super::xref::XRef) -> [f64; 4] {
-        // Reference: pdf.js/src/core/document.js - Page.view
+    pub fn resolve_view_box_for_rendering<R: PageResolver>(&self, resolver: &mut R) -> [f64; 4] {
         let media_box = self
-            .get_inheritable_property(xref, "MediaBox", false)
+            .get_inheritable_property(resolver, "MediaBox", false)
             .ok()
             .and_then(|value| value.as_deref().and_then(Self::resolve_rect))
             .unwrap_or([0.0, 0.0, 612.0, 792.0]);
 
         let crop_box = self
-            .get_inheritable_property(xref, "CropBox", false)
+            .get_inheritable_property(resolver, "CropBox", false)
             .ok()
             .and_then(|value| value.as_deref().and_then(Self::resolve_rect))
             .unwrap_or(media_box);
@@ -289,10 +288,9 @@ impl Page {
     }
 
     /// Resolve the normalized `/Rotate` for this page. Public for backend adapters.
-    pub fn resolve_rotate_for_rendering(&self, xref: &mut super::xref::XRef) -> i32 {
-        // Reference: pdf.js/src/core/document.js - Page.rotate
+    pub fn resolve_rotate_for_rendering<R: PageResolver>(&self, resolver: &mut R) -> i32 {
         let mut rotate = self
-            .get_inheritable_property(xref, "Rotate", false)
+            .get_inheritable_property(resolver, "Rotate", false)
             .ok()
             .and_then(|value| {
                 value.as_deref().and_then(|obj| match obj {
@@ -313,23 +311,21 @@ impl Page {
         rotate
     }
 
-    pub(crate) fn get_inheritable_resources(
+    pub(crate) fn get_inheritable_resources<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Option<Arc<PDFObject>>> {
-        // Reference: pdf.js/src/core/document.js - Page.resources
-        self.get_inheritable_property(xref, "Resources", false)
+        self.get_inheritable_property(resolver, "Resources", false)
     }
 
-    fn merge_stream_resources(
+    fn merge_stream_resources<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         stream_resources: Option<&PDFObject>,
         page_resources: &Option<Arc<PDFObject>>,
     ) -> PDFResult<Option<PDFObject>> {
-        // Reference: pdf.js/src/core/document.js - #getMergedResources
         let local_resources = match stream_resources {
-            Some(value) => match &*xref.fetch_if_ref(value)? {
+            Some(value) => match &*resolver.resolve_if_ref(value)? {
                 PDFObject::Dictionary(dict) if !dict.is_empty() => {
                     Some(PDFObject::Dictionary(dict.clone()))
                 }
@@ -350,9 +346,9 @@ impl Page {
     }
 
     #[cfg(feature = "rendering")]
-    fn load_fonts_for_rendering_with_resources<D: crate::rendering::Device>(
+    fn load_fonts_for_rendering_with_resources<D: crate::rendering::Device, R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         device: &mut D,
         resources: Option<&PDFObject>,
     ) -> PDFResult<()> {
@@ -371,14 +367,14 @@ impl Page {
             None => return Ok(()),
         };
 
-        let font_dict = match &*xref.fetch_if_ref(font_entry)? {
+        let font_dict = match &*resolver.resolve_if_ref(font_entry)? {
             PDFObject::Dictionary(d) => d.clone(),
             _ => return Ok(()),
         };
 
         for (font_name, font_ref) in font_dict {
-            if let Ok(font_obj) = xref.fetch_if_ref(&font_ref) {
-                if let Ok(pdf_font) = super::font::Font::new((*font_obj).clone(), xref) {
+            if let Ok(font_obj) = resolver.resolve_if_ref(&font_ref) {
+                if let Ok(pdf_font) = super::font::Font::new((*font_obj).clone(), resolver) {
                     if let Some(embedded_data) = pdf_font.embedded_font {
                         if let Err(e) = device.load_font_data(&font_name, embedded_data, None) {
                             if !e.to_string().contains("UnknownMagic") {
@@ -988,7 +984,7 @@ impl Page {
         use crate::rendering::RenderingContext;
 
         // Reference: pdf.js/src/core/document.js - Page.view (MediaBox/CropBox handling)
-        let view_box = self.resolve_view_box_for_rendering(resolver.as_xref_mut());
+        let view_box = self.resolve_view_box_for_rendering(resolver);
 
         let contents = match self.contents() {
             Some(contents) => contents,
@@ -1165,14 +1161,14 @@ impl Page {
     /// Gets all fonts from the page's Resources dictionary.
     ///
     /// Returns a mapping of font names (like "F1", "F2") to font dictionaries.
-    pub fn get_fonts(
+    pub fn get_fonts<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<(String, super::PDFObject)>> {
         use super::PDFObject;
 
         let resources = match self.resources() {
-            Some(r) => xref.fetch_if_ref(r)?,
+            Some(r) => resolver.resolve_if_ref(r)?,
             None => return Ok(Vec::new()),
         };
 
@@ -1182,7 +1178,7 @@ impl Page {
         };
 
         let font_dict = match resources_dict.get("Font") {
-            Some(f) => xref.fetch_if_ref(f)?,
+            Some(f) => resolver.resolve_if_ref(f)?,
             None => return Ok(Vec::new()),
         };
 
@@ -1212,19 +1208,19 @@ impl Page {
     /// # Returns
     /// Ok(()) if successful, even if some fonts fail to load
     #[cfg(feature = "rendering")]
-    pub fn load_fonts_for_rendering<D: crate::rendering::Device>(
+    pub fn load_fonts_for_rendering<D: crate::rendering::Device, R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         device: &mut D,
     ) -> PDFResult<()> {
-        let fonts = self.get_fonts(xref)?;
+        let fonts = self.get_fonts(resolver)?;
 
         for (font_name, font_ref) in fonts {
             // Try to fetch and load the font
-            match xref.fetch_if_ref(&font_ref) {
+            match resolver.resolve_if_ref(&font_ref) {
                 Ok(font_obj) => {
                     // Try to create a Font and extract embedded data
-                    match super::font::Font::new((*font_obj).clone(), xref) {
+                    match super::font::Font::new((*font_obj).clone(), resolver) {
                         Ok(pdf_font) => {
                             // If we have embedded font data, load it
                             if let Some(embedded_data) = pdf_font.embedded_font {
@@ -1441,52 +1437,48 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
-    /// let images = page.get_image_metadata(&mut doc.xref_mut()).unwrap();
+    /// let images = page.get_image_metadata(doc.doc_store_mut()).unwrap();
     ///
     /// for image in images {
     ///     println!("Image: {} ({}x{}, {})",
     ///              image.name, image.width, image.height, image.format);
     /// }
     /// ```
-    pub fn get_image_metadata(
+    pub fn get_image_metadata<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<super::image::ImageMetadata>> {
         use super::image::{ImageDecoder, ImageFormat, ImageMetadata};
 
         let mut images = Vec::new();
 
-        // Get the Resources dictionary from the page
         let resources = match self.resources() {
-            Some(res) => xref.fetch_if_ref(res)?,
-            None => return Ok(images), // No resources
+            Some(res) => resolver.resolve_if_ref(res)?,
+            None => return Ok(images),
         };
 
         let resources_dict = match &*resources {
             PDFObject::Dictionary(dict) => dict,
-            _ => return Ok(images), // Resources is not a dictionary
+            _ => return Ok(images),
         };
 
-        // Get XObject dictionary from Resources
         let xobject_entry = match resources_dict.get("XObject") {
             Some(entry) => entry,
-            None => return Ok(images), // No XObjects
+            None => return Ok(images),
         };
 
-        let xobject_obj = xref.fetch_if_ref(xobject_entry)?;
+        let xobject_obj = resolver.resolve_if_ref(xobject_entry)?;
         let xobject_dict = match &*xobject_obj {
             PDFObject::Dictionary(dict) => dict,
-            _ => return Ok(images), // XObject is not a dictionary
+            _ => return Ok(images),
         };
 
-        // Iterate through all XObjects
         for (name, xobject_ref) in xobject_dict {
-            // Resolve the XObject reference
-            let xobject = xref.fetch_if_ref(xobject_ref)?;
+            let xobject = resolver.resolve_if_ref(xobject_ref)?;
 
             // Check if it's an image (Subtype == /Image)
             if let PDFObject::Stream { dict, data } = &*xobject {
@@ -1616,11 +1608,11 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
-    /// let images = page.extract_images(&mut doc.xref_mut()).unwrap();
+    /// let images = page.extract_images(doc.doc_store_mut()).unwrap();
     ///
     /// for (i, image) in images.iter().enumerate() {
     ///     println!("Image {}: {}x{} pixels, {} bytes",
@@ -1628,42 +1620,38 @@ impl Page {
     ///     // Save or process image.data...
     /// }
     /// ```
-    pub fn extract_images(
+    pub fn extract_images<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<super::image::DecodedImage>> {
         use super::decode;
         use super::image::{ImageColorSpace, ImageDecoder};
 
         let mut decoded_images = Vec::new();
 
-        // Get the Resources dictionary from the page
         let resources = match self.resources() {
-            Some(res) => xref.fetch_if_ref(res)?,
-            None => return Ok(decoded_images), // No resources
+            Some(res) => resolver.resolve_if_ref(res)?,
+            None => return Ok(decoded_images),
         };
 
         let resources_dict = match &*resources {
             PDFObject::Dictionary(dict) => dict,
-            _ => return Ok(decoded_images), // Resources is not a dictionary
+            _ => return Ok(decoded_images),
         };
 
-        // Get XObject dictionary from Resources
         let xobject_entry = match resources_dict.get("XObject") {
             Some(entry) => entry,
-            None => return Ok(decoded_images), // No XObjects
+            None => return Ok(decoded_images),
         };
 
-        let xobject_obj = xref.fetch_if_ref(xobject_entry)?;
+        let xobject_obj = resolver.resolve_if_ref(xobject_entry)?;
         let xobject_dict = match &*xobject_obj {
             PDFObject::Dictionary(dict) => dict,
-            _ => return Ok(decoded_images), // XObject is not a dictionary
+            _ => return Ok(decoded_images),
         };
 
-        // Iterate through all XObjects
         for (name, xobject_ref) in xobject_dict {
-            // Resolve the XObject reference
-            let xobject = xref.fetch_if_ref(xobject_ref)?;
+            let xobject = resolver.resolve_if_ref(xobject_ref)?;
 
             // Check if it's an image (Subtype == /Image)
             if let PDFObject::Stream { dict, data } = &*xobject {
@@ -1862,20 +1850,18 @@ impl Page {
 
         Ok(decoded_images)
     }
-}
 
-impl Page {
     /// Helper method to get XObject data by name.
     /// This retrieves the actual image data from the page's XObject resources.
-    pub fn get_xobject_data(&self, name: &str, xref: &mut super::xref::XRef) -> PDFResult<Vec<u8>> {
-        // Get the Resources dictionary from the page
+    pub fn get_xobject_data<R: PageResolver>(
+        &self,
+        name: &str,
+        resolver: &mut R,
+    ) -> PDFResult<Vec<u8>> {
         if let Some(resources) = self.resources() {
-            // Look for XObject dictionary
             if let PDFObject::Dictionary(xobject_dict) = resources {
-                // Check if there's an XObject entry
                 if let Some(xobject_entry) = xobject_dict.get("XObject") {
-                    // Follow reference if needed
-                    let xobject_obj = xref.fetch_if_ref(xobject_entry)?;
+                    let xobject_obj = resolver.resolve_if_ref(xobject_entry)?;
                     let xobject_dict = match &*xobject_obj {
                         PDFObject::Dictionary(dict) => dict,
                         _ => {
@@ -1885,13 +1871,10 @@ impl Page {
                         }
                     };
 
-                    // Find the XObject with the given name
                     for (name_key, xobject_ref) in xobject_dict {
                         if name_key == name {
-                            // Follow the reference to get the actual XObject
-                            let xobject = xref.fetch_if_ref(xobject_ref)?;
+                            let xobject = resolver.resolve_if_ref(xobject_ref)?;
 
-                            // Check if it's an image stream and return the data
                             if let PDFObject::Stream { dict: _, data } = &*xobject {
                                 return Ok(data.clone());
                             } else {
@@ -1936,11 +1919,11 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
-    /// let annotations = page.extract_annotations(&mut doc.xref_mut()).unwrap();
+    /// let annotations = page.extract_annotations(doc.doc_store_mut()).unwrap();
     ///
     /// for annot in annotations {
     ///     println!("Annotation type: {:?}", annot.annotation_type);
@@ -1949,9 +1932,9 @@ impl Page {
     ///     }
     /// }
     /// ```
-    pub fn extract_annotations(
+    pub fn extract_annotations<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<super::annotation::Annotation>> {
         use super::annotation::parse_annotations;
 
@@ -1960,6 +1943,6 @@ impl Page {
             None => return Ok(Vec::new()),
         };
 
-        parse_annotations(annots, xref)
+        parse_annotations(annots, resolver)
     }
 }

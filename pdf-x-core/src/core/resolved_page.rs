@@ -87,8 +87,8 @@ impl DocStore {
         // view_box / rotation reuse Page's existing resolvers. These read the page dict
         // (already delta-resolved) for the page's OWN MediaBox/Rotate; only inherited
         // values from parent nodes still go through the base XRef (see module gap note).
-        let view_box = page.resolve_view_box_for_rendering(self.xref_mut());
-        let rotation = page.resolve_rotate_for_rendering(self.xref_mut());
+        let view_box = page.resolve_view_box_for_rendering(self);
+        let rotation = page.resolve_rotate_for_rendering(self);
 
         // /Resources resolved delta-aware (direct page-dict value; inheritance is a
         // later refinement).
