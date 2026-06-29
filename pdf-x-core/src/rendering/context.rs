@@ -2138,6 +2138,13 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 )
             };
 
+        // Downscale 16-bpc to 8-bpc (draw_image only supports 8-bpc).
+        let (decoded_data, decoded_bpc) = if decoded_bpc > 8 {
+            (downscale_16_to_8(&decoded_data), 8)
+        } else {
+            (decoded_data, decoded_bpc)
+        };
+
         // Apply /Decode array inversion only for non-JPEG images.
         // JPEG decoders handle colorspace conversion internally.
         let is_jpeg = match xobject_dict.get("Filter") {
@@ -2454,6 +2461,11 @@ fn mode_clips(mode: super::graphics_state::TextRenderingMode) -> bool {
             | super::graphics_state::TextRenderingMode::FillStrokeClip
             | super::graphics_state::TextRenderingMode::Clip
     )
+}
+
+/// Downscale 16-bit pixel data to 8-bit (take high byte of each 16-bit sample).
+fn downscale_16_to_8(data: &[u8]) -> Vec<u8> {
+    data.chunks_exact(2).map(|pair| pair[0]).collect()
 }
 
 /// Apply /Decode array inversion. Each pair [min max] in the array
