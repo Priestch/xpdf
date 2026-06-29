@@ -2138,6 +2138,25 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 )
             };
 
+        // Apply /Decode array inversion only for non-JPEG images.
+        // JPEG decoders handle colorspace conversion internally.
+        let is_jpeg = match xobject_dict.get("Filter") {
+            Some(PDFObject::Name(n)) => n == "DCTDecode" || n == "DCT",
+            Some(PDFObject::Array(arr)) => arr
+                .iter()
+                .any(|f| matches!(&**f, PDFObject::Name(n) if n == "DCTDecode" || n == "DCT")),
+            _ => false,
+        };
+        let decoded_data = if !is_jpeg {
+            if let Some(PDFObject::Array(decode_arr)) = xobject_dict.get("Decode") {
+                apply_decode_inversion(&decoded_data, decode_arr, decoded_bpc)
+            } else {
+                decoded_data
+            }
+        } else {
+            decoded_data
+        };
+
         // Create image data for the device
         let image = super::ImageData {
             width: decoded_width,
@@ -2428,14 +2447,49 @@ fn text_paint_for_rendering_mode(
 
 /// Whether the rendering mode requires adding glyph outlines to the clip path.
 fn mode_clips(mode: super::graphics_state::TextRenderingMode) -> bool {
-    use super::graphics_state::TextRenderingMode;
     matches!(
         mode,
-        TextRenderingMode::FillClip
-            | TextRenderingMode::StrokeClip
-            | TextRenderingMode::FillStrokeClip
-            | TextRenderingMode::Clip
+        super::graphics_state::TextRenderingMode::FillClip
+            | super::graphics_state::TextRenderingMode::StrokeClip
+            | super::graphics_state::TextRenderingMode::FillStrokeClip
+            | super::graphics_state::TextRenderingMode::Clip
     )
+}
+
+/// Apply /Decode array inversion. Each pair [min max] in the array
+/// controls one component. When [1 0], the component is inverted (255 - v).
+/// When [0 1] (default), no change. Only 8-bpc is handled.
+fn apply_decode_inversion(data: &[u8], decode: &[Box<PDFObject>], bpc: u8) -> Vec<u8> {
+    if bpc != 8 {
+        return data.to_vec();
+    }
+
+    // Determine which channels are inverted ([1 0] = inverted).
+    let channels = decode.len() / 2;
+    let mut inverted = Vec::with_capacity(channels);
+    for i in 0..channels {
+        let is_inverted = match (decode.get(i * 2), decode.get(i * 2 + 1)) {
+            (Some(b), Some(c)) => match (&**b, &**c) {
+                (PDFObject::Number(min), PDFObject::Number(max)) => *min == 1.0 && *max == 0.0,
+                _ => false,
+            },
+            _ => false,
+        };
+        inverted.push(is_inverted);
+    }
+
+    if !inverted.iter().any(|&b| b) {
+        return data.to_vec(); // No inversions needed.
+    }
+
+    let mut result = data.to_vec();
+    for (i, byte) in result.iter_mut().enumerate() {
+        let ch = i % channels;
+        if ch < inverted.len() && inverted[ch] {
+            *byte = 255 - *byte;
+        }
+    }
+    result
 }
 
 /// Post-concatenate a translation matrix.
