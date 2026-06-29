@@ -28,6 +28,7 @@ zune-jpeg = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 hayro-jpeg2000 = { path = "../hayro/hayro-jpeg2000", optional = true, default-features = false }
 hayro-jbig2 = { path = "../hayro/hayro-jbig2", optional = true, default-features = false }
+hayro-ccitt = { path = "../hayro/hayro-ccitt", optional = true }
 
 # NOTE: the tiny-skia rendering backend (tiny-skia / rustybuzz / ttf-parser /
 # hayro-font) moved to the `pdf-x-device-tinyskia` adapter crate (Phase 0 step 5).
@@ -38,7 +39,7 @@ hayro-jbig2 = { path = "../hayro/hayro-jbig2", optional = true, default-features
 default = ["jpeg-decoding"]
 jpeg-decoding = ["zune-jpeg"]
 png-decoding = ["image"]
-advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
+advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2", "hayro-ccitt"]
 crypto = ["sha2"]  # AES implementation is now built-in, only SHA-2 is external
 # Backend-agnostic rendering surface (Device trait, RenderingContext, `interpret`) is
 # always compiled (no external deps). The tiny-skia backend now lives in

@@ -1975,14 +1975,79 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                                 }
                             }
                             "CCITTFaxDecode" | "CCF" => {
-                                // TODO: Implement CCITT decoding
-                                (
-                                    image_data.clone(),
-                                    width,
-                                    height,
-                                    bits_per_component,
-                                    has_alpha,
-                                )
+                                #[cfg(feature = "advanced-image-formats")]
+                                {
+                                    match decode_ccitt(image_data, xobject_dict, width, height) {
+                                        Some(data) => (data, width, height, 1, false),
+                                        None => (
+                                            image_data.clone(),
+                                            width,
+                                            height,
+                                            bits_per_component,
+                                            has_alpha,
+                                        ),
+                                    }
+                                }
+                                #[cfg(not(feature = "advanced-image-formats"))]
+                                {
+                                    (
+                                        image_data.clone(),
+                                        width,
+                                        height,
+                                        bits_per_component,
+                                        has_alpha,
+                                    )
+                                }
+                            }
+                            "JPXDecode" => {
+                                #[cfg(feature = "advanced-image-formats")]
+                                {
+                                    match decode_jpx(image_data) {
+                                        Some((d, w, h, bpc, a)) => (d, w, h, bpc, a),
+                                        None => (
+                                            image_data.clone(),
+                                            width,
+                                            height,
+                                            bits_per_component,
+                                            has_alpha,
+                                        ),
+                                    }
+                                }
+                                #[cfg(not(feature = "advanced-image-formats"))]
+                                {
+                                    (
+                                        image_data.clone(),
+                                        width,
+                                        height,
+                                        bits_per_component,
+                                        has_alpha,
+                                    )
+                                }
+                            }
+                            "JBIG2Decode" => {
+                                #[cfg(feature = "advanced-image-formats")]
+                                {
+                                    match decode_jbig2(image_data, width, height) {
+                                        Some(data) => (data, width, height, 1, false),
+                                        None => (
+                                            image_data.clone(),
+                                            width,
+                                            height,
+                                            bits_per_component,
+                                            has_alpha,
+                                        ),
+                                    }
+                                }
+                                #[cfg(not(feature = "advanced-image-formats"))]
+                                {
+                                    (
+                                        image_data.clone(),
+                                        width,
+                                        height,
+                                        bits_per_component,
+                                        has_alpha,
+                                    )
+                                }
                             }
                             _ => {
                                 // Unsupported filter - try raw data
@@ -2411,6 +2476,177 @@ fn remap_text_bytes_with_cmap(bytes: &[u8], cmap: &CMap) -> Option<Vec<u8>> {
         Some(mapped_utf16be)
     } else {
         None
+    }
+}
+
+// Image decoder helpers (advanced-image-formats feature)
+
+#[cfg(feature = "advanced-image-formats")]
+fn decode_ccitt(
+    data: &[u8],
+    dict: &HashMap<String, PDFObject>,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    use hayro_ccitt::{self, DecodeSettings, EncodingMode};
+    let parms = dict.get("DecodeParms");
+    let k = num_in(parms, "K").unwrap_or(0);
+    let columns = num_in(parms, "Columns").unwrap_or(width as i64) as u32;
+    let rows = num_in(parms, "Rows").unwrap_or(height as i64) as u32;
+    let settings = DecodeSettings {
+        columns,
+        rows,
+        end_of_block: bool_in(parms, "EndOfBlock").unwrap_or(true),
+        end_of_line: bool_in(parms, "EndOfLine").unwrap_or(false),
+        rows_are_byte_aligned: bool_in(parms, "EncodedByteAlign").unwrap_or(false),
+        encoding: if k < 0 {
+            EncodingMode::Group4
+        } else if k > 0 {
+            EncodingMode::Group3_2D { k: k as u32 }
+        } else {
+            EncodingMode::Group3_1D
+        },
+        invert_black: bool_in(parms, "BlackIs1").map(|b| !b).unwrap_or(false),
+    };
+    let mut sink = BitmapSink::new(columns);
+    hayro_ccitt::decode(data, &mut sink, &settings)?;
+    Some(sink.finish())
+}
+
+#[cfg(feature = "advanced-image-formats")]
+fn decode_jpx(data: &[u8]) -> Option<(Vec<u8>, u32, u32, u8, bool)> {
+    let settings = hayro_jpeg2000::DecodeSettings {
+        resolve_palette_indices: true,
+        strict: false,
+        target_resolution: None,
+    };
+    let image = hayro_jpeg2000::Image::new(data, &settings).ok()?;
+    let decoded = image.decode().ok()?;
+    Some((
+        decoded,
+        image.width(),
+        image.height(),
+        image.original_bit_depth().max(8),
+        image.has_alpha(),
+    ))
+}
+
+#[cfg(feature = "advanced-image-formats")]
+fn decode_jbig2(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let image = hayro_jbig2::decode(data).ok()?;
+    let mut bitmap = Vec::with_capacity((width * height + 7) as usize / 8);
+    let mut bit_idx = 0u32;
+    let mut cur = 0u8;
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) as usize;
+            if i < image.data.len() && image.data[i] {
+                cur |= 1 << (7 - (bit_idx % 8));
+            }
+            bit_idx += 1;
+            if bit_idx % 8 == 0 {
+                bitmap.push(cur);
+                cur = 0;
+            }
+        }
+    }
+    if bit_idx % 8 != 0 {
+        bitmap.push(cur);
+    }
+    Some(bitmap)
+}
+
+#[cfg(feature = "advanced-image-formats")]
+fn num_in(p: Option<&PDFObject>, key: &str) -> Option<i64> {
+    p.and_then(|p| match p {
+        PDFObject::Dictionary(d) => Some(d),
+        _ => None,
+    })?
+    .get(key)
+    .and_then(|v| match v {
+        PDFObject::Number(n) => Some(*n as i64),
+        _ => None,
+    })
+}
+
+#[cfg(feature = "advanced-image-formats")]
+fn bool_in(p: Option<&PDFObject>, key: &str) -> Option<bool> {
+    p.and_then(|p| match p {
+        PDFObject::Dictionary(d) => Some(d),
+        _ => None,
+    })?
+    .get(key)
+    .and_then(|v| match v {
+        PDFObject::Boolean(b) => Some(*b),
+        _ => None,
+    })
+}
+
+#[cfg(feature = "advanced-image-formats")]
+struct BitmapSink {
+    bytes: Vec<u8>,
+    cur: u8,
+    bit: u8,
+    cols: u32,
+    x: u32,
+}
+
+#[cfg(feature = "advanced-image-formats")]
+impl BitmapSink {
+    fn new(cols: u32) -> Self {
+        Self {
+            bytes: Vec::new(),
+            cur: 0,
+            bit: 0,
+            cols,
+            x: 0,
+        }
+    }
+    fn finish(mut self) -> Vec<u8> {
+        if self.bit > 0 {
+            self.bytes.push(self.cur);
+        }
+        self.bytes
+    }
+}
+
+#[cfg(feature = "advanced-image-formats")]
+impl hayro_ccitt::Decoder for BitmapSink {
+    fn push_byte(&mut self, byte: u8) {
+        for bit in (0..8).rev() {
+            if (byte >> bit) & 1 == 0 {
+                self.cur |= 1 << (7 - self.bit);
+            }
+            self.bit += 1;
+            self.x += 1;
+            if self.bit == 8 {
+                self.bytes.push(self.cur);
+                self.cur = 0;
+                self.bit = 0;
+            }
+            if self.x >= self.cols {
+                if self.bit > 0 {
+                    self.bytes.push(self.cur);
+                    self.cur = 0;
+                    self.bit = 0;
+                }
+                self.x = 0;
+                break;
+            }
+        }
+    }
+    fn push_bytes(&mut self, byte: u8, count: usize) {
+        for _ in 0..count {
+            self.push_byte(byte);
+        }
+    }
+    fn next_line(&mut self) {
+        if self.bit > 0 {
+            self.bytes.push(self.cur);
+            self.cur = 0;
+            self.bit = 0;
+        }
+        self.x = 0;
     }
 }
 
