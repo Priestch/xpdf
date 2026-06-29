@@ -1927,14 +1927,37 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                     PDFObject::Name(filter_name) => {
                         use crate::core::decode;
                         match filter_name.as_str() {
-                            "FlateDecode" | "Fl" => (
-                                decode::decode_flate(image_data)
-                                    .unwrap_or_else(|_| image_data.clone()),
-                                width,
-                                height,
-                                bits_per_component,
-                                has_alpha,
-                            ),
+                            "FlateDecode" | "Fl" => {
+                                let mut decoded = decode::decode_flate(image_data)
+                                    .unwrap_or_else(|_| image_data.clone());
+                                // Apply PNG predictor if DecodeParms specifies one.
+                                if let Some(parms) = xobject_dict.get("DecodeParms") {
+                                    if let PDFObject::Dictionary(p) = parms {
+                                        if let Some(PDFObject::Number(pred)) = p.get("Predictor") {
+                                            let pred = *pred as i32;
+                                            if pred >= 10 {
+                                                let colors = match p.get("Colors") {
+                                                    Some(PDFObject::Number(n)) => *n as usize,
+                                                    _ => 1,
+                                                };
+                                                let bpc = match p.get("BitsPerComponent") {
+                                                    Some(PDFObject::Number(n)) => *n as usize,
+                                                    _ => 8,
+                                                };
+                                                let cols = match p.get("Columns") {
+                                                    Some(PDFObject::Number(n)) => *n as usize,
+                                                    _ => width as usize,
+                                                };
+                                                decoded = decode::decode_png_predictor(
+                                                    &decoded, colors, bpc, cols,
+                                                )
+                                                .unwrap_or(decoded);
+                                            }
+                                        }
+                                    }
+                                }
+                                (decoded, width, height, bits_per_component, has_alpha)
+                            }
                             "DCTDecode" | "DCT" => {
                                 // JPEG data - decode it using zune-jpeg
                                 #[cfg(feature = "jpeg-decoding")]
@@ -2117,6 +2140,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                                 (decoded, width, height, bits_per_component, has_alpha)
                             }
                         } else {
+                            // Apply PNG predictor from DecodeParms if present.
+                            let decoded = apply_predictor_from_parms(decoded, xobject_dict, width);
                             (decoded, width, height, bits_per_component, has_alpha)
                         }
                     }
@@ -2567,6 +2592,50 @@ fn expand_indexed_cs(
     };
 
     (expand_indexed(data, &lut, base_channels), true)
+}
+
+/// Apply PNG predictor from DecodeParms (handles both Dict and Array forms).
+fn apply_predictor_from_parms(
+    data: Vec<u8>,
+    dict: &HashMap<String, PDFObject>,
+    default_columns: u32,
+) -> Vec<u8> {
+    let parms = match dict.get("DecodeParms") {
+        Some(p) => p,
+        None => return data,
+    };
+    let parms_dict = match parms {
+        PDFObject::Dictionary(d) => Some(d),
+        PDFObject::Array(arr) => arr.iter().find_map(|item| match &**item {
+            PDFObject::Dictionary(d) => Some(d),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let parms_dict = match parms_dict {
+        Some(d) => d,
+        None => return data,
+    };
+    let pred = match parms_dict.get("Predictor") {
+        Some(PDFObject::Number(n)) => *n as i32,
+        _ => return data,
+    };
+    if pred < 10 {
+        return data;
+    }
+    let colors = match parms_dict.get("Colors") {
+        Some(PDFObject::Number(n)) => *n as usize,
+        _ => 1,
+    };
+    let bpc = match parms_dict.get("BitsPerComponent") {
+        Some(PDFObject::Number(n)) => *n as usize,
+        _ => 8,
+    };
+    let cols = match parms_dict.get("Columns") {
+        Some(PDFObject::Number(n)) => *n as usize,
+        _ => default_columns as usize,
+    };
+    crate::core::decode::decode_png_predictor(&data, colors, bpc, cols).unwrap_or(data)
 }
 
 /// Each byte in `data` is an index into `lut`, which contains
