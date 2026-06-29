@@ -359,6 +359,12 @@ fn apply_filter(data: &[u8], filter_name: &str) -> PDFResult<Vec<u8>> {
         "FlateDecode" | "Fl" => decode_flate(data),
         "ASCIIHexDecode" | "AHx" => decode_ascii_hex(data),
         "ASCII85Decode" | "A85" => decode_ascii85(data),
+        // Image-specific filters (DCTDecode, JPXDecode, CCITTFaxDecode, JBIG2Decode)
+        // are handled separately by the image rendering pipeline — return data
+        // unchanged so apply_filters can continue with remaining filters.
+        "DCTDecode" | "DCT" | "JPXDecode" | "CCITTFaxDecode" | "CCF" | "JBIG2Decode" => {
+            Ok(data.to_vec())
+        }
         _ => Err(PDFError::Generic(format!(
             "Unsupported filter: {}",
             filter_name
@@ -366,14 +372,11 @@ fn apply_filter(data: &[u8], filter_name: &str) -> PDFResult<Vec<u8>> {
     }
 }
 
-/// Applies multiple filters to data in sequence.
+/// Applies multiple filters to data in sequence (forward order per PDF spec
+/// §7.9.2: "applied in the order in which they appear").
 ///
-/// PDF streams can have multiple filters that are applied in order.
-/// For example: [/FlateDecode /ASCIIHexDecode] means ASCIIHex decode first,
-/// then Flate decode the result.
-///
-/// IMPORTANT: Filters in the array are applied in LAST-to-FIRST order.
-/// The LAST filter is applied FIRST.
+/// Image-specific filters (DCTDecode, JPXDecode, CCITTFaxDecode, JBIG2Decode)
+/// pass through unchanged — the image rendering pipeline handles them.
 ///
 /// # Arguments
 /// * `data` - The input data

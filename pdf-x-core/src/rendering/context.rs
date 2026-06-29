@@ -1911,8 +1911,9 @@ impl<'a, D: Device> RenderingContext<'a, D> {
 
         // Determine if image has alpha
         let has_alpha = match color_space_name {
-            Some("DeviceRGB") | Some("DeviceGray") | Some("CalRGB") | Some("CalGray") => false,
-            _ => true, // Assume other color spaces might have alpha
+            Some("DeviceRGB") | Some("DeviceGray") | Some("CalRGB") | Some("CalGray")
+            | Some("DeviceCMYK") => false,
+            _ => true,
         };
 
         // Get the image data stream
@@ -2062,11 +2063,62 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                         }
                     }
                     PDFObject::Array(_) => {
-                        // Apply all filters in order using apply_filters.
+                        // Apply non-image filters first (FlateDecode, ASCIIHex, etc.)
                         let filter = xobject_dict.get("Filter").unwrap();
                         let decoded = crate::core::decode::apply_filters(image_data, filter)
                             .unwrap_or_else(|_| image_data.clone());
-                        (decoded, width, height, bits_per_component, has_alpha)
+
+                        // Check if DCTDecode or JPXDecode is in the chain —
+                        // apply_filters skips these, so decode the image separately.
+                        let filter_names: Vec<&str> = match filter {
+                            PDFObject::Array(arr) => arr
+                                .iter()
+                                .filter_map(|f| match &**f {
+                                    PDFObject::Name(n) => Some(n.as_str()),
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+
+                        if filter_names.contains(&"DCTDecode") || filter_names.contains(&"DCT") {
+                            #[cfg(feature = "jpeg-decoding")]
+                            {
+                                match crate::core::image::ImageDecoder::decode_image(
+                                    &decoded,
+                                    crate::core::image::ImageFormat::JPEG,
+                                ) {
+                                    Ok(img) => (
+                                        img.data,
+                                        img.metadata.width,
+                                        img.metadata.height,
+                                        8,
+                                        img.metadata.has_alpha,
+                                    ),
+                                    Err(_) => {
+                                        (decoded, width, height, bits_per_component, has_alpha)
+                                    }
+                                }
+                            }
+                            #[cfg(not(feature = "jpeg-decoding"))]
+                            {
+                                (decoded, width, height, bits_per_component, has_alpha)
+                            }
+                        } else if filter_names.contains(&"JPXDecode") {
+                            #[cfg(feature = "advanced-image-formats")]
+                            {
+                                match decode_jpx(&decoded) {
+                                    Some((d, w, h, bpc, a)) => (d, w, h, bpc, a),
+                                    None => (decoded, width, height, bits_per_component, has_alpha),
+                                }
+                            }
+                            #[cfg(not(feature = "advanced-image-formats"))]
+                            {
+                                (decoded, width, height, bits_per_component, has_alpha)
+                            }
+                        } else {
+                            (decoded, width, height, bits_per_component, has_alpha)
+                        }
                     }
                     _ => (
                         image_data.clone(),
@@ -2521,14 +2573,24 @@ fn decode_jpx(data: &[u8]) -> Option<(Vec<u8>, u32, u32, u8, bool)> {
         target_resolution: None,
     };
     let image = hayro_jpeg2000::Image::new(data, &settings).ok()?;
+    let bpc = image.original_bit_depth();
+    let has_alpha = image.has_alpha();
     let decoded = image.decode().ok()?;
-    Some((
-        decoded,
-        image.width(),
-        image.height(),
-        image.original_bit_depth().max(8),
-        image.has_alpha(),
-    ))
+
+    // If 16-bit, downscale to 8-bit (draw_image only supports 8-bpc).
+    let decoded = if bpc > 8 {
+        decoded
+            .chunks_exact(2)
+            .map(|pair| {
+                // Big-endian 16-bit → 8-bit (take high byte).
+                pair[0]
+            })
+            .collect()
+    } else {
+        decoded
+    };
+
+    Some((decoded, image.width(), image.height(), 8, has_alpha))
 }
 
 #[cfg(feature = "advanced-image-formats")]
