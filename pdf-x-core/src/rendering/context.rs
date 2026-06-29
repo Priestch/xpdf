@@ -2161,16 +2161,11 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             color_space_name
         };
 
-        // Apply /Decode array inversion only for non-JPEG images.
-        // JPEG decoders handle colorspace conversion internally.
-        let is_jpeg = match xobject_dict.get("Filter") {
-            Some(PDFObject::Name(n)) => n == "DCTDecode" || n == "DCT",
-            Some(PDFObject::Array(arr)) => arr
-                .iter()
-                .any(|f| matches!(&**f, PDFObject::Name(n) if n == "DCTDecode" || n == "DCT")),
-            _ => false,
-        };
-        let decoded_data = if !is_jpeg {
+        // Apply /Decode array inversion for non-CMYK images.
+        // CMYK JPEGs: the JPEG decoder handles colorspace conversion internally,
+        // so the Decode array (used for Adobe CMYK inversion) should not be re-applied.
+        let is_cmyk = matches!(color_space_name, Some("DeviceCMYK"));
+        let decoded_data = if !is_cmyk {
             if let Some(PDFObject::Array(decode_arr)) = xobject_dict.get("Decode") {
                 apply_decode_inversion(&decoded_data, decode_arr, decoded_bpc)
             } else {
