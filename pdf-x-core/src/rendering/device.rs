@@ -71,6 +71,12 @@ pub struct ImageData {
     pub has_alpha: bool,
     /// Bits per component
     pub bits_per_component: u8,
+    /// Whether this is a 1-bpp image mask (stencil).
+    /// When true, a set bit (1) means paint with `mask_color`;
+    /// an unset bit (0) means transparent.
+    pub is_mask: bool,
+    /// Fill color for image masks (R, G, B in 0-255). Only used when is_mask.
+    pub mask_color: [u8; 3],
 }
 
 /// A device that can render PDF drawing operations.
@@ -175,6 +181,24 @@ pub trait Device {
         char_spacing: f64,
         word_spacing: f64,
     ) -> PDFResult<f64>;
+
+    /// Add the glyph outlines of a text run to the current clip path.
+    ///
+    /// Called for text rendering modes 4–7 (Clip variants) in addition to
+    /// (or instead of) `draw_text`. The parameters mirror `draw_text`.
+    /// Devices that don't support text clipping can no-op.
+    fn clip_text(
+        &mut self,
+        _text_bytes: &[u8],
+        _font_name: &str,
+        _font_size: f64,
+        _text_matrix: &[f64; 6],
+        _horizontal_scaling: f64,
+        _text_rise: f64,
+        _char_spacing: f64,
+        _word_spacing: f64,
+    ) {
+    }
 
     /// Draw an image.
     ///

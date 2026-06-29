@@ -521,7 +521,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             .clone()
             .unwrap_or_else(|| "Default".to_string());
         let font_size = state.font_size.unwrap_or(12.0);
-        let paint = text_paint_for_rendering_mode(state.text_rendering_mode, state.fill_color);
+        let rendering_mode = state.text_rendering_mode;
+        let paint = text_paint_for_rendering_mode(rendering_mode, state.fill_color);
         let text_matrix = state.text_matrix;
         let horizontal_scaling = state.text_horizontal_scaling;
         let text_rise = state.text_rise;
@@ -544,6 +545,20 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 character_spacing,
                 word_spacing,
             )?;
+
+            // For clip modes (4–7), add glyph outlines to the clip path.
+            if mode_clips(rendering_mode) {
+                self.device.clip_text(
+                    mapped_bytes.as_ref(),
+                    &font_name,
+                    font_size,
+                    &text_matrix,
+                    horizontal_scaling,
+                    text_rise,
+                    character_spacing,
+                    word_spacing,
+                );
+            }
 
             if is_text_trace_enabled() {
                 eprintln!(
@@ -582,7 +597,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             .clone()
             .unwrap_or_else(|| "Default".to_string());
         let font_size = state.font_size.unwrap_or(12.0);
-        let paint = text_paint_for_rendering_mode(state.text_rendering_mode, state.fill_color);
+        let rendering_mode = state.text_rendering_mode;
+        let paint = text_paint_for_rendering_mode(rendering_mode, state.fill_color);
         let horizontal_scaling = state.text_horizontal_scaling;
         let text_rise = state.text_rise;
         let character_spacing = state.character_spacing;
@@ -624,6 +640,20 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                             character_spacing,
                             word_spacing,
                         )?;
+
+                        // For clip modes (4–7), add glyph outlines to the clip path.
+                        if mode_clips(rendering_mode) {
+                            self.device.clip_text(
+                                mapped_bytes.as_ref(),
+                                &font_name,
+                                font_size,
+                                &text_matrix,
+                                horizontal_scaling,
+                                text_rise,
+                                character_spacing,
+                                word_spacing,
+                            );
+                        }
 
                         if is_text_trace_enabled() {
                             eprintln!(
@@ -1841,6 +1871,15 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             return Ok(());
         }
 
+        // Check for image mask (1-bpp stencil: 1 = paint with current fill color).
+        let is_image_mask = xobject_dict
+            .get("ImageMask")
+            .and_then(|v| match v {
+                PDFObject::Boolean(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
         // Extract image properties
         let width = match xobject_dict.get("Width") {
             Some(PDFObject::Number(w)) => *w as u32,
@@ -1852,9 +1891,13 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             _ => return Ok(()),
         };
 
-        let bits_per_component = match xobject_dict.get("BitsPerComponent") {
-            Some(PDFObject::Number(b)) => *b as u8,
-            _ => 8, // Default to 8
+        let bits_per_component = if is_image_mask {
+            1 // Image masks are always 1 bpc
+        } else {
+            match xobject_dict.get("BitsPerComponent") {
+                Some(PDFObject::Number(b)) => *b as u8,
+                _ => 8,
+            }
         };
 
         let color_space_name = match xobject_dict.get("ColorSpace") {
@@ -1985,6 +2028,22 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             data: decoded_data,
             has_alpha: decoded_has_alpha,
             bits_per_component: decoded_bpc,
+            is_mask: is_image_mask,
+            mask_color: {
+                let c = self.current_state().fill_color;
+                match c {
+                    crate::rendering::Color::Gray(v) => {
+                        let g = (v * 255.0).clamp(0.0, 255.0) as u8;
+                        [g, g, g]
+                    }
+                    crate::rendering::Color::RGB(r, g, b) => [
+                        (r * 255.0).clamp(0.0, 255.0) as u8,
+                        (g * 255.0).clamp(0.0, 255.0) as u8,
+                        (b * 255.0).clamp(0.0, 255.0) as u8,
+                    ],
+                    crate::rendering::Color::CMYK(_, _, _, _) => [0, 0, 0],
+                }
+            },
         };
 
         #[cfg(feature = "debug-logging")]
@@ -2248,6 +2307,18 @@ fn text_paint_for_rendering_mode(
         TextRenderingMode::Invisible | TextRenderingMode::Clip => Paint::Transparent,
         _ => Paint::from_color(fill_color),
     }
+}
+
+/// Whether the rendering mode requires adding glyph outlines to the clip path.
+fn mode_clips(mode: super::graphics_state::TextRenderingMode) -> bool {
+    use super::graphics_state::TextRenderingMode;
+    matches!(
+        mode,
+        TextRenderingMode::FillClip
+            | TextRenderingMode::StrokeClip
+            | TextRenderingMode::FillStrokeClip
+            | TextRenderingMode::Clip
+    )
 }
 
 /// Post-concatenate a translation matrix.

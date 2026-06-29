@@ -1409,184 +1409,215 @@ impl<'a> Device for SkiaDevice<'a> {
         // Convert image data to RGBA format if needed
         let pixel_count = (image.width * image.height) as usize;
 
-        let (data, has_alpha) = match (image.bits_per_component, image.data.len()) {
-            // Check for 1-bit black and white images first
-            (1, data_len)
-                if data_len >= ((image.width as usize * image.height as usize + 7) / 8) =>
-            {
-                #[cfg(feature = "debug-logging")]
-                eprintln!(
-                    "DEBUG: Detected 1-bpp image, {}x{}, {} bytes",
-                    image.width, image.height, data_len
-                );
+        // Image mask: 1-bpp stencil. Set bit = mask_color, unset = transparent.
+        let (data, has_alpha) = if image.is_mask {
+            let [fr, fg, fb] = image.mask_color;
+            // Check for inverted decode ([1 0] means 0=paint)
+            let inverted = false; // TODO: read Decode array
 
-                // Convert 1-bit to RGBA
-                let mut rgba = Vec::with_capacity(image.width as usize * image.height as usize * 4);
-                let mut bit_idx = 0;
-
-                for byte in image.data.iter() {
-                    for bit in (0..8).rev() {
-                        let pixel_is_set = (byte >> bit) & 1;
-                        let color_value = if pixel_is_set != 0 { 0 } else { 255 };
-
-                        rgba.push(color_value); // R
-                        rgba.push(color_value); // G
-                        rgba.push(color_value); // B
-                        rgba.push(255); // A
-
-                        bit_idx += 1;
-                        if bit_idx >= pixel_count {
-                            break;
-                        }
+            let mut rgba = Vec::with_capacity(pixel_count * 4);
+            let mut bit_idx = 0usize;
+            for &byte in &image.data {
+                for bit in (0..8).rev() {
+                    let set = ((byte >> bit) & 1) != 0;
+                    let paint = if inverted { !set } else { set };
+                    if paint {
+                        rgba.extend_from_slice(&[fr, fg, fb, 255]);
+                    } else {
+                        rgba.extend_from_slice(&[0, 0, 0, 0]);
                     }
+                    bit_idx += 1;
                     if bit_idx >= pixel_count {
                         break;
                     }
                 }
-
-                (rgba, false)
+                if bit_idx >= pixel_count {
+                    break;
+                }
             }
-            // Already RGBA (8 bpc, 4 channels, has_alpha flag set)
-            // Check this FIRST to avoid confusing RGBA with CMYK (both have 4 channels)
-            (8, _) if image.has_alpha && image.data.len() >= pixel_count * 4 => {
-                (image.data.clone(), true)
-            }
+            (rgba, true)
+        } else {
+            match (image.bits_per_component, image.data.len()) {
+                // Check for 1-bit black and white images first
+                (1, data_len)
+                    if data_len >= ((image.width as usize * image.height as usize + 7) / 8) =>
+                {
+                    #[cfg(feature = "debug-logging")]
+                    eprintln!(
+                        "DEBUG: Detected 1-bpp image, {}x{}, {} bytes",
+                        image.width, image.height, data_len
+                    );
 
-            // CMYK to RGBA conversion (8 bpc, 4 channels per pixel)
-            // Must check this BEFORE RGB (3 channels) since CMYK also has data_len >= pixel_count * 3
-            // Must check AFTER RGBA to avoid treating RGBA as CMYK
-            // Reference: pdf.js/src/core/colorspace.js - DeviceCmykCS.#toRgb
-            // Uses polynomial coefficients derived from US Web Coated (SWOP) colorspace
-            (8, data_len) if !image.has_alpha && data_len >= pixel_count * 4 => {
-                let mut rgba = Vec::with_capacity(pixel_count * 4);
-                for chunk in image.data.chunks(4).take(pixel_count) {
-                    if chunk.len() == 4 {
-                        // CMYK values are 0-255, need to normalize to 0-1 for the formula
-                        // PDF.js uses srcScale parameter to normalize, we do it directly
-                        let c = (chunk[0] as f32) / 255.0;
-                        let m = (chunk[1] as f32) / 255.0;
-                        let y = (chunk[2] as f32) / 255.0;
-                        let k = (chunk[3] as f32) / 255.0;
+                    // Convert 1-bit to RGBA
+                    let mut rgba =
+                        Vec::with_capacity(image.width as usize * image.height as usize * 4);
+                    let mut bit_idx = 0;
 
-                        // CMYK to RGB conversion using PDF.js polynomial coefficients
-                        // Derived from numerical analysis of US Web Coated (SWOP) colorspace
-                        let r = 255.0
-                            + c * (-4.387332384609988 * c
-                                + 54.48615194189176 * m
-                                + 18.82290502165302 * y
-                                + 212.25662451639585 * k
-                                - 285.2331026137004)
-                            + m * (1.7149763477362134 * m
-                                - 5.6096736904047315 * y
-                                - 17.873870861415444 * k
-                                - 5.497006427196366)
-                            + y * (-2.5217340131683033 * y - 21.248923337353073 * k
-                                + 17.5119270841813)
-                            + k * (-21.86122147463605 * k - 189.48180835922747);
+                    for byte in image.data.iter() {
+                        for bit in (0..8).rev() {
+                            let pixel_is_set = (byte >> bit) & 1;
+                            let color_value = if pixel_is_set != 0 { 0 } else { 255 };
 
-                        let g = 255.0
-                            + c * (8.841041422036149 * c
-                                + 60.118027045597366 * m
-                                + 6.871425592049007 * y
-                                + 31.159100130055922 * k
-                                - 79.2970844816548)
-                            + m * (-15.310361306967817 * m
-                                + 17.575251261109482 * y
-                                + 131.35250912493976 * k
-                                - 190.9453302588951)
-                            + y * (4.444339102852739 * y + 9.8632861493405 * k - 24.86741582555878)
-                            + k * (-20.737325471181034 * k - 187.80453709719578);
+                            rgba.push(color_value); // R
+                            rgba.push(color_value); // G
+                            rgba.push(color_value); // B
+                            rgba.push(255); // A
 
-                        let b = 255.0
-                            + c * (0.8842522430003296 * c
-                                + 8.078677503112928 * m
-                                + 30.89978309703729 * y
-                                - 0.23883238689178934 * k
-                                - 14.183576799673286)
-                            + m * (10.49593273432072 * m
-                                + 63.02378494754052 * y
-                                + 50.606957656360734 * k
-                                - 112.23884253719248)
-                            + y * (0.03296041114873217 * y + 115.60384449646641 * k
-                                - 193.58209356861505)
-                            + k * (-22.33816807309886 * k - 180.12613974708367);
+                            bit_idx += 1;
+                            if bit_idx >= pixel_count {
+                                break;
+                            }
+                        }
+                        if bit_idx >= pixel_count {
+                            break;
+                        }
+                    }
 
-                        rgba.push(r.clamp(0.0, 255.0) as u8);
-                        rgba.push(g.clamp(0.0, 255.0) as u8);
-                        rgba.push(b.clamp(0.0, 255.0) as u8);
+                    (rgba, false)
+                }
+                // Already RGBA (8 bpc, 4 channels, has_alpha flag set)
+                // Check this FIRST to avoid confusing RGBA with CMYK (both have 4 channels)
+                (8, _) if image.has_alpha && image.data.len() >= pixel_count * 4 => {
+                    (image.data.clone(), true)
+                }
+
+                // CMYK to RGBA conversion (8 bpc, 4 channels per pixel)
+                // Must check this BEFORE RGB (3 channels) since CMYK also has data_len >= pixel_count * 3
+                // Must check AFTER RGBA to avoid treating RGBA as CMYK
+                // Reference: pdf.js/src/core/colorspace.js - DeviceCmykCS.#toRgb
+                // Uses polynomial coefficients derived from US Web Coated (SWOP) colorspace
+                (8, data_len) if !image.has_alpha && data_len >= pixel_count * 4 => {
+                    let mut rgba = Vec::with_capacity(pixel_count * 4);
+                    for chunk in image.data.chunks(4).take(pixel_count) {
+                        if chunk.len() == 4 {
+                            // CMYK values are 0-255, need to normalize to 0-1 for the formula
+                            // PDF.js uses srcScale parameter to normalize, we do it directly
+                            let c = (chunk[0] as f32) / 255.0;
+                            let m = (chunk[1] as f32) / 255.0;
+                            let y = (chunk[2] as f32) / 255.0;
+                            let k = (chunk[3] as f32) / 255.0;
+
+                            // CMYK to RGB conversion using PDF.js polynomial coefficients
+                            // Derived from numerical analysis of US Web Coated (SWOP) colorspace
+                            let r = 255.0
+                                + c * (-4.387332384609988 * c
+                                    + 54.48615194189176 * m
+                                    + 18.82290502165302 * y
+                                    + 212.25662451639585 * k
+                                    - 285.2331026137004)
+                                + m * (1.7149763477362134 * m
+                                    - 5.6096736904047315 * y
+                                    - 17.873870861415444 * k
+                                    - 5.497006427196366)
+                                + y * (-2.5217340131683033 * y - 21.248923337353073 * k
+                                    + 17.5119270841813)
+                                + k * (-21.86122147463605 * k - 189.48180835922747);
+
+                            let g = 255.0
+                                + c * (8.841041422036149 * c
+                                    + 60.118027045597366 * m
+                                    + 6.871425592049007 * y
+                                    + 31.159100130055922 * k
+                                    - 79.2970844816548)
+                                + m * (-15.310361306967817 * m
+                                    + 17.575251261109482 * y
+                                    + 131.35250912493976 * k
+                                    - 190.9453302588951)
+                                + y * (4.444339102852739 * y + 9.8632861493405 * k
+                                    - 24.86741582555878)
+                                + k * (-20.737325471181034 * k - 187.80453709719578);
+
+                            let b = 255.0
+                                + c * (0.8842522430003296 * c
+                                    + 8.078677503112928 * m
+                                    + 30.89978309703729 * y
+                                    - 0.23883238689178934 * k
+                                    - 14.183576799673286)
+                                + m * (10.49593273432072 * m
+                                    + 63.02378494754052 * y
+                                    + 50.606957656360734 * k
+                                    - 112.23884253719248)
+                                + y * (0.03296041114873217 * y + 115.60384449646641 * k
+                                    - 193.58209356861505)
+                                + k * (-22.33816807309886 * k - 180.12613974708367);
+
+                            rgba.push(r.clamp(0.0, 255.0) as u8);
+                            rgba.push(g.clamp(0.0, 255.0) as u8);
+                            rgba.push(b.clamp(0.0, 255.0) as u8);
+                            rgba.push(255); // A (opaque)
+                        }
+                    }
+                    (rgba, true)
+                }
+
+                // RGB to RGBA conversion (8 bpc, 3 channels per pixel)
+                (8, data_len) if data_len >= pixel_count * 3 => {
+                    let mut rgba = Vec::with_capacity(pixel_count * 4);
+                    for chunk in image.data.chunks(3).take(pixel_count) {
+                        if chunk.len() == 3 {
+                            rgba.push(chunk[0]); // R
+                            rgba.push(chunk[1]); // G
+                            rgba.push(chunk[2]); // B
+                            rgba.push(255); // A (opaque)
+                        }
+                    }
+                    (rgba, true)
+                }
+
+                // Grayscale to RGBA conversion (8 bpc, 1 channel per pixel)
+                (8, data_len) if data_len >= pixel_count => {
+                    let mut rgba = Vec::with_capacity(pixel_count * 4);
+                    for &gray in image.data.iter().take(pixel_count) {
+                        rgba.push(gray); // R = gray
+                        rgba.push(gray); // G = gray
+                        rgba.push(gray); // B = gray
                         rgba.push(255); // A (opaque)
                     }
+                    (rgba, true)
                 }
-                (rgba, true)
-            }
 
-            // RGB to RGBA conversion (8 bpc, 3 channels per pixel)
-            (8, data_len) if data_len >= pixel_count * 3 => {
-                let mut rgba = Vec::with_capacity(pixel_count * 4);
-                for chunk in image.data.chunks(3).take(pixel_count) {
-                    if chunk.len() == 3 {
-                        rgba.push(chunk[0]); // R
-                        rgba.push(chunk[1]); // G
-                        rgba.push(chunk[2]); // B
-                        rgba.push(255); // A (opaque)
-                    }
-                }
-                (rgba, true)
-            }
-
-            // Grayscale to RGBA conversion (8 bpc, 1 channel per pixel)
-            (8, data_len) if data_len >= pixel_count => {
-                let mut rgba = Vec::with_capacity(pixel_count * 4);
-                for &gray in image.data.iter().take(pixel_count) {
-                    rgba.push(gray); // R = gray
-                    rgba.push(gray); // G = gray
-                    rgba.push(gray); // B = gray
-                    rgba.push(255); // A (opaque)
-                }
-                (rgba, true)
-            }
-
-            // Grayscale to RGBA conversion (4 bpc, 1 channel per pixel)
-            // Each byte contains 2 pixels (high nibble = first pixel, low nibble = second pixel)
-            (4, data_len) if data_len >= (pixel_count / 2 + pixel_count % 2) => {
-                let mut rgba = Vec::with_capacity(pixel_count * 4);
-                for &byte in image.data.iter() {
-                    // High nibble (first pixel)
-                    let high = (byte >> 4) * 17; // Scale 4-bit (0-15) to 8-bit (0-255)
-                    rgba.push(high);
-                    rgba.push(high);
-                    rgba.push(high);
-                    rgba.push(255);
-
-                    // Low nibble (second pixel) - only if we need more pixels
-                    if rgba.len() < pixel_count * 4 {
-                        let low = (byte & 0x0F) * 17; // Scale 4-bit (0-15) to 8-bit (0-255)
-                        rgba.push(low);
-                        rgba.push(low);
-                        rgba.push(low);
+                // Grayscale to RGBA conversion (4 bpc, 1 channel per pixel)
+                // Each byte contains 2 pixels (high nibble = first pixel, low nibble = second pixel)
+                (4, data_len) if data_len >= (pixel_count / 2 + pixel_count % 2) => {
+                    let mut rgba = Vec::with_capacity(pixel_count * 4);
+                    for &byte in image.data.iter() {
+                        // High nibble (first pixel)
+                        let high = (byte >> 4) * 17; // Scale 4-bit (0-15) to 8-bit (0-255)
+                        rgba.push(high);
+                        rgba.push(high);
+                        rgba.push(high);
                         rgba.push(255);
-                    } else {
-                        // We have all the pixels we need
-                        break;
-                    }
-                }
-                // Tiny-skia's Pixmap::from_vec requires capacity == length
-                rgba.shrink_to_fit();
-                (rgba, true)
-            }
 
-            _ => {
-                eprintln!(
-                    "WARNING: Unsupported image format - has_alpha={}, bits={}, data_len={}, pixel_count={}",
-                    image.has_alpha,
-                    image.bits_per_component,
-                    image.data.len(),
-                    pixel_count
-                );
-                // For now, skip unsupported formats
-                return Ok(());
+                        // Low nibble (second pixel) - only if we need more pixels
+                        if rgba.len() < pixel_count * 4 {
+                            let low = (byte & 0x0F) * 17; // Scale 4-bit (0-15) to 8-bit (0-255)
+                            rgba.push(low);
+                            rgba.push(low);
+                            rgba.push(low);
+                            rgba.push(255);
+                        } else {
+                            // We have all the pixels we need
+                            break;
+                        }
+                    }
+                    // Tiny-skia's Pixmap::from_vec requires capacity == length
+                    rgba.shrink_to_fit();
+                    (rgba, true)
+                }
+
+                _ => {
+                    eprintln!(
+                        "WARNING: Unsupported image format - has_alpha={}, bits={}, data_len={}, pixel_count={}",
+                        image.has_alpha,
+                        image.bits_per_component,
+                        image.data.len(),
+                        pixel_count
+                    );
+                    // For now, skip unsupported formats
+                    return Ok(());
+                }
             }
-        };
+        }; // end match + else
 
         let int_size = tiny_skia::IntSize::from_wh(image.width, image.height)
             .ok_or(PDFError::Generic("Failed to create IntSize".into()))?;
@@ -1743,4 +1774,111 @@ impl<'a> Device for SkiaDevice<'a> {
     fn has_font(&self, name: &str) -> bool {
         self.font_cache.contains_key(name)
     }
+
+    fn clip_text(
+        &mut self,
+        text_bytes: &[u8],
+        font_name: &str,
+        font_size: f64,
+        text_matrix: &[f64; 6],
+        horizontal_scaling: f64,
+        text_rise: f64,
+        char_spacing: f64,
+        word_spacing: f64,
+    ) {
+        // Only Type1 fonts support text clipping (TrueType path would need
+        // separate outline extraction). Silently skip for unsupported fonts.
+        let is_type1 = self.font_cache.get(font_name).is_some_and(|f| f.is_type1());
+        if !is_type1 {
+            return;
+        }
+
+        // Build the glyph path — same logic as draw_text's Type1 branch but
+        // without painting; just collect outlines into one PathBuilder.
+        let (type1_font, pdf_widths) = {
+            let font = self.font_cache.get(font_name).unwrap();
+            (font.type1_font().unwrap().clone(), font.pdf_widths.clone())
+        };
+
+        let units_per_em = 1000.0f32;
+        let spacing_to_font_units = if font_size.abs() > f64::EPSILON {
+            units_per_em as f64 / font_size
+        } else {
+            0.0
+        };
+
+        let mut text_path = PathBuilder::new();
+        let mut current_x = 0.0f32;
+
+        for &byte in text_bytes {
+            let ch = char::from(byte);
+            let glyph_width = pdf_widths
+                .as_ref()
+                .map(|w| w[byte as usize])
+                .unwrap_or(type1_font.glyph_width(ch) as f32);
+            let mut spacing_user = char_spacing;
+            if byte == b' ' {
+                spacing_user += word_spacing;
+            }
+            let spacing_font = (spacing_user * spacing_to_font_units) as f32;
+
+            // Use cached glyph outline
+            if let Some(glyph_path) = self
+                .font_cache
+                .get_mut(font_name)
+                .unwrap()
+                .cached_glyph_path(byte)
+            {
+                let transform = Transform::from_row(1.0, 0.0, 0.0, 1.0, current_x, 0.0);
+                if let Some(t) = glyph_path.transform(transform) {
+                    text_path.push_path(&t);
+                }
+            }
+
+            current_x += glyph_width + spacing_font;
+        }
+
+        // Create a mask from the text path and intersect with existing clip.
+        if let Some(path) = text_path.finish() {
+            let full_text = compose_text_transform(
+                text_matrix,
+                font_size,
+                horizontal_scaling,
+                text_rise,
+                units_per_em,
+            );
+            let ctm = self.current_state().transform;
+            let final_transform = full_text.post_concat(ctm);
+
+            if let Some(mut mask) = Mask::new(self.pixmap.width(), self.pixmap.height()) {
+                mask.fill_path(&path, SkiaFillRule::Winding, false, final_transform);
+
+                // Intersect with existing clip mask
+                if let Some(existing) = &self.current_state().clip_mask {
+                    if let Some(merged) = intersect_masks(existing, &mask) {
+                        self.current_state_mut().clip_mask = Some(merged);
+                    }
+                } else {
+                    self.current_state_mut().clip_mask = Some(mask);
+                }
+            }
+        }
+    }
+}
+
+/// Intersect two masks (AND operation). Returns None if dimensions don't match.
+fn intersect_masks(a: &Mask, b: &Mask) -> Option<Mask> {
+    // Masks are 8-bit alpha. Intersect = min(a, b) per pixel.
+    let a_data = a.data();
+    let b_data = b.data();
+    if a_data.len() != b_data.len() || a.width() != b.width() || a.height() != b.height() {
+        return None;
+    }
+    let merged: Vec<u8> = a_data
+        .iter()
+        .zip(b_data.iter())
+        .map(|(&x, &y)| x.min(y))
+        .collect();
+    let size = tiny_skia::IntSize::from_wh(a.width(), a.height())?;
+    Mask::from_vec(merged, size)
 }

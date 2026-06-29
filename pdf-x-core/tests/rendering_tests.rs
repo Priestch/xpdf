@@ -488,6 +488,9 @@ fn test_draw_image() {
         data: pixel_data,
         has_alpha: true,
         bits_per_component: 8,
+        is_mask: false,
+        mask_color: [0, 0, 0],
+        is_mask: false,
     };
 
     let transform = [10.0, 0.0, 0.0, 10.0, 0.0, 0.0];

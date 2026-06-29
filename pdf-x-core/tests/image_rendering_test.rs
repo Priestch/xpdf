@@ -34,6 +34,9 @@ fn test_render_rgb_image() {
         data: image_data,
         has_alpha: false,
         bits_per_component: 8,
+        is_mask: false,
+        mask_color: [0, 0, 0],
+        is_mask: false,
     };
 
     // Draw at (10, 10) with 1x scale (no scaling, just translation)
@@ -109,6 +112,9 @@ fn test_render_cmyk_image() {
         data: image_data,
         has_alpha: false,
         bits_per_component: 8,
+        is_mask: false,
+        mask_color: [0, 0, 0],
+        is_mask: false,
     };
 
     // Draw at (10, 10) with 1x scale (no scaling, just translation)
@@ -162,6 +168,9 @@ fn test_render_grayscale_image() {
         data: image_data,
         has_alpha: false,
         bits_per_component: 8,
+        is_mask: false,
+        mask_color: [0, 0, 0],
+        is_mask: false,
     };
 
     // Draw at (10, 10) with 1x scale (no scaling, just translation)
@@ -329,6 +338,9 @@ fn test_image_with_identity_transform() {
         data: image_data,
         has_alpha: false,
         bits_per_component: 8,
+        is_mask: false,
+        mask_color: [0, 0, 0],
+        is_mask: false,
     };
 
     // Draw at (50, 50) with identity transform
@@ -368,6 +380,9 @@ fn test_rgba_image_passthrough() {
         data: image_data,
         has_alpha: true,
         bits_per_component: 8,
+        is_mask: false,
+        mask_color: [0, 0, 0],
+        is_mask: false,
     };
 
     // Draw at (10, 10) with 1x scale (no scaling, just translation)
