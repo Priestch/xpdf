@@ -1953,55 +1953,12 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                             }
                         }
                     }
-                    PDFObject::Array(filters) => {
-                        // TODO: Handle multiple filters (apply in order)
-                        use crate::core::decode;
-                        // For now, try to apply the first filter if it's FlateDecode
-                        if !filters.is_empty() {
-                            match filters.get(0) {
-                                Some(filter_obj) => match filter_obj.as_ref() {
-                                    PDFObject::Name(filter_name) => match filter_name.as_str() {
-                                        "FlateDecode" | "Fl" => (
-                                            decode::decode_flate(image_data)
-                                                .unwrap_or_else(|_| image_data.clone()),
-                                            width,
-                                            height,
-                                            bits_per_component,
-                                            has_alpha,
-                                        ),
-                                        _ => (
-                                            image_data.clone(),
-                                            width,
-                                            height,
-                                            bits_per_component,
-                                            has_alpha,
-                                        ),
-                                    },
-                                    _ => (
-                                        image_data.clone(),
-                                        width,
-                                        height,
-                                        bits_per_component,
-                                        has_alpha,
-                                    ),
-                                },
-                                None => (
-                                    image_data.clone(),
-                                    width,
-                                    height,
-                                    bits_per_component,
-                                    has_alpha,
-                                ),
-                            }
-                        } else {
-                            (
-                                image_data.clone(),
-                                width,
-                                height,
-                                bits_per_component,
-                                has_alpha,
-                            )
-                        }
+                    PDFObject::Array(_) => {
+                        // Apply all filters in order using apply_filters.
+                        let filter = xobject_dict.get("Filter").unwrap();
+                        let decoded = crate::core::decode::apply_filters(image_data, filter)
+                            .unwrap_or_else(|_| image_data.clone());
+                        (decoded, width, height, bits_per_component, has_alpha)
                     }
                     _ => (
                         image_data.clone(),

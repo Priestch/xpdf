@@ -410,7 +410,7 @@ pub fn apply_filters(data: &[u8], filters: &PDFObject) -> PDFResult<Vec<u8>> {
 
     // Apply filters in REVERSE order (last filter first)
     let mut current_data = data.to_vec();
-    for filter_name in filter_list.iter().rev() {
+    for filter_name in filter_list.iter() {
         #[cfg(feature = "debug-logging")]
         eprintln!("DEBUG: Applying filter: {}", filter_name);
         current_data = apply_filter(&current_data, filter_name)
@@ -565,9 +565,10 @@ mod tests {
         let hex_encoded = hex_string.as_bytes();
 
         // Now decode using multi-filter
+        // Filters: [ASCIIHexDecode, FlateDecode] — forward order per spec
         let filters = PDFObject::Array(smallvec::smallvec![
-            Box::new(PDFObject::Name("FlateDecode".into())),
             Box::new(PDFObject::Name("ASCIIHexDecode".into())),
+            Box::new(PDFObject::Name("FlateDecode".into())),
         ]);
 
         let decoded = apply_filters(hex_encoded, &filters).unwrap();
@@ -581,7 +582,7 @@ mod tests {
         use flate2::write::ZlibEncoder;
         use std::io::Write;
 
-        // Test that filters are applied in LAST-to-FIRST order
+        // Test that filters are applied in FIRST-to-LAST order (spec forward)
         let original = b"Test data";
 
         // Compress
@@ -593,11 +594,11 @@ mod tests {
         let hex_string = hex::encode_upper(&compressed);
         let hex_encoded = hex_string.as_bytes();
 
-        // Filters array: [/FlateDecode /ASCIIHexDecode]
-        // Should apply ASCIIHex FIRST, then Flate
+        // Filters array: [/ASCIIHexDecode /FlateDecode]
+        // Apply ASCIIHex FIRST, then Flate (spec: forward order)
         let filters = PDFObject::Array(smallvec::smallvec![
-            Box::new(PDFObject::Name("FlateDecode".into())),
             Box::new(PDFObject::Name("ASCIIHexDecode".into())),
+            Box::new(PDFObject::Name("FlateDecode".into())),
         ]);
 
         let decoded = apply_filters(hex_encoded, &filters).unwrap();
