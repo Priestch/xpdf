@@ -28,7 +28,7 @@ def render_mutool(pdf_path, page, dpi=72):
         out = f.name
     try:
         r = subprocess.run(
-            ["mutool", "draw", "-o", out, "-F", "pnm", "-r", str(dpi),
+            ["mutool", "draw", "-o", out, "-F", "ppm", "-r", str(dpi),
              pdf_path, str(page + 1)],
             capture_output=True
         )
