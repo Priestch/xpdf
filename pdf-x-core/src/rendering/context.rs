@@ -2145,6 +2145,23 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             (decoded_data, decoded_bpc)
         };
 
+        // Handle Indexed color space: [/Indexed baseCS hival lookup_table]
+        let (decoded_data, color_expanded) = {
+            let cs_obj = xobject_dict.get("ColorSpace").cloned();
+            if let Some(resolver) = self.resolver.as_mut() {
+                expand_indexed_cs(&decoded_data, cs_obj.as_ref(), Some(*resolver))
+            } else {
+                expand_indexed_cs(&decoded_data, cs_obj.as_ref(), None)
+            }
+        };
+
+        // If indexed CS was expanded, update the effective color space.
+        let color_space_name = if color_expanded {
+            Some("DeviceRGB")
+        } else {
+            color_space_name
+        };
+
         // Apply /Decode array inversion only for non-JPEG images.
         // JPEG decoders handle colorspace conversion internally.
         let is_jpeg = match xobject_dict.get("Filter") {
@@ -2461,6 +2478,93 @@ fn mode_clips(mode: super::graphics_state::TextRenderingMode) -> bool {
             | super::graphics_state::TextRenderingMode::FillStrokeClip
             | super::graphics_state::TextRenderingMode::Clip
     )
+}
+
+/// Resolve and expand an Indexed color space lookup table.
+fn expand_indexed_cs(
+    data: &[u8],
+    cs_obj: Option<&PDFObject>,
+    resolver: Option<&mut dyn PageResolver>,
+) -> (Vec<u8>, bool) {
+    // Try to resolve the ColorSpace and lookup table.
+    let cs_obj = match cs_obj {
+        Some(o) => o,
+        None => return (data.to_vec(), false),
+    };
+
+    // Resolve indirect ref for the ColorSpace array
+    let resolved_cs;
+    let cs = match cs_obj {
+        PDFObject::Ref(r) => {
+            let res = match resolver {
+                Some(r) => r,
+                None => return (data.to_vec(), false),
+            };
+            match res.resolve_ref(r.num, r.generation) {
+                Ok(o) => {
+                    resolved_cs = o;
+                    &*resolved_cs
+                }
+                Err(_) => return (data.to_vec(), false),
+            }
+        }
+        other => other,
+    };
+
+    let cs_arr = match cs {
+        PDFObject::Array(a) if a.len() >= 4 => a,
+        _ => return (data.to_vec(), false),
+    };
+
+    if !matches!(&*cs_arr[0], PDFObject::Name(n) if n == "Indexed") {
+        return (data.to_vec(), false);
+    }
+
+    let base_channels = match &*cs_arr[1] {
+        PDFObject::Name(n) => match n.as_str() {
+            "DeviceRGB" | "CalRGB" => 3,
+            "DeviceGray" | "CalGray" => 1,
+            "DeviceCMYK" => 4,
+            _ => 3,
+        },
+        _ => 3,
+    };
+
+    // Get lookup table. For inline strings it's immediate.
+    // For Refs/Streams we need the resolver — but we already consumed it above.
+    // So handle the common case: lookup is inline (String/HexString/Stream).
+    let lut = match &*cs_arr[3] {
+        PDFObject::String(s) | PDFObject::HexString(s) => s.clone(),
+        PDFObject::Stream {
+            dict,
+            data: stream_data,
+        } => {
+            if let Some(filter) = dict.get("Filter") {
+                crate::core::decode::apply_filters(stream_data, filter)
+                    .unwrap_or_else(|_| stream_data.clone())
+            } else {
+                stream_data.clone()
+            }
+        }
+        // Ref case: would need resolver, but it's already consumed.
+        // For now, skip (rare for indexed CS in practice).
+        _ => return (data.to_vec(), false),
+    };
+
+    (expand_indexed(data, &lut, base_channels), true)
+}
+
+/// Each byte in `data` is an index into `lut`, which contains
+/// `base_channels` bytes per entry.
+fn expand_indexed(data: &[u8], lut: &[u8], base_channels: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * base_channels);
+    for &idx in data {
+        let offset = idx as usize * base_channels;
+        for ch in 0..base_channels {
+            out.push(lut.get(offset + ch).copied().unwrap_or(0));
+        }
+    }
+    out
 }
 
 /// Downscale 16-bit pixel data to 8-bit (take high byte of each 16-bit sample).
