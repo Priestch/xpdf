@@ -2148,11 +2148,10 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         // Handle Indexed color space: [/Indexed baseCS hival lookup_table]
         let (decoded_data, color_expanded) = {
             let cs_obj = xobject_dict.get("ColorSpace").cloned();
-            if let Some(resolver) = self.resolver.as_mut() {
-                expand_indexed_cs(&decoded_data, cs_obj.as_ref(), Some(*resolver))
-            } else {
-                expand_indexed_cs(&decoded_data, cs_obj.as_ref(), None)
-            }
+            let mut resolver = self.resolver.take();
+            let result = expand_indexed_cs(&decoded_data, cs_obj.as_ref(), &mut resolver);
+            self.resolver = resolver;
+            result
         };
 
         // If indexed CS was expanded, update the effective color space.
@@ -2484,7 +2483,7 @@ fn mode_clips(mode: super::graphics_state::TextRenderingMode) -> bool {
 fn expand_indexed_cs(
     data: &[u8],
     cs_obj: Option<&PDFObject>,
-    resolver: Option<&mut dyn PageResolver>,
+    resolver: &mut Option<&mut dyn PageResolver>,
 ) -> (Vec<u8>, bool) {
     // Try to resolve the ColorSpace and lookup table.
     let cs_obj = match cs_obj {
@@ -2496,7 +2495,7 @@ fn expand_indexed_cs(
     let resolved_cs;
     let cs = match cs_obj {
         PDFObject::Ref(r) => {
-            let res = match resolver {
+            let res = match resolver.as_mut() {
                 Some(r) => r,
                 None => return (data.to_vec(), false),
             };
@@ -2530,9 +2529,7 @@ fn expand_indexed_cs(
         _ => 3,
     };
 
-    // Get lookup table. For inline strings it's immediate.
-    // For Refs/Streams we need the resolver — but we already consumed it above.
-    // So handle the common case: lookup is inline (String/HexString/Stream).
+    // Get lookup table (inline String/HexString/Stream or Ref).
     let lut = match &*cs_arr[3] {
         PDFObject::String(s) | PDFObject::HexString(s) => s.clone(),
         PDFObject::Stream {
@@ -2546,8 +2543,31 @@ fn expand_indexed_cs(
                 stream_data.clone()
             }
         }
-        // Ref case: would need resolver, but it's already consumed.
-        // For now, skip (rare for indexed CS in practice).
+        PDFObject::Ref(r) => {
+            // Resolve the lookup table reference.
+            let res = match resolver.as_mut() {
+                Some(r) => r,
+                None => return (data.to_vec(), false),
+            };
+            match res.resolve_ref(r.num, r.generation) {
+                Ok(fetched) => match &*fetched {
+                    PDFObject::String(s) | PDFObject::HexString(s) => s.clone(),
+                    PDFObject::Stream {
+                        dict,
+                        data: stream_data,
+                    } => {
+                        if let Some(filter) = dict.get("Filter") {
+                            crate::core::decode::apply_filters(stream_data, filter)
+                                .unwrap_or_else(|_| stream_data.clone())
+                        } else {
+                            stream_data.clone()
+                        }
+                    }
+                    _ => return (data.to_vec(), false),
+                },
+                Err(_) => return (data.to_vec(), false),
+            }
+        }
         _ => return (data.to_vec(), false),
     };
 
