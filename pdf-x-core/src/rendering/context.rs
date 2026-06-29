@@ -2186,6 +2186,29 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             color_space_name
         };
 
+        // Handle Lab color space: convert L*a*b* → sRGB.
+        let (decoded_data, color_space_name) =
+            if let Some(PDFObject::Array(cs_arr)) = xobject_dict.get("ColorSpace") {
+                if cs_arr.len() >= 2 {
+                    if let PDFObject::Name(n) = &*cs_arr[0] {
+                        if n == "Lab" {
+                            // Parse Lab parameters
+                            let (xw, yw, zw, amin, amax, bmin, bmax) = parse_lab_params(&cs_arr);
+                            let rgb = lab_to_rgb(&decoded_data, xw, yw, zw, amin, amax, bmin, bmax);
+                            (rgb, Some("DeviceRGB"))
+                        } else {
+                            (decoded_data, color_space_name)
+                        }
+                    } else {
+                        (decoded_data, color_space_name)
+                    }
+                } else {
+                    (decoded_data, color_space_name)
+                }
+            } else {
+                (decoded_data, color_space_name)
+            };
+
         // Apply /Decode array inversion for non-CMYK images.
         // CMYK JPEGs: the JPEG decoder handles colorspace conversion internally,
         // so the Decode array (used for Adobe CMYK inversion) should not be re-applied.
@@ -2636,6 +2659,114 @@ fn apply_predictor_from_parms(
         _ => default_columns as usize,
     };
     crate::core::decode::decode_png_predictor(&data, colors, bpc, cols).unwrap_or(data)
+}
+
+/// Parse Lab color space parameters from the CS array.
+fn parse_lab_params(cs_arr: &[Box<PDFObject>]) -> (f64, f64, f64, f64, f64, f64, f64) {
+    let mut xw = 1.0;
+    let mut yw = 1.0;
+    let mut zw = 1.0;
+    let mut amin = -100.0;
+    let mut amax = 100.0;
+    let mut bmin = -100.0;
+    let mut bmax = 100.0;
+
+    if cs_arr.len() >= 2 {
+        if let PDFObject::Dictionary(d) = &*cs_arr[1] {
+            if let Some(PDFObject::Array(wp)) = d.get("WhitePoint") {
+                if wp.len() >= 3 {
+                    if let (PDFObject::Number(x), PDFObject::Number(y), PDFObject::Number(z)) =
+                        (&*wp[0], &*wp[1], &*wp[2])
+                    {
+                        xw = *x;
+                        yw = *y;
+                        zw = *z;
+                    }
+                }
+            }
+            if let Some(PDFObject::Array(range)) = d.get("Range") {
+                if range.len() >= 4 {
+                    if let (
+                        PDFObject::Number(a0),
+                        PDFObject::Number(a1),
+                        PDFObject::Number(b0),
+                        PDFObject::Number(b1),
+                    ) = (&*range[0], &*range[1], &*range[2], &*range[3])
+                    {
+                        amin = *a0;
+                        amax = *a1;
+                        bmin = *b0;
+                        bmax = *b1;
+                    }
+                }
+            }
+        }
+    }
+    (xw, yw, zw, amin, amax, bmin, bmax)
+}
+
+/// Convert Lab pixel data to RGB. Reference: pdf.js/src/core/colorspace.js — LabCS.#toRgb
+fn lab_to_rgb(
+    data: &[u8],
+    xw: f64,
+    yw: f64,
+    zw: f64,
+    amin: f64,
+    amax: f64,
+    bmin: f64,
+    bmax: f64,
+) -> Vec<u8> {
+    let fn_g = |x: f64| -> f64 {
+        if x >= 6.0 / 29.0 {
+            x * x * x
+        } else {
+            (108.0 / 841.0) * (x - 4.0 / 29.0)
+        }
+    };
+
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks(3) {
+        if chunk.len() < 3 {
+            out.extend_from_slice(chunk);
+            continue;
+        }
+        // Decode from 0-255 to Lab ranges
+        let l_star = chunk[0] as f64 * 100.0 / 255.0;
+        let a_star = amin + chunk[1] as f64 * (amax - amin) / 255.0;
+        let b_star = bmin + chunk[2] as f64 * (bmax - bmin) / 255.0;
+
+        // Lab → XYZ
+        let m = (l_star + 16.0) / 116.0;
+        let l = m + a_star / 500.0;
+        let n = m - b_star / 200.0;
+
+        let x = xw * fn_g(l);
+        let y = yw * fn_g(m);
+        let z = zw * fn_g(n);
+
+        // XYZ → sRGB (use D65 if ZW >= 1, D50 otherwise)
+        let (r, g, b) = if zw < 1.0 {
+            // D50
+            (
+                x * 3.1339 + y * -1.617 + z * -0.4906,
+                x * -0.9785 + y * 1.916 + z * 0.0333,
+                x * 0.072 + y * -0.229 + z * 1.4057,
+            )
+        } else {
+            // D65
+            (
+                x * 3.2406 + y * -1.5372 + z * -0.4986,
+                x * -0.9689 + y * 1.8758 + z * 0.0415,
+                x * 0.0557 + y * -0.204 + z * 1.057,
+            )
+        };
+
+        // Gamma correction (sqrt) and clamp to [0, 255]
+        out.push((r.max(0.0).sqrt() * 255.0).min(255.0) as u8);
+        out.push((g.max(0.0).sqrt() * 255.0).min(255.0) as u8);
+        out.push((b.max(0.0).sqrt() * 255.0).min(255.0) as u8);
+    }
+    out
 }
 
 /// Each byte in `data` is an index into `lut`, which contains
