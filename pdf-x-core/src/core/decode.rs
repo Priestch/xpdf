@@ -347,18 +347,12 @@ pub fn decode_ascii85(data: &[u8]) -> PDFResult<Vec<u8>> {
 }
 
 /// Applies a single filter to data.
-///
-/// # Arguments
-/// * `data` - The input data
-/// * `filter_name` - The filter name
-///
-/// # Returns
-/// The filtered data
 fn apply_filter(data: &[u8], filter_name: &str) -> PDFResult<Vec<u8>> {
     match filter_name {
         "FlateDecode" | "Fl" => decode_flate(data),
         "ASCIIHexDecode" | "AHx" => decode_ascii_hex(data),
         "ASCII85Decode" | "A85" => decode_ascii85(data),
+        "LZWDecode" | "LZW" => decode_lzw(data),
         // Image-specific filters (DCTDecode, JPXDecode, CCITTFaxDecode, JBIG2Decode)
         // are handled separately by the image rendering pipeline — return data
         // unchanged so apply_filters can continue with remaining filters.
@@ -370,6 +364,92 @@ fn apply_filter(data: &[u8], filter_name: &str) -> PDFResult<Vec<u8>> {
             filter_name
         ))),
     }
+}
+
+/// Decodes an LZWDecode-compressed stream (PDF §7.4.4.2).
+///
+/// Uses the early-change variant (code length increments at code 819, not 511).
+pub fn decode_lzw(data: &[u8]) -> PDFResult<Vec<u8>> {
+    const CLEAR_TABLE: u16 = 256;
+    const EOD: u16 = 257;
+
+    let mut result = Vec::new();
+    let mut dictionary: Vec<Vec<u8>> = Vec::with_capacity(8192);
+    let mut bit_buffer: u32 = 0;
+    let mut bits_in_buffer: u32 = 0;
+    let mut byte_pos = 0;
+    let mut code_length: u32 = 9;
+    let mut prev_code: Option<u16> = None;
+    let mut dict_size: u32 = 258;
+
+    // Initialize dictionary with single-byte entries 0-255
+    for i in 0..256u16 {
+        dictionary.push(vec![i as u8]);
+    }
+    // Placeholder for CLEAR and EOD
+    dictionary.push(Vec::new()); // 256 = CLEAR
+    dictionary.push(Vec::new()); // 257 = EOD
+
+    loop {
+        // Read bits to fill a code
+        while bits_in_buffer < code_length {
+            if byte_pos >= data.len() {
+                return Ok(result);
+            }
+            bit_buffer = (bit_buffer << 8) | (data[byte_pos] as u32);
+            bits_in_buffer += 8;
+            byte_pos += 1;
+        }
+
+        bits_in_buffer -= code_length;
+        let code = ((bit_buffer >> bits_in_buffer) & ((1u32 << code_length) - 1)) as u16;
+
+        if code == EOD {
+            break;
+        }
+
+        if code == CLEAR_TABLE {
+            dictionary.truncate(258);
+            code_length = 9;
+            dict_size = 258;
+            prev_code = None;
+            continue;
+        }
+
+        let entry: Vec<u8> = if (code as usize) < dictionary.len() {
+            dictionary[code as usize].clone()
+        } else if code == dict_size as u16 {
+            if let Some(pc) = prev_code {
+                let mut e = dictionary[pc as usize].clone();
+                e.push(e[0]);
+                e
+            } else {
+                return Err(PDFError::Generic("LZW: bad code".into()));
+            }
+        } else {
+            return Err(PDFError::Generic(format!(
+                "LZW: code {} out of range",
+                code
+            )));
+        };
+
+        result.extend_from_slice(&entry);
+
+        if let Some(pc) = prev_code {
+            let mut new_entry = dictionary[pc as usize].clone();
+            new_entry.push(entry[0]);
+            dictionary.push(new_entry);
+            dict_size += 1;
+            // PDF LZW uses early change: increment code length one code earlier
+            if dict_size == (1u32 << code_length) - 1 && code_length < 12 {
+                code_length += 1;
+            }
+        }
+
+        prev_code = Some(code);
+    }
+
+    Ok(result)
 }
 
 /// Applies multiple filters to data in sequence (forward order per PDF spec
