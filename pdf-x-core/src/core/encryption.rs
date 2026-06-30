@@ -7,7 +7,9 @@
 //! - File encryption key derivation
 //! - PDF object decryption (strings and streams)
 
-use crate::core::crypto::{AES128Cipher, AES256Cipher, ARC4Cipher, PDF20, PDFPasswordAlgorithm};
+use crate::core::crypto::{
+    AES128Cipher, AES256Cipher, ARC4Cipher, PDF17, PDF20, PDFPasswordAlgorithm,
+};
 use crate::core::error::{PDFError, PDFResult};
 use crate::core::parser::PDFObject;
 
@@ -107,6 +109,9 @@ pub struct EncryptDict {
     /// Encrypt metadata (EncryptMetadata)
     pub encrypt_metadata: bool,
 
+    /// Key length in bytes specified by /Length (None = use default for algorithm)
+    pub length: Option<usize>,
+
     /// File encryption key (derived after password verification)
     pub encryption_key: Option<Vec<u8>>,
 }
@@ -169,6 +174,13 @@ impl EncryptDict {
                 .and_then(|obj| obj.as_boolean())
                 .unwrap_or(true);
 
+            // /Length is optional; specifies key length in bits (not bytes).
+            // Default depends on V: 40 bits for V=1, 128 for V=2/V=4.
+            let length = dict
+                .get("Length")
+                .and_then(|obj| obj.as_number())
+                .map(|n| n as usize / 8);
+
             Ok(EncryptDict {
                 filter: filter.to_string(),
                 version,
@@ -179,6 +191,7 @@ impl EncryptDict {
                 ue,
                 permissions: PDFPermissions::from_p_value(p),
                 encrypt_metadata,
+                length,
                 encryption_key: None,
             })
         } else {
@@ -218,9 +231,30 @@ impl EncryptDict {
                 // Legacy versions require file_id - use derive_encryption_key_with_file_id instead
                 false
             }
-            EncryptionVersion::V5R5 | EncryptionVersion::V5R6 => {
-                // Use PDF 2.0 algorithm
+            EncryptionVersion::V5R6 => {
+                // PDF 2.0 R=6 uses PDF20 (iterated AES-CBC)
                 let alg = PDF20::new();
+
+                // Extract validation salt and password hash from U
+                if self.u.len() >= 48 {
+                    let user_validation_salt = &self.u[32..40];
+                    let user_password_hash = &self.u[0..32];
+
+                    if alg.check_user_password(password, user_validation_salt, user_password_hash) {
+                        // Derive encryption key
+                        if let Some(ref ue) = self.ue {
+                            let user_key_salt = &self.u[40..48];
+                            let key = alg.get_user_key(password, user_key_salt, ue);
+                            self.encryption_key = Some(key);
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            EncryptionVersion::V5R5 => {
+                // PDF 2.0 R=5 uses PDF17 (simple SHA-256)
+                let alg = PDF17::new();
 
                 // Extract validation salt and password hash from U
                 if self.u.len() >= 48 {
@@ -308,9 +342,39 @@ impl EncryptDict {
                 // TODO: Implement for V1/V2/V4
                 false
             }
-            EncryptionVersion::V5R5 | EncryptionVersion::V5R6 => {
-                // Use PDF 2.0 algorithm
+            EncryptionVersion::V5R6 => {
+                // PDF 2.0 R=6 uses PDF20 (iterated AES-CBC)
                 let alg = PDF20::new();
+
+                // Extract validation salt and password hash from O
+                if self.o.len() >= 48 {
+                    let owner_validation_salt = &self.o[32..40];
+                    let owner_password_hash = &self.o[0..32];
+
+                    if self.u.len() >= 48 {
+                        let u_bytes = &self.u[0..48];
+
+                        if alg.check_owner_password(
+                            password,
+                            owner_validation_salt,
+                            u_bytes,
+                            owner_password_hash,
+                        ) {
+                            // Derive encryption key
+                            if let Some(ref oe) = self.oe {
+                                let owner_key_salt = &self.o[40..48];
+                                let key = alg.get_owner_key(password, owner_key_salt, u_bytes, oe);
+                                self.encryption_key = Some(key);
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            EncryptionVersion::V5R5 => {
+                // PDF 2.0 R=5 uses PDF17 (simple SHA-256)
+                let alg = PDF17::new();
 
                 // Extract validation salt and password hash from O
                 if self.o.len() >= 48 {
@@ -342,7 +406,13 @@ impl EncryptDict {
     }
 
     /// Get the file encryption key length in bytes
+    ///
+    /// If the /Length field is present, uses that value.
+    /// Otherwise, returns the standard default for the encryption version.
     pub fn key_length(&self) -> usize {
+        if let Some(len) = self.length {
+            return len;
+        }
         match self.encryption_version() {
             EncryptionVersion::V1 => 5,                              // 40-bit RC4
             EncryptionVersion::V2 => 16,                             // 128-bit RC4
@@ -573,10 +643,11 @@ fn derive_encryption_key(
     // Step 4: Compute MD5 hash
     let mut hash = calculate_md5(&hash_data).to_vec();
 
-    // Step 5: For R >= 3, iterate MD5 50 times
+    // Step 5: For R >= 3, iterate MD5 50 times over the current key-length prefix.
+    // Ported from pdf.js `CipherTransformFactory.#prepareKeyData` (src/core/crypto.js).
     if revision >= 3 {
         for _ in 0..50 {
-            hash = calculate_md5(&hash).to_vec();
+            hash = calculate_md5(&hash[..key_length]).to_vec();
         }
     }
 
@@ -766,6 +837,7 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(p),
             encrypt_metadata: true,
+            length: None,
             encryption_key: None,
         };
 
@@ -888,6 +960,7 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(p),
             encrypt_metadata: true,
+            length: None,
             encryption_key: None,
         };
 
@@ -946,6 +1019,7 @@ mod tests {
             ue: Some(ue.to_vec()),
             permissions: PDFPermissions::from_p_value(p),
             encrypt_metadata: true,
+            length: None,
             encryption_key: None,
         };
 
@@ -980,6 +1054,7 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(0xFFFFFFFC),
             encrypt_metadata: true,
+            length: None,
             encryption_key: Some(vec![
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
                 0x0E, 0x0F,
@@ -1058,6 +1133,7 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(p),
             encrypt_metadata: true,
+            length: None,
             encryption_key: None,
         };
 
@@ -1130,6 +1206,7 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(p),
             encrypt_metadata: true,
+            length: None,
             encryption_key: None,
         };
 
@@ -1152,6 +1229,7 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(0xFFFFFFFC),
             encrypt_metadata: true,
+            length: None,
             encryption_key: Some(vec![
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
                 0x0E, 0x0F,
@@ -1202,6 +1280,7 @@ mod tests {
             ue: Some(vec![0u8; 32]),
             permissions: PDFPermissions::from_p_value(0xFFFFFFFC),
             encrypt_metadata: true,
+            length: None,
             encryption_key: Some(vec![
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
                 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
@@ -1299,6 +1378,7 @@ mod tests {
             ue: None,
             permissions: PDFPermissions::from_p_value(0xFFFFFFFC),
             encrypt_metadata: true,
+            length: None,
             encryption_key: Some(vec![
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
                 0x0E, 0x0F,
@@ -1384,5 +1464,28 @@ mod legacy_tests {
             ]),
             "empty-pw legacy file key mismatch"
         );
+    }
+
+    /// RC4-rev3 (V=2/R=3) with /Length 64 (8-byte key).
+    /// Source: hayro-tests `encrypted_rc4_rev3.pdf`.
+    #[test]
+    fn legacy_v2_rev3_8byte_key() {
+        let o = vec![
+            0xFE, 0xE2, 0xC6, 0x7F, 0x36, 0x6A, 0xA4, 0xAA, 0x52, 0x8B, 0xD8, 0xFA, 0xF1, 0x42,
+            0x89, 0x3A, 0x0B, 0xE2, 0xB4, 0x2E, 0xE5, 0x99, 0xFC, 0xAE, 0x4E, 0x65, 0x04, 0xCC,
+            0x36, 0xEC, 0xA2, 0xFE,
+        ];
+        let u = vec![
+            0x91, 0x8D, 0x0F, 0xCF, 0xED, 0x41, 0x26, 0x39, 0xA2, 0x85, 0xC3, 0xCC, 0x6E, 0x73,
+            0x8A, 0x52, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        let file_id = vec![
+            0xB4, 0x1E, 0xF7, 0xAD, 0xFC, 0x7D, 0x6C, 0x55, 0xD5, 0xBC, 0x04, 0x42, 0xD1, 0x66,
+            0xA8, 0x88,
+        ];
+
+        let key8 = check_user_password_legacy(b"", &o, (-1i32) as u32, &file_id, 3, 8, true, &u);
+        assert!(key8.is_some(), "8-byte key should authenticate");
     }
 }
