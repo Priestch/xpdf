@@ -30,6 +30,9 @@ hayro-jpeg2000 = { path = "../hayro/hayro-jpeg2000", optional = true, default-fe
 hayro-jbig2 = { path = "../hayro/hayro-jbig2", optional = true, default-features = false }
 hayro-ccitt = { path = "../hayro/hayro-ccitt", optional = true }
 
+# Optional ICC color management (required for rendering)
+moxcms = { workspace = true, optional = true }
+
 # NOTE: the tiny-skia rendering backend (tiny-skia / rustybuzz / ttf-parser /
 # hayro-font) moved to the `pdf-x-device-tinyskia` adapter crate (Phase 0 step 5).
 # The core is now backend-free; `cargo build -p pdf-x-core --no-default-features`
@@ -45,7 +48,7 @@ crypto = ["sha2"]  # AES implementation is now built-in, only SHA-2 is external
 # always compiled (no external deps). The tiny-skia backend now lives in
 # `pdf-x-device-tinyskia`. This feature is retained as a marker so existing
 # `required-features = ["rendering"]` test targets keep working unchanged.
-rendering = []
+rendering = ["dep:moxcms"]
 debug-logging = []  # Enable verbose debug logging for rendering operations
 
 [dev-dependencies]

@@ -7,7 +7,7 @@ use pdf_x_core::rendering::{BlendMode, Color, FillRule, LineCap, LineJoin, Strok
 use std::collections::HashMap;
 use std::sync::Arc;
 use tiny_skia::{
-    BlendMode as SkiaBlendMode, FillRule as SkiaFillRule, LineCap as SkiaLineCap,
+    BlendMode as SkiaBlendMode, FillRule as SkiaFillRule, FilterQuality, LineCap as SkiaLineCap,
     LineJoin as SkiaLineJoin, Mask, Paint as SkiaPaint, PathBuilder, Pixmap, PixmapMut, Rect,
     Stroke, Transform,
 };
@@ -40,11 +40,13 @@ fn to_skia_blend_mode(mode: BlendMode) -> SkiaBlendMode {
     }
 }
 
-fn to_skia_paint(paint: &Paint, blend_mode: BlendMode) -> SkiaPaint {
+fn to_skia_paint(paint: &Paint, blend_mode: BlendMode, opacity: f32) -> SkiaPaint {
     let mut sk_paint = SkiaPaint::default();
     match paint {
         Paint::Solid(color) => {
-            sk_paint.set_color(to_skia_color(*color));
+            let (r, g, b, a) = color.rgba();
+            let adj_a = ((a as f32) * opacity) as u8;
+            sk_paint.set_color(tiny_skia::Color::from_rgba8(r, g, b, adj_a));
         }
         Paint::Transparent => {
             sk_paint.set_color_rgba8(0, 0, 0, 0);
@@ -79,12 +81,20 @@ fn to_skia_fill_rule(fill_rule: FillRule) -> SkiaFillRule {
 }
 
 fn to_skia_stroke(stroke_props: &StrokeProps) -> Stroke {
+    let dash = if stroke_props.dash_array.len() >= 2 {
+        tiny_skia::StrokeDash::new(
+            stroke_props.dash_array.iter().map(|&v| v as f32).collect(),
+            stroke_props.dash_offset as f32,
+        )
+    } else {
+        None
+    };
     Stroke {
         width: stroke_props.line_width as f32,
         miter_limit: stroke_props.miter_limit as f32,
         line_cap: to_skia_line_cap(stroke_props.line_cap),
         line_join: to_skia_line_join(stroke_props.line_join),
-        dash: None, // TODO: Add dash pattern support
+        dash,
     }
 }
 
@@ -196,6 +206,8 @@ struct SkiaGraphicsState {
     transform: Transform,
     clip_mask: Option<Mask>,
     blend_mode: BlendMode,
+    soft_mask: Option<Mask>,
+    opacity: f32,
 }
 
 impl Default for SkiaGraphicsState {
@@ -204,6 +216,8 @@ impl Default for SkiaGraphicsState {
             transform: Transform::identity(),
             clip_mask: None,
             blend_mode: BlendMode::Normal,
+            soft_mask: None,
+            opacity: 1.0,
         }
     }
 }
@@ -744,6 +758,8 @@ pub struct SkiaDevice<'a> {
     font_cache: &'a mut HashMap<String, StoredFont>,
     draw_count: usize,
     colors_seen: std::collections::HashMap<String, usize>,
+    /// Saved pixel data stack during offscreen rendering (for nested soft masks).
+    offscreen_stack: Vec<Vec<u8>>,
 }
 
 struct PathConverter(PathBuilder);
@@ -779,6 +795,7 @@ impl<'a> SkiaDevice<'a> {
             font_cache,
             draw_count: 0,
             colors_seen: std::collections::HashMap::new(),
+            offscreen_stack: Vec::new(),
         }
     }
 
@@ -844,9 +861,30 @@ impl<'a> SkiaDevice<'a> {
     }
 
     fn get_clip_mask(&self) -> Option<Mask> {
-        // The clip mask is created when the clip is set, so we just return it
-        // This ensures the mask is in the correct coordinate space (the CTM at the time the clip was set)
-        self.current_state().clip_mask.clone()
+        let clip = self.current_state().clip_mask.clone();
+        let soft = self.current_state().soft_mask.clone();
+        match (clip, soft) {
+            (Some(c), Some(s)) => {
+                // Combine clip + soft mask: pixel-wise minimum
+                if c.width() == s.width() && c.height() == s.height() {
+                    let combined: Vec<u8> = c
+                        .data()
+                        .iter()
+                        .zip(s.data().iter())
+                        .map(|(&a, &b)| a.min(b))
+                        .collect();
+                    Mask::from_vec(
+                        combined,
+                        tiny_skia::IntSize::from_wh(c.width(), c.height())?,
+                    )
+                } else {
+                    Some(c) // Fallback: use clip only if sizes mismatch
+                }
+            }
+            (Some(c), None) => Some(c),
+            (None, Some(s)) => Some(s),
+            (None, None) => None,
+        }
     }
 }
 
@@ -975,7 +1013,7 @@ impl<'a> Device for SkiaDevice<'a> {
         self.draw_count += 1;
 
         let blend_mode = self.current_state().blend_mode;
-        let sk_paint = to_skia_paint(paint, blend_mode);
+        let sk_paint = to_skia_paint(paint, blend_mode, self.current_state().opacity);
         let clip_mask = self.get_clip_mask();
 
         match mode {
@@ -1233,7 +1271,7 @@ impl<'a> Device for SkiaDevice<'a> {
 
             if let Some(path) = text_path_builder.finish() {
                 let blend_mode = self.current_state().blend_mode;
-                let sk_paint = to_skia_paint(paint, blend_mode);
+                let sk_paint = to_skia_paint(paint, blend_mode, self.current_state().opacity);
                 let ctm = self.current_state().transform;
                 let full_text = compose_text_transform(
                     text_matrix,
@@ -1349,7 +1387,7 @@ impl<'a> Device for SkiaDevice<'a> {
             eprintln!("DEBUG: Text path created successfully");
 
             let blend_mode = self.current_state().blend_mode;
-            let sk_paint = to_skia_paint(paint, blend_mode);
+            let sk_paint = to_skia_paint(paint, blend_mode, self.current_state().opacity);
             let ctm = self.current_state().transform;
 
             let full_text = compose_text_transform(
@@ -1410,7 +1448,7 @@ impl<'a> Device for SkiaDevice<'a> {
         let pixel_count = (image.width * image.height) as usize;
 
         // Image mask: 1-bpp stencil. Set bit = mask_color, unset = transparent.
-        let (data, has_alpha) = if image.is_mask {
+        let (data, _has_alpha) = if image.is_mask {
             let [fr, fg, fb] = image.mask_color;
             // Check for inverted decode ([1 0] means 0=paint)
             let inverted = false; // TODO: read Decode array
@@ -1481,76 +1519,8 @@ impl<'a> Device for SkiaDevice<'a> {
                     (image.data.clone(), true)
                 }
 
-                // CMYK to RGBA conversion (8 bpc, 4 channels per pixel)
-                // Must check this BEFORE RGB (3 channels) since CMYK also has data_len >= pixel_count * 3
-                // Must check AFTER RGBA to avoid treating RGBA as CMYK
-                // Reference: pdf.js/src/core/colorspace.js - DeviceCmykCS.#toRgb
-                // Uses polynomial coefficients derived from US Web Coated (SWOP) colorspace
-                (8, data_len) if !image.has_alpha && data_len >= pixel_count * 4 => {
-                    let mut rgba = Vec::with_capacity(pixel_count * 4);
-                    for chunk in image.data.chunks(4).take(pixel_count) {
-                        if chunk.len() == 4 {
-                            // CMYK values are 0-255, need to normalize to 0-1 for the formula
-                            // PDF.js uses srcScale parameter to normalize, we do it directly
-                            let c = (chunk[0] as f32) / 255.0;
-                            let m = (chunk[1] as f32) / 255.0;
-                            let y = (chunk[2] as f32) / 255.0;
-                            let k = (chunk[3] as f32) / 255.0;
-
-                            // CMYK to RGB conversion using PDF.js polynomial coefficients
-                            // Derived from numerical analysis of US Web Coated (SWOP) colorspace
-                            let r = 255.0
-                                + c * (-4.387332384609988 * c
-                                    + 54.48615194189176 * m
-                                    + 18.82290502165302 * y
-                                    + 212.25662451639585 * k
-                                    - 285.2331026137004)
-                                + m * (1.7149763477362134 * m
-                                    - 5.6096736904047315 * y
-                                    - 17.873870861415444 * k
-                                    - 5.497006427196366)
-                                + y * (-2.5217340131683033 * y - 21.248923337353073 * k
-                                    + 17.5119270841813)
-                                + k * (-21.86122147463605 * k - 189.48180835922747);
-
-                            let g = 255.0
-                                + c * (8.841041422036149 * c
-                                    + 60.118027045597366 * m
-                                    + 6.871425592049007 * y
-                                    + 31.159100130055922 * k
-                                    - 79.2970844816548)
-                                + m * (-15.310361306967817 * m
-                                    + 17.575251261109482 * y
-                                    + 131.35250912493976 * k
-                                    - 190.9453302588951)
-                                + y * (4.444339102852739 * y + 9.8632861493405 * k
-                                    - 24.86741582555878)
-                                + k * (-20.737325471181034 * k - 187.80453709719578);
-
-                            let b = 255.0
-                                + c * (0.8842522430003296 * c
-                                    + 8.078677503112928 * m
-                                    + 30.89978309703729 * y
-                                    - 0.23883238689178934 * k
-                                    - 14.183576799673286)
-                                + m * (10.49593273432072 * m
-                                    + 63.02378494754052 * y
-                                    + 50.606957656360734 * k
-                                    - 112.23884253719248)
-                                + y * (0.03296041114873217 * y + 115.60384449646641 * k
-                                    - 193.58209356861505)
-                                + k * (-22.33816807309886 * k - 180.12613974708367);
-
-                            rgba.push(r.clamp(0.0, 255.0) as u8);
-                            rgba.push(g.clamp(0.0, 255.0) as u8);
-                            rgba.push(b.clamp(0.0, 255.0) as u8);
-                            rgba.push(255); // A (opaque)
-                        }
-                    }
-                    (rgba, true)
-                }
-
                 // RGB to RGBA conversion (8 bpc, 3 channels per pixel)
+                // CMYK images are converted to RGB by the core before reaching the device.
                 (8, data_len) if data_len >= pixel_count * 3 => {
                     let mut rgba = Vec::with_capacity(pixel_count * 4);
                     for chunk in image.data.chunks(3).take(pixel_count) {
@@ -1718,6 +1688,9 @@ impl<'a> Device for SkiaDevice<'a> {
 
         let mut pixmap_paint = tiny_skia::PixmapPaint::default();
         pixmap_paint.blend_mode = to_skia_blend_mode(self.current_state().blend_mode);
+        if image.interpolate {
+            pixmap_paint.quality = FilterQuality::Bilinear;
+        }
 
         self.pixmap.draw_pixmap(
             0,
@@ -1863,6 +1836,128 @@ impl<'a> Device for SkiaDevice<'a> {
                 }
             }
         }
+    }
+
+    fn draw_shading(
+        &mut self,
+        shading: &pdf_x_core::rendering::shading::Shading,
+        ctm: &[f64; 6],
+    ) -> PDFResult<()> {
+        let w = self.pixmap.width();
+        let h = self.pixmap.height();
+        let clip_mask = self.get_clip_mask();
+
+        // Inverse CTM to map device pixels → shading space.
+        let (a, b, c, d, e, f) = (
+            ctm[0] as f32,
+            ctm[1] as f32,
+            ctm[2] as f32,
+            ctm[3] as f32,
+            ctm[4] as f32,
+            ctm[5] as f32,
+        );
+        let det = a * d - b * c;
+        if det.abs() < 1e-12 {
+            return Ok(());
+        }
+        let inv_det = 1.0 / det;
+
+        let clip_data = clip_mask.as_ref().map(|m| m.data());
+
+        for y in 0..h {
+            for x in 0..w {
+                let px = x as usize;
+                let py = y as usize;
+                let pixel_idx = py * w as usize + px;
+
+                // Check clip mask
+                if let Some(cd) = &clip_data {
+                    if cd[pixel_idx] == 0 {
+                        continue;
+                    }
+                }
+
+                // Device pixel → shading space via inverse CTM
+                let dx = x as f32;
+                let dy = y as f32;
+                let sx = (d * (dx - e) - c * (dy - f)) * inv_det;
+                let sy = (-b * (dx - e) + a * (dy - f)) * inv_det;
+
+                if let Some((r, g, b_val, a_val)) = shading.sample(sx as f64, sy as f64) {
+                    let offset = pixel_idx * 4;
+                    let data = self.pixmap.data_mut();
+                    if offset + 3 < data.len() {
+                        // Alpha blend with existing pixel (source-over)
+                        let alpha = a_val as f32 / 255.0;
+                        let inv_alpha = 1.0 - alpha;
+                        data[offset] = (r as f32 * alpha + data[offset] as f32 * inv_alpha) as u8;
+                        data[offset + 1] =
+                            (g as f32 * alpha + data[offset + 1] as f32 * inv_alpha) as u8;
+                        data[offset + 2] =
+                            (b_val as f32 * alpha + data[offset + 2] as f32 * inv_alpha) as u8;
+                        data[offset + 3] = 255;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn begin_offscreen(&mut self) -> PDFResult<()> {
+        self.offscreen_stack.push(self.pixmap.data_mut().to_vec());
+        self.pixmap.data_mut().fill(0);
+        Ok(())
+    }
+
+    fn end_offscreen_as_mask(&mut self, luminosity: bool) -> Option<(Vec<u8>, u32, u32)> {
+        let saved = self.offscreen_stack.pop()?;
+        let w = self.pixmap.width();
+        let h = self.pixmap.height();
+        let src = self.pixmap.data_mut();
+
+        let mask_data: Vec<u8> = (0..(w * h) as usize)
+            .map(|i| {
+                let offset = i * 4;
+                let a = src[offset + 3] as f32 / 255.0;
+                if luminosity {
+                    // Un-premultiply, compute luminosity, re-multiply by alpha
+                    if a > 0.0 {
+                        let r = (src[offset] as f32 / 255.0) / a;
+                        let g = (src[offset + 1] as f32 / 255.0) / a;
+                        let b = (src[offset + 2] as f32 / 255.0) / a;
+                        // PDF spec: luminosity for DeviceRGB = 0.299R + 0.587G + 0.114B
+                        ((0.299 * r + 0.587 * g + 0.114 * b) * a * 255.0) as u8
+                    } else {
+                        0
+                    }
+                } else {
+                    (a * 255.0) as u8
+                }
+            })
+            .collect();
+
+        // Restore original pixels
+        self.pixmap.data_mut().copy_from_slice(&saved);
+        Some((mask_data, w, h))
+    }
+
+    fn set_soft_mask(&mut self, mask: Option<(&[u8], u32, u32)>) -> PDFResult<()> {
+        match mask {
+            None => self.current_state_mut().soft_mask = None,
+            Some((data, w, h)) => {
+                if let Some(size) = tiny_skia::IntSize::from_wh(w, h) {
+                    if let Some(m) = Mask::from_vec(data.to_vec(), size) {
+                        self.current_state_mut().soft_mask = Some(m);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn set_opacity(&mut self, opacity: f64) {
+        self.current_state_mut().opacity = opacity as f32;
     }
 }
 

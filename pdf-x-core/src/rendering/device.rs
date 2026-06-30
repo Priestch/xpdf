@@ -77,6 +77,8 @@ pub struct ImageData {
     pub is_mask: bool,
     /// Fill color for image masks (R, G, B in 0-255). Only used when is_mask.
     pub mask_color: [u8; 3],
+    /// Whether the PDF requested image interpolation.
+    pub interpolate: bool,
 }
 
 /// A device that can render PDF drawing operations.
@@ -206,6 +208,38 @@ pub trait Device {
     /// * `image` - The image data
     /// * `transform` - Transformation matrix for placing the image
     fn draw_image(&mut self, image: ImageData, transform: &[f64; 6]) -> PDFResult<()>;
+
+    /// Draw a shading (Type 2 axial / Type 3 radial gradient).
+    ///
+    /// The shading is already parsed and sampled in device space via `ctm`.
+    fn draw_shading(
+        &mut self,
+        shading: &crate::rendering::shading::Shading,
+        ctm: &[f64; 6],
+    ) -> PDFResult<()> {
+        let _ = shading;
+        let _ = ctm;
+        Ok(())
+    }
+
+    /// Begin offscreen rendering: save current pixels, clear to transparent.
+    fn begin_offscreen(&mut self) -> PDFResult<()> {
+        Ok(())
+    }
+
+    /// End offscreen rendering: extract mask from rendered content, restore pixels.
+    /// Returns (mask_data, width, height) or None if not supported.
+    fn end_offscreen_as_mask(&mut self, _luminosity: bool) -> Option<(Vec<u8>, u32, u32)> {
+        None
+    }
+
+    /// Set or clear the soft mask for subsequent draw operations.
+    fn set_soft_mask(&mut self, _mask: Option<(&[u8], u32, u32)>) -> PDFResult<()> {
+        Ok(())
+    }
+
+    /// Set the fill opacity (from ExtGState /ca).
+    fn set_opacity(&mut self, _opacity: f64) {}
 
     /// Get the current page bounds.
     ///

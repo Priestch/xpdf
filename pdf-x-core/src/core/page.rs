@@ -1039,8 +1039,13 @@ impl Page {
             }
         };
 
-        // Set initial clip to the view box to prevent rendering outside page bounds
+        // Set initial CTM to map view_box [x0,y0,x1,y1] to device pixels [0,0,w,h].
+        // This handles non-zero MediaBox origins (e.g. [20,20,180,180]).
         let [x0, y0, x1, y1] = view_box;
+        let page_transform = [1.0, 0.0, 0.0, -1.0, -x0, y1];
+        device.set_matrix(&page_transform);
+
+        // Set initial clip to the view box to prevent rendering outside page bounds
         device.begin_path();
         device.move_to(x0, y0);
         device.line_to(x1, y0);
@@ -1107,6 +1112,8 @@ impl Page {
 
             // Create a rendering context to process operations
             let mut ctx = RenderingContext::new(device);
+            // Sync context CTM with the device's page transform
+            ctx.current_state_mut().set_matrix(&page_transform);
 
             // Set xref and resources for XObject (image) rendering
             // Note: We need to extend the lifetime of the fetched resources
@@ -1271,73 +1278,65 @@ impl Page {
     /// Gets fallback font data for standard PDF fonts.
     ///
     /// Returns font data for common PDF base fonts (Helvetica, Times, Courier, etc.)
-    /// by loading bundled Liberation fonts (which are metric-compatible with PDF standard fonts).
+    /// by embedding Liberation fonts at compile time (metric-compatible with PDF standard fonts).
     #[cfg(feature = "rendering")]
     fn get_fallback_font_data(base_font: &str) -> Option<Vec<u8>> {
-        // Normalize font name (remove suffixes like -Bold, -Italic, etc.)
-        let font_name = base_font.split('-').next().unwrap_or(base_font);
-
-        // Map standard PDF fonts to bundled Liberation fonts
-        // Liberation fonts are metric-compatible with standard PDF fonts and are OFL licensed
-        let fallback_font = match font_name {
+        let data = match base_font {
             // Helvetica family -> Liberation Sans
-            "Helvetica" | "Arial" | "sans-serif" => "LiberationSans-Regular.ttf",
-            "Helvetica-Bold" | "Arial-Bold" => "LiberationSans-Bold.ttf",
+            "Helvetica" | "Arial" | "sans-serif" => {
+                include_bytes!("../../assets/fonts/LiberationSans-Regular.ttf").as_slice()
+            }
+            "Helvetica-Bold" | "Arial-Bold" => {
+                include_bytes!("../../assets/fonts/LiberationSans-Bold.ttf").as_slice()
+            }
             "Helvetica-Oblique" | "Helvetica-Italic" | "Arial-Italic" => {
-                "LiberationSans-Italic.ttf"
+                include_bytes!("../../assets/fonts/LiberationSans-Italic.ttf").as_slice()
             }
             "Helvetica-BoldOblique" | "Helvetica-BoldItalic" | "Arial-BoldItalic" => {
-                "LiberationSans-BoldItalic.ttf"
+                include_bytes!("../../assets/fonts/LiberationSans-BoldItalic.ttf").as_slice()
             }
 
             // Times family -> Liberation Serif
-            "Times" | "Times-Roman" | "serif" => "LiberationSerif-Regular.ttf",
-            "Times-Bold" => "LiberationSerif-Bold.ttf",
-            "Times-Italic" | "Times-Roman-Italic" => "LiberationSerif-Italic.ttf",
-            "Times-BoldItalic" | "Times-Roman-BoldItalic" => "LiberationSerif-BoldItalic.ttf",
+            "Times" | "Times-Roman" | "serif" => {
+                include_bytes!("../../assets/fonts/LiberationSerif-Regular.ttf").as_slice()
+            }
+            "Times-Bold" => {
+                include_bytes!("../../assets/fonts/LiberationSerif-Bold.ttf").as_slice()
+            }
+            "Times-Italic" | "Times-Roman-Italic" => {
+                include_bytes!("../../assets/fonts/LiberationSerif-Italic.ttf").as_slice()
+            }
+            "Times-BoldItalic" | "Times-Roman-BoldItalic" => {
+                include_bytes!("../../assets/fonts/LiberationSerif-BoldItalic.ttf").as_slice()
+            }
 
             // Courier family -> Liberation Mono
-            "Courier" | "CourierNew" | "monospace" => "LiberationMono-Regular.ttf",
-            "Courier-Bold" | "CourierNew-Bold" => "LiberationMono-Bold.ttf",
+            "Courier" | "CourierNew" | "monospace" => {
+                include_bytes!("../../assets/fonts/LiberationMono-Regular.ttf").as_slice()
+            }
+            "Courier-Bold" | "CourierNew-Bold" => {
+                include_bytes!("../../assets/fonts/LiberationMono-Bold.ttf").as_slice()
+            }
             "Courier-Oblique" | "Courier-Italic" | "CourierNew-Italic" => {
-                "LiberationMono-Italic.ttf"
+                include_bytes!("../../assets/fonts/LiberationMono-Italic.ttf").as_slice()
             }
             "Courier-BoldOblique" | "Courier-BoldItalic" | "CourierNew-BoldItalic" => {
-                "LiberationMono-BoldItalic.ttf"
+                include_bytes!("../../assets/fonts/LiberationMono-BoldItalic.ttf").as_slice()
             }
 
-            // Symbol and ZapfDingbats don't have Liberation equivalents, return None
+            // Symbol and ZapfDingbats don't have Liberation equivalents
             "Symbol" | "ZapfDingbats" => return None,
 
             _ => return None,
         };
 
-        // Load the font from bundled assets
-        let font_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("assets")
-            .join("fonts")
-            .join(fallback_font);
-
-        match std::fs::read(&font_path) {
-            Ok(data) => {
-                #[cfg(feature = "debug-logging")]
-                eprintln!(
-                    "DEBUG: Loaded fallback font '{}' for '{}' ({} bytes)",
-                    fallback_font,
-                    base_font,
-                    data.len()
-                );
-                Some(data)
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to load fallback font '{}': {}",
-                    font_path.display(),
-                    e
-                );
-                None
-            }
-        }
+        #[cfg(feature = "debug-logging")]
+        eprintln!(
+            "DEBUG: Loaded bundled fallback font for '{}' ({} bytes)",
+            base_font,
+            data.len()
+        );
+        Some(data.to_vec())
     }
 }
 

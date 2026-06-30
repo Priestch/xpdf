@@ -12,6 +12,11 @@ pub mod device;
 pub mod graphics_state;
 pub mod path;
 
+#[cfg(feature = "rendering")]
+pub mod cmyk_icc;
+
+pub mod shading;
+
 // Re-export key types
 pub use context::{RenderingContext, is_text_trace_enabled, set_text_trace_enabled};
 pub use device::{Device, ImageData, Paint, PathDrawMode, TestDevice};
@@ -45,8 +50,10 @@ pub fn interpret<D: Device>(
     use crate::rendering::context::RenderingContext;
     use crate::rendering::graphics_state::FillRule;
 
-    // Clip to the view box (matches Page::render's pre-amble).
+    // Set initial CTM and clip to the view box (matches Page::render's pre-amble).
     let [x0, y0, x1, y1] = page.view_box();
+    let page_transform = [1.0, 0.0, 0.0, -1.0, -x0, y1];
+    device.set_matrix(&page_transform);
     device.begin_path();
     device.move_to(x0, y0);
     device.line_to(x1, y0);
@@ -66,6 +73,7 @@ pub fn interpret<D: Device>(
     // interpret is a single pass, and the content's own q/Q ops manage graphics state.)
     let mut resolver = SnapshotPageResolver::new(page.objects());
     let mut ctx = RenderingContext::new(device);
+    ctx.current_state_mut().set_matrix(&page_transform);
     if !matches!(page.resources(), PDFObject::Null) {
         ctx.set_xobject_resources(&mut resolver, page.resources());
     }

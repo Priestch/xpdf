@@ -81,6 +81,21 @@ pub struct RenderingContext<'a, D: Device> {
     /// We only do this for composite/CID-style fonts where raw shown bytes are
     /// not directly drawable by the simple Type1/TrueType code paths.
     font_requires_cmap_remap: HashMap<String, bool>,
+
+    /// Current nonstroking color space selected by `cs`.
+    fill_color_space: Option<PDFObject>,
+
+    /// Current stroking color space selected by `CS`.
+    stroke_color_space: Option<PDFObject>,
+
+    /// Color-space graphics state stack parallel to `state_stack`.
+    color_space_stack: Vec<(Option<PDFObject>, Option<PDFObject>)>,
+
+    /// Pending fill shading (set by `scn` with a Pattern color space).
+    pending_fill_shading: Option<super::shading::Shading>,
+
+    /// Soft mask group reference stack (prevents only true self-recursion).
+    soft_mask_group_stack: Vec<(u32, u32)>,
 }
 
 impl<'a, D: Device> RenderingContext<'a, D> {
@@ -100,6 +115,11 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             operation_count: 0,
             font_to_unicode: HashMap::new(),
             font_requires_cmap_remap: HashMap::new(),
+            fill_color_space: None,
+            stroke_color_space: None,
+            color_space_stack: Vec::new(),
+            pending_fill_shading: None,
+            soft_mask_group_stack: Vec::new(),
         }
     }
 
@@ -237,6 +257,10 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             OpCode::SetFillRGBColor => self.set_fill_rgb(&op.args)?,
             OpCode::SetStrokeCMYKColor => self.set_stroke_cmyk(&op.args)?,
             OpCode::SetFillCMYKColor => self.set_fill_cmyk(&op.args)?,
+            OpCode::SetStrokeColorSpace => self.set_stroke_color_space(&op.args)?,
+            OpCode::SetFillColorSpace => self.set_fill_color_space(&op.args)?,
+            OpCode::SetStrokeColor | OpCode::SetStrokeColorN => self.set_stroke_color(&op.args)?,
+            OpCode::SetFillColor | OpCode::SetFillColorN => self.set_fill_color(&op.args)?,
 
             // Line property operators
             OpCode::SetLineWidth => self.set_line_width(&op.args)?,
@@ -248,6 +272,9 @@ impl<'a, D: Device> RenderingContext<'a, D> {
 
             // XObject operator
             OpCode::PaintXObject => self.paint_xobject(&op.args)?,
+
+            // Shading operator
+            OpCode::ShadingFill => self.handle_shading_fill(&op.args)?,
 
             _ => {
                 // Other operators not yet implemented
@@ -265,6 +292,10 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         // Save current state
         let saved = self.current_state().save();
         self.state_stack.push(saved);
+        self.color_space_stack.push((
+            self.fill_color_space.clone(),
+            self.stroke_color_space.clone(),
+        ));
         self.device.save_state();
         Ok(())
     }
@@ -280,6 +311,10 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         // Restore graphics state
         if self.state_stack.len() > 1 {
             self.state_stack.pop();
+            if let Some((fill, stroke)) = self.color_space_stack.pop() {
+                self.fill_color_space = fill;
+                self.stroke_color_space = stroke;
+            }
             self.device.restore_state();
         }
         Ok(())
@@ -424,7 +459,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
 
     fn stroke(&mut self) -> PDFResult<()> {
         let state = self.current_state();
-        let paint = Paint::from_color(state.stroke_color.clone());
+        let paint = Paint::from_color(state.stroke_color);
         let stroke_props = state.stroke_props.clone();
         #[cfg(feature = "debug-logging")]
         #[cfg(feature = "debug-logging")]
@@ -442,11 +477,29 @@ impl<'a, D: Device> RenderingContext<'a, D> {
     }
 
     fn fill(&mut self, rule: FillRule) -> PDFResult<()> {
+        if let Some(shading) = self.pending_fill_shading.take() {
+            self.device.save_state();
+            self.device.clip_path(rule)?;
+            let ctm = self.current_state().ctm;
+            // Compose pattern matrix with CTM for the full shading transform.
+            // Forward: shading_point → PatternMatrix → user_point → CTM → device_pixel
+            let pm = shading.matrix;
+            let combined = [
+                ctm[0] * pm[0] + ctm[1] * pm[2],
+                ctm[0] * pm[1] + ctm[1] * pm[3],
+                ctm[2] * pm[0] + ctm[3] * pm[2],
+                ctm[2] * pm[1] + ctm[3] * pm[3],
+                ctm[4] * pm[0] + ctm[5] * pm[2] + pm[4],
+                ctm[4] * pm[1] + ctm[5] * pm[3] + pm[5],
+            ];
+            self.device.draw_shading(&shading, &combined)?;
+            self.device.restore_state();
+            self.current_path.begin();
+            return Ok(());
+        }
         let state = self.current_state();
-        let paint = Paint::from_color(state.fill_color.clone());
+        let paint = Paint::from_color(state.fill_color);
         let stroke_props = state.stroke_props.clone();
-        #[cfg(feature = "debug-logging")]
-        #[cfg(feature = "debug-logging")]
         #[cfg(feature = "debug-logging")]
         eprintln!("DEBUG: Fill path with color {:?}", state.fill_color);
         self.device
@@ -459,7 +512,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         let state = self.current_state();
         // For fill and stroke, we use fill color for fill, stroke color for stroke
         // But our Device trait only takes one paint, so we use fill color
-        let paint = Paint::from_color(state.fill_color.clone());
+        let paint = Paint::from_color(state.fill_color);
         let stroke_props = state.stroke_props.clone();
         self.device
             .draw_path(PathDrawMode::FillStroke(rule), &paint, &stroke_props)?;
@@ -1040,136 +1093,84 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         font_dict: &crate::core::font::FontDict,
         resolver: &mut dyn PageResolver,
     ) -> Option<Vec<u8>> {
+        // For Type0 fonts, FontDescriptor is in the DescendantFonts → CIDFont dict.
+        let descriptor_ref = if let Some(desc) = &font_dict.font_descriptor {
+            desc.clone()
+        } else if let Some(PDFObject::Array(descendants)) = &font_dict.descendant_fonts {
+            // Type0: traverse DescendantFonts → CIDFont → FontDescriptor
+            let cid_ref = descendants.first()?;
+            let cid_obj = resolver.resolve_if_ref(cid_ref).ok()?;
+            match &*cid_obj {
+                PDFObject::Dictionary(cid_dict) => cid_dict.get("FontDescriptor")?.clone(),
+                PDFObject::Stream { dict, .. } => dict.get("FontDescriptor")?.clone(),
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+
+        // Fetch the descriptor (might be a reference)
+        let _fetched_descriptor;
+        let descriptor = match &descriptor_ref {
+            PDFObject::Dictionary(d) => d,
+            PDFObject::Ref(r) => {
+                _fetched_descriptor = resolver.resolve_ref(r.num, r.generation).ok()?;
+                match &*_fetched_descriptor {
+                    PDFObject::Dictionary(d) => d,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+
         #[cfg(feature = "debug-logging")]
         #[cfg(feature = "debug-logging")]
         eprintln!(
-            "DEBUG: extract_font_data - font_descriptor exists: {}",
-            font_dict.font_descriptor.is_some()
+            "DEBUG: FontDescriptor keys: {:?}",
+            descriptor.keys().collect::<Vec<_>>()
         );
 
-        // Check for embedded font data in FontDescriptor
-        if let Some(descriptor_ref) = &font_dict.font_descriptor {
-            // Fetch the descriptor (might be a reference)
-            let _fetched_descriptor;
-            let descriptor = match descriptor_ref {
-                PDFObject::Dictionary(d) => d,
-                PDFObject::Ref(r) => {
-                    _fetched_descriptor = resolver.resolve_ref(r.num, r.generation).ok()?;
-                    match &*_fetched_descriptor {
-                        PDFObject::Dictionary(d) => d,
-                        _ => return None,
-                    }
-                }
-                _ => return None,
-            };
-
-            #[cfg(feature = "debug-logging")]
-            #[cfg(feature = "debug-logging")]
-            eprintln!(
-                "DEBUG: FontDescriptor keys: {:?}",
-                descriptor.keys().collect::<Vec<_>>()
-            );
-
-            // Try to get font file from FontDescriptor
-            // The key depends on font type:
-            // - TrueType: /FontFile2
-            // - Type1: /FontFile
-            // - Type1C (CFF): /FontFile3
-            //
-            // NOTE: Some PDFs mislabel Type1C as Type1, so we check multiple keys
-            let font_file_keys = match font_dict.font_type {
-                crate::core::font::FontType::TrueType => vec!["FontFile2"],
-                crate::core::font::FontType::Type1 => {
-                    // Type1 might actually be Type1C (CFF), so check both
-                    #[cfg(feature = "debug-logging")]
-                    #[cfg(feature = "debug-logging")]
-                    eprintln!("DEBUG: Type1 font, checking FontFile and FontFile3");
-                    vec!["FontFile", "FontFile3"]
-                }
-                crate::core::font::FontType::Type1C => vec!["FontFile3"],
-                crate::core::font::FontType::CIDFontType0 => vec!["FontFile3"],
-                crate::core::font::FontType::CIDFontType2 => vec!["FontFile2"],
-                _ => vec!["FontFile2", "FontFile3", "FontFile"],
-            };
-
-            #[cfg(feature = "debug-logging")]
-            #[cfg(feature = "debug-logging")]
-            eprintln!("DEBUG: Looking for font file keys: {:?}", font_file_keys);
-
-            for key in font_file_keys {
+        // Try to get font file from FontDescriptor
+        // The key depends on font type:
+        // - TrueType: /FontFile2
+        // - Type1: /FontFile
+        // - Type1C (CFF): /FontFile3
+        //
+        // NOTE: Some PDFs mislabel Type1C as Type1, so we check multiple keys
+        let font_file_keys = match font_dict.font_type {
+            crate::core::font::FontType::TrueType => vec!["FontFile2"],
+            crate::core::font::FontType::Type1 => {
+                // Type1 might actually be Type1C (CFF), so check both
                 #[cfg(feature = "debug-logging")]
                 #[cfg(feature = "debug-logging")]
-                #[cfg(feature = "debug-logging")]
-                eprintln!("DEBUG: Checking for key '{}'", key);
-                if let Some(font_file_ref) = descriptor.get(key) {
-                    #[cfg(feature = "debug-logging")]
-                    #[cfg(feature = "debug-logging")]
-                    eprintln!("DEBUG: Found font file ref for '{}'", key);
-                    // Fetch the font file stream
-                    let font_file_obj = resolver.resolve_if_ref(font_file_ref).ok()?;
-                    if let PDFObject::Stream { dict, data } = &*font_file_obj {
-                        #[cfg(feature = "debug-logging")]
-                        eprintln!("DEBUG: Font file stream found, data length: {}", data.len());
+                eprintln!("DEBUG: Type1 font, checking FontFile and FontFile3");
+                vec!["FontFile", "FontFile3"]
+            }
+            crate::core::font::FontType::Type1C => vec!["FontFile3"],
+            crate::core::font::FontType::CIDFontType0 => vec!["FontFile3"],
+            crate::core::font::FontType::CIDFontType2 => vec!["FontFile2"],
+            _ => vec!["FontFile2", "FontFile3", "FontFile"],
+        };
 
-                        // Decode if needed
-                        if let Some(filter) = dict.get("Filter") {
-                            match filter {
-                                PDFObject::Name(filter_name) => {
-                                    if filter_name == "FlateDecode" || filter_name == "Fl" {
-                                        if let Ok(decoded) =
-                                            crate::core::decode::decode_flate(&data)
-                                        {
-                                            #[cfg(feature = "debug-logging")]
-                                            eprintln!(
-                                                "DEBUG: Successfully decoded {} bytes",
-                                                decoded.len()
-                                            );
-                                            return Some(decoded);
-                                        }
-                                    }
-                                }
-                                PDFObject::Array(filters) => {
-                                    // Try first filter
-                                    if !filters.is_empty() {
-                                        if let Some(PDFObject::Name(filter_name)) =
-                                            filters.get(0).map(|f| f.as_ref())
-                                        {
-                                            if filter_name == "FlateDecode" || filter_name == "Fl" {
-                                                if let Ok(decoded) =
-                                                    crate::core::decode::decode_flate(&data)
-                                                {
-                                                    #[cfg(feature = "debug-logging")]
-                                                    eprintln!(
-                                                        "DEBUG: Successfully decoded {} bytes",
-                                                        decoded.len()
-                                                    );
-                                                    return Some(decoded);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+        #[cfg(feature = "debug-logging")]
+        #[cfg(feature = "debug-logging")]
+        eprintln!("DEBUG: Looking for font file keys: {:?}", font_file_keys);
 
-                        // No filter or decode failed, return raw data
-                        #[cfg(feature = "debug-logging")]
-                        eprintln!("DEBUG: Returning raw font data: {} bytes", data.len());
-                        return Some(data.clone());
+        for key in font_file_keys {
+            if let Some(font_file_ref) = descriptor.get(key) {
+                let font_file_obj = resolver.resolve_if_ref(font_file_ref).ok()?;
+                if let PDFObject::Stream { dict, data } = &*font_file_obj {
+                    let decoded = if let Some(filter) = dict.get("Filter") {
+                        crate::core::decode::apply_filters(data, filter)
+                            .unwrap_or_else(|_| data.clone())
                     } else {
-                        #[cfg(feature = "debug-logging")]
-                        eprintln!("DEBUG: Font file ref is not a stream");
-                    }
-                } else {
-                    #[cfg(feature = "debug-logging")]
-                    #[cfg(feature = "debug-logging")]
-                    eprintln!("DEBUG: Key '{}' not found in descriptor", key);
+                        data.clone()
+                    };
+                    return Some(decoded);
                 }
             }
         }
 
-        #[cfg(feature = "debug-logging")]
         #[cfg(feature = "debug-logging")]
         eprintln!("DEBUG: No font data found in extract_font_data");
         None
@@ -1202,237 +1203,19 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         #[cfg(feature = "debug-logging")]
         eprintln!("DEBUG: Clean font name: '{}'", clean_font);
 
-        // Map PDF font names to system font names
-        let system_font = match clean_font {
-            // Standard PDF fonts
-            "Times-Roman" | "TimesNewRoman" | "Times" => "Times New Roman",
-            "Times-Bold" => "Times New Roman Bold",
-            "Times-Italic" => "Times New Roman Italic",
-            "Times-BoldItalic" => "Times New Roman Bold Italic",
-            "Helvetica" => "Arial",
-            "Helvetica-Bold" => "Arial Bold",
-            "Helvetica-Oblique" | "Helvetica-Italic" => "Arial Italic",
-            "Helvetica-BoldOblique" | "Helvetica-BoldItalic" => "Arial Bold Italic",
-            "Courier" | "CourierNew" => "Courier New",
-            "Courier-Bold" => "Courier New Bold",
-            "Courier-Oblique" | "Courier-Italic" => "Courier New Italic",
-            "Courier-BoldOblique" | "Courier-BoldItalic" => "Courier New Bold Italic",
-
-            // Nimbus fonts (PostScript clones of standard fonts)
-            s if s.starts_with("NimbusRomNo9L") => "Times New Roman",
-            s if s.starts_with("NimbusSans") => "Arial",
-            s if s.starts_with("NimbusMono") => "Courier New",
-
-            // Liberation fonts (open source clones)
-            s if s.starts_with("LiberationSerif") => "Times New Roman",
-            s if s.starts_with("LiberationSans") => "Arial",
-            s if s.starts_with("LiberationMono") => "Courier New",
-
-            // TeX Gyre fonts (modern replacements)
-            s if s.starts_with("TeXGyreTermes") => "Times New Roman",
-            s if s.starts_with("TeXGyreHeros") => "Arial",
-            s if s.starts_with("TeXGyreCursor") => "Courier New",
-
-            // URW fonts (more PostScript clones)
-            s if s.starts_with("URWPalladio") => "Times New Roman",
-            s if s.starts_with("URWGothic") => "Arial",
-            s if s.starts_with("URWCourier") => "Courier New",
-
-            // Computer Modern fonts (TeX/LaTeX)
-            s if s.contains("ComputerModern")
-                || s.contains("Computer Modern")
-                || s.contains("CM")
-                || s.starts_with("ComputerModern")
-                || s.starts_with("CMR")
-                || s.starts_with("CMM")
-                || s.starts_with("CMS")
-                || s.starts_with("CMT")
-                || s.starts_with("CMEX")
-                || s.starts_with("CMB") =>
-            {
-                "Times New Roman"
-            }
-
-            // Latin Modern fonts (modern Computer Modern)
-            s if s.starts_with("LatinModern")
-                || s.starts_with("LMRoman")
-                || s.starts_with("LMSans")
-                || s.starts_with("LMTypewriter") =>
-            {
-                match clean_font {
-                    s if s.contains("Sans") => "Arial",
-                    s if s.contains("Mono") || s.contains("Typewriter") => "Courier New",
-                    _ => "Times New Roman",
-                }
-            }
-
-            // Any font with "Roman" or "Serif" in name -> Times
-            s if s.contains("Roman") || s.contains("Serif") || s.contains("Book") => {
-                "Times New Roman"
-            }
-
-            // Any font with "Sans" in name -> Arial
-            s if s.contains("Sans") => "Arial",
-
-            // Any font with "Mono" or "Code" in name -> Courier
-            s if s.contains("Mono") || s.contains("Code") || s.contains("Typewriter") => {
-                "Courier New"
-            }
-
-            _ => {
-                // Last resort: try to guess font family from name
-                #[cfg(feature = "debug-logging")]
-                eprintln!(
-                    "DEBUG: Unknown font '{}', attempting smart fallback",
-                    clean_font
-                );
-
-                // Default to Times for serif-like fonts, Arial for sans-serif
-                let fallback = if clean_font.contains("Bold") || clean_font.contains("Light") {
-                    "Times New Roman" // Serif default
-                } else {
-                    "Times New Roman" // Safe default
-                };
-
-                #[cfg(feature = "debug-logging")]
-                eprintln!(
-                    "DEBUG: Using fallback '{}' for font '{}' (cache_key='{}')",
-                    fallback, clean_font, cache_key
-                );
-
-                // Continue with the fallback instead of returning early
-                fallback
-            }
-        };
-
-        // Try to load the system font
-        #[cfg(target_os = "linux")]
-        {
-            // Map system font names to actual Linux font files
-            // Try multiple common locations and font families
-            let font_files: Vec<&str> = match system_font.as_ref() {
-                "Times New Roman" => vec![
-                    // Liberation fonts (RHEL/CentOS)
-                    "LiberationSerif-Regular.ttf",
-                    "LiberationSerif.ttf",
-                    // DejaVu fonts (most distros)
-                    "DejaVuSerif.ttf",
-                    // Free fonts
-                    "FreeSerif.ttf",
-                    // Noto fonts (modern distros)
-                    "NotoSerif-Regular.ttf",
-                    // URW fonts (TeX Live)
-                    "NimbusRomNo9L-Regular.ttf",
-                    "NimbusRoman-Regular.ttf",
-                ],
-                "Times New Roman Bold" => vec![
-                    "LiberationSerif-Bold.ttf",
-                    "DejaVuSerif-Bold.ttf",
-                    "FreeSerifBold.ttf",
-                    "NotoSerif-Bold.ttf",
-                ],
-                "Times New Roman Italic" => vec![
-                    "LiberationSerif-Italic.ttf",
-                    "DejaVuSerif-Italic.ttf",
-                    "FreeSerifItalic.ttf",
-                    "NotoSerif-Italic.ttf",
-                ],
-                "Times New Roman Bold Italic" => vec![
-                    "LiberationSerif-BoldItalic.ttf",
-                    "DejaVuSerif-BoldItalic.ttf",
-                    "FreeSerifBoldItalic.ttf",
-                    "NotoSerif-BoldItalic.ttf",
-                ],
-                "Arial" => vec![
-                    "LiberationSans-Regular.ttf",
-                    "LiberationSans.ttf",
-                    "DejaVuSans.ttf",
-                    "FreeSans.ttf",
-                    "NotoSans-Regular.ttf",
-                    "NimbusSans-Regular.ttf",
-                ],
-                "Arial Bold" => vec![
-                    "LiberationSans-Bold.ttf",
-                    "DejaVuSans-Bold.ttf",
-                    "FreeSansBold.ttf",
-                    "NotoSans-Bold.ttf",
-                ],
-                "Arial Italic" => vec![
-                    "LiberationSans-Italic.ttf",
-                    "DejaVuSans-Oblique.ttf",
-                    "FreeSansOblique.ttf",
-                    "NotoSans-Italic.ttf",
-                ],
-                "Arial Bold Italic" => vec![
-                    "LiberationSans-BoldItalic.ttf",
-                    "DejaVuSans-BoldOblique.ttf",
-                    "FreeSansBoldOblique.ttf",
-                    "NotoSans-BoldItalic.ttf",
-                ],
-                "Courier New" => vec![
-                    "LiberationMono-Regular.ttf",
-                    "LiberationMono.ttf",
-                    "DejaVuSansMono.ttf",
-                    "FreeMono.ttf",
-                    "NotoMono-Regular.ttf",
-                    "NimbusMono-Regular.ttf",
-                    "Courier10PitchBT-Roman.ttf",
-                ],
-                "Courier New Bold" => vec![
-                    "LiberationMono-Bold.ttf",
-                    "DejaVuSansMono-Bold.ttf",
-                    "FreeMonoBold.ttf",
-                    "NotoMono-Bold.ttf",
-                ],
-                "Courier New Italic" => vec![
-                    "LiberationMono-Italic.ttf",
-                    "DejaVuSansMono-Oblique.ttf",
-                    "FreeMonoOblique.ttf",
-                ],
-                "Courier New Bold Italic" => vec![
-                    "LiberationMono-BoldItalic.ttf",
-                    "DejaVuSansMono-BoldOblique.ttf",
-                    "FreeMonoBoldOblique.ttf",
-                ],
-                _ => vec![], // No mapping
-            };
-
-            // Try each font file in multiple directories
-            let font_dirs = vec![
-                "/usr/share/fonts/truetype",
-                "/usr/share/fonts/truetype/dejavu",
-                "/usr/share/fonts/truetype/liberation",
-                "/usr/share/fonts/truetype/freefont",
-                "/usr/share/fonts/truetype/noto",
-                "/usr/share/fonts/opentype/noto",
-                "/usr/share/fonts/truetype/lmodern",
-                "/usr/share/fonts/truetype/cmu", // Computer Modern Unicode
-                "/usr/share/fonts/truetype/cm-unicode", // Alternative CM path
-                "/usr/share/fonts/opentype/cm-unicode",
-                "/usr/share/fonts/truetype/computer-modern",
-                "/usr/share/fonts/opentype/public-lm",
-                "/usr/share/fonts/TTF",
-                "/usr/share/fonts",
-                "/usr/local/share/fonts",
-            ];
-
-            for font_file in font_files {
-                for dir in &font_dirs {
-                    let path = format!("{}/{}", dir, font_file);
-                    if let Ok(data) = std::fs::read(&path) {
-                        #[cfg(feature = "debug-logging")]
-                        eprintln!("DEBUG: Loaded font '{}' from {}", cache_key, path);
-                        // System fonts don't have custom encodings
-                        return self.device.load_font_data(cache_key, data, None);
-                    }
-                }
-            }
+        if let Some(data) = bundled_standard_font_data(clean_font) {
+            #[cfg(feature = "debug-logging")]
+            eprintln!(
+                "DEBUG: Loaded bundled standard font for cache_key='{}', base_font='{}'",
+                cache_key, base_font
+            );
+            return self.device.load_font_data(cache_key, data, None);
         }
 
         #[cfg(feature = "debug-logging")]
         #[cfg(feature = "debug-logging")]
         eprintln!(
-            "DEBUG: Could not find system font for cache_key='{}', base_font='{}'",
+            "DEBUG: Could not find bundled standard font for cache_key='{}', base_font='{}'",
             cache_key, base_font
         );
         Ok(())
@@ -1623,6 +1406,295 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         Ok(())
     }
 
+    fn set_stroke_color_space(&mut self, args: &[PDFObject]) -> PDFResult<()> {
+        self.stroke_color_space = self.resolve_color_space_arg(args)?;
+        Ok(())
+    }
+
+    fn set_fill_color_space(&mut self, args: &[PDFObject]) -> PDFResult<()> {
+        self.fill_color_space = self.resolve_color_space_arg(args)?;
+        Ok(())
+    }
+
+    fn set_stroke_color(&mut self, args: &[PDFObject]) -> PDFResult<()> {
+        if self.stroke_color_space.is_some() {
+            if let Some(color) =
+                self.color_from_current_space(args, self.stroke_color_space.clone())?
+            {
+                self.current_state_mut().stroke_color = color;
+            }
+            return Ok(());
+        }
+        self.set_color_by_component_count(args, false)
+    }
+
+    fn set_fill_color(&mut self, args: &[PDFObject]) -> PDFResult<()> {
+        // Check for Pattern color space
+        if let Some(PDFObject::Name(cs_name)) = &self.fill_color_space {
+            if cs_name == "Pattern" {
+                return self.set_pattern_fill(args);
+            }
+        }
+        if self.fill_color_space.is_some() {
+            if let Some(color) =
+                self.color_from_current_space(args, self.fill_color_space.clone())?
+            {
+                self.current_state_mut().fill_color = color;
+            }
+            return Ok(());
+        }
+        self.set_color_by_component_count(args, true)
+    }
+
+    fn set_pattern_fill(&mut self, args: &[PDFObject]) -> PDFResult<()> {
+        use super::shading::ShadingKind;
+
+        let pattern_name = match args.first() {
+            Some(PDFObject::Name(n)) => n.clone(),
+            _ => return Ok(()),
+        };
+
+        let resources = match self.resources.clone() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let pattern_obj = {
+            let resolved = resolve_object_clone(resources, &mut self.resolver);
+            match resolved {
+                Some(PDFObject::Dictionary(d)) => d.get("Pattern").cloned(),
+                _ => None,
+            }
+        };
+
+        let pattern_ref = match pattern_obj {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let pattern_dict = resolve_object_clone(pattern_ref, &mut self.resolver);
+        let pattern_entry = match pattern_dict {
+            Some(PDFObject::Dictionary(d)) => d.get(&pattern_name).cloned(),
+            _ => None,
+        };
+
+        let pattern_entry = match pattern_entry {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let resolved_pattern =
+            resolve_object_clone(pattern_entry, &mut self.resolver).unwrap_or(PDFObject::Null);
+        let pattern_dict = match &resolved_pattern {
+            PDFObject::Dictionary(d) => d,
+            PDFObject::Stream { dict, .. } => dict,
+            _ => return Ok(()),
+        };
+
+        // Only handle Pattern Type 2 (shading patterns) for now
+        let pattern_type = pattern_dict
+            .get("PatternType")
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as i32;
+
+        if pattern_type != 2 {
+            return Ok(());
+        }
+
+        // Get the shading dictionary from the pattern
+        let shading_ref = match pattern_dict.get("Shading").cloned() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let shading_obj =
+            resolve_object_clone(shading_ref, &mut self.resolver).unwrap_or(PDFObject::Null);
+        let shading_dict = match &shading_obj {
+            PDFObject::Dictionary(d) => d,
+            PDFObject::Stream { dict, .. } => dict,
+            _ => return Ok(()),
+        };
+
+        let shading_type = shading_dict
+            .get("ShadingType")
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as i32;
+
+        if shading_type != 2 && shading_type != 3 {
+            return Ok(());
+        }
+
+        let n_components = match shading_dict.get("ColorSpace") {
+            Some(PDFObject::Name(n)) => match n.as_str() {
+                "DeviceGray" | "G" => 1,
+                "DeviceCMYK" | "CMYK" => 4,
+                _ => 3,
+            },
+            _ => 3,
+        };
+
+        let coords: Vec<f64> = match shading_dict.get("Coords") {
+            Some(PDFObject::Array(arr)) => arr.iter().filter_map(|v| v.as_number()).collect(),
+            _ => return Ok(()),
+        };
+
+        let domain = match shading_dict.get("Domain") {
+            Some(PDFObject::Array(arr)) => {
+                let vals: Vec<f64> = arr.iter().filter_map(|v| v.as_number()).collect();
+                if vals.len() >= 2 {
+                    [vals[0], vals[1]]
+                } else {
+                    [0.0, 1.0]
+                }
+            }
+            _ => [0.0, 1.0],
+        };
+
+        let extend = match shading_dict.get("Extend") {
+            Some(PDFObject::Array(arr)) => {
+                let vals: Vec<bool> = arr
+                    .iter()
+                    .filter_map(|v| match v.as_ref() {
+                        PDFObject::Boolean(b) => Some(*b),
+                        _ => None,
+                    })
+                    .collect();
+                [
+                    vals.first().copied().unwrap_or(true),
+                    vals.get(1).copied().unwrap_or(true),
+                ]
+            }
+            _ => [true, true],
+        };
+
+        let function = match shading_dict.get("Function") {
+            Some(f) => parse_shading_function(f, &mut self.resolver),
+            None => return Ok(()),
+        };
+
+        let kind = if shading_type == 2 {
+            if coords.len() < 4 {
+                return Ok(());
+            }
+            ShadingKind::Axial {
+                x0: coords[0],
+                y0: coords[1],
+                x1: coords[2],
+                y1: coords[3],
+                t0: domain[0],
+                t1: domain[1],
+                function,
+                extend_start: extend[0],
+                extend_end: extend[1],
+            }
+        } else {
+            if coords.len() < 6 {
+                return Ok(());
+            }
+            ShadingKind::Radial {
+                x0: coords[0],
+                y0: coords[1],
+                r0: coords[2],
+                x1: coords[3],
+                y1: coords[4],
+                r1: coords[5],
+                t0: domain[0],
+                t1: domain[1],
+                function,
+                extend_start: extend[0],
+                extend_end: extend[1],
+            }
+        };
+
+        let pattern_matrix = match pattern_dict.get("Matrix") {
+            Some(PDFObject::Array(arr)) if arr.len() >= 6 => {
+                let vals: Vec<f64> = arr.iter().filter_map(|v| v.as_number()).collect();
+                if vals.len() >= 6 {
+                    [vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]]
+                } else {
+                    [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+                }
+            }
+            _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        };
+
+        self.pending_fill_shading = Some(super::shading::Shading {
+            kind,
+            n_components,
+            bbox: None,
+            matrix: pattern_matrix,
+        });
+
+        Ok(())
+    }
+
+    fn set_color_by_component_count(&mut self, args: &[PDFObject], fill: bool) -> PDFResult<()> {
+        let color = match args.len() {
+            1 => Color::Gray(extract_number(args, 0)?),
+            3 => Color::RGB(
+                extract_number(args, 0)?,
+                extract_number(args, 1)?,
+                extract_number(args, 2)?,
+            ),
+            4 => Color::CMYK(
+                extract_number(args, 0)?,
+                extract_number(args, 1)?,
+                extract_number(args, 2)?,
+                extract_number(args, 3)?,
+            ),
+            _ => return Ok(()),
+        };
+        if fill {
+            self.current_state_mut().fill_color = color;
+        } else {
+            self.current_state_mut().stroke_color = color;
+        }
+        Ok(())
+    }
+
+    fn resolve_color_space_arg(&mut self, args: &[PDFObject]) -> PDFResult<Option<PDFObject>> {
+        let Some(PDFObject::Name(name)) = args.first() else {
+            return Ok(None);
+        };
+        Ok(self
+            .lookup_color_space_resource(name)
+            .or_else(|| Some(PDFObject::Name(name.clone()))))
+    }
+
+    fn lookup_color_space_resource(&mut self, name: &str) -> Option<PDFObject> {
+        let resources = self.resources.clone()?;
+        let resources = resolve_object_clone(resources, &mut self.resolver)?;
+        let PDFObject::Dictionary(resources_dict) = resources else {
+            return None;
+        };
+        let color_spaces = resources_dict.get("ColorSpace")?.clone();
+        let color_spaces = resolve_object_clone(color_spaces, &mut self.resolver)?;
+        let PDFObject::Dictionary(color_spaces_dict) = color_spaces else {
+            return None;
+        };
+        let color_space = color_spaces_dict.get(name)?.clone();
+        resolve_object_clone(color_space, &mut self.resolver)
+    }
+
+    fn color_from_current_space(
+        &mut self,
+        args: &[PDFObject],
+        color_space: Option<PDFObject>,
+    ) -> PDFResult<Option<Color>> {
+        let Some(color_space) = color_space else {
+            return Ok(None);
+        };
+        let color_space = match resolve_object_clone(color_space, &mut self.resolver) {
+            Some(cs) => cs,
+            None => return Ok(None),
+        };
+        Ok(color_from_color_space(
+            &color_space,
+            args,
+            &mut self.resolver,
+        ))
+    }
+
     // === Line Property Operators ===
 
     fn set_line_width(&mut self, args: &[crate::core::parser::PDFObject]) -> PDFResult<()> {
@@ -1775,15 +1847,261 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             }
         };
 
+        // Put resolver back so SMask rendering can use it
+        self.resolver = Some(resolver);
+
         if let PDFObject::Dictionary(gs_dict) = &*gs_obj {
             if let Some(mode) = gs_dict.get("BM").and_then(parse_blend_mode) {
                 self.current_state_mut().blend_mode = mode;
                 self.device.set_blend_mode(mode);
             }
+
+            // Handle fill/stroke alpha
+            if let Some(ca) = gs_dict.get("ca").and_then(|v| v.as_number()) {
+                self.current_state_mut().fill_alpha = ca;
+                self.device.set_opacity(ca);
+            }
+            if let Some(ca) = gs_dict.get("CA").and_then(|v| v.as_number()) {
+                self.current_state_mut().stroke_alpha = ca;
+            }
+
+            // Handle SMask (soft mask)
+            let smask_val = gs_dict.get("SMask").cloned();
+            let smask_resolved = match &smask_val {
+                Some(PDFObject::Ref(_)) => {
+                    let mut resolver = self.resolver.take();
+                    let r = resolve_object_clone(smask_val.clone().unwrap(), &mut resolver);
+                    self.resolver = resolver;
+                    r
+                }
+                Some(_) => smask_val.clone(),
+                None => None,
+            };
+            match smask_resolved.as_ref() {
+                Some(PDFObject::Name(n)) if n == "None" => {
+                    let _ = self.device.set_soft_mask(None);
+                }
+                Some(PDFObject::Dictionary(smask_dict)) => {
+                    self.render_and_set_soft_mask(smask_dict.clone());
+                }
+                _ => {}
+            }
         }
 
-        self.resolver = Some(resolver);
         Ok(())
+    }
+
+    fn render_and_set_soft_mask(&mut self, smask_dict: HashMap<String, PDFObject>) {
+        let luminosity = match smask_dict.get("S") {
+            Some(PDFObject::Name(n)) => n == "Luminosity",
+            _ => false,
+        };
+
+        let group_ref = match smask_dict.get("G") {
+            Some(g) => g.clone(),
+            None => return,
+        };
+
+        let group_key = match &group_ref {
+            PDFObject::Ref(r) => Some((r.num, r.generation)),
+            _ => None,
+        };
+        if group_key.is_some_and(|key| self.soft_mask_group_stack.contains(&key)) {
+            return;
+        }
+
+        let group_obj = match &mut self.resolver {
+            Some(r) => r.resolve_if_ref(&group_ref).ok(),
+            None => None,
+        };
+
+        let (form_dict, form_data) = match group_obj.as_deref() {
+            Some(PDFObject::Stream { dict, data }) => (dict.clone(), data.clone()),
+            _ => return,
+        };
+
+        let decoded_data = if let Some(filter) = form_dict.get("Filter") {
+            crate::core::decode::apply_filters(&form_data, filter).unwrap_or(form_data)
+        } else {
+            form_data
+        };
+
+        // Render the mask content offscreen.
+        // Reset opacity to 1.0 — the mask group is independent of the current ca.
+        let saved_opacity = self.current_state().fill_alpha;
+        self.device.set_opacity(1.0);
+        if let Some(key) = group_key {
+            self.soft_mask_group_stack.push(key);
+        }
+        let _ = self.device.begin_offscreen();
+
+        // Save current resources and set form resources if available
+        let prev_resources = self.resources.clone();
+        let mut resolver = self.resolver.take();
+        if let Some(form_res) = form_dict.get("Resources").cloned() {
+            let resolved = resolve_object_clone(form_res, &mut resolver);
+            if let Some(res) = resolved {
+                self.resources = Some(res);
+            }
+        }
+        self.resolver = resolver;
+
+        // Process the mask content stream
+        self.process_content_stream_bytes(decoded_data);
+
+        // Restore resources
+        self.resources = prev_resources;
+
+        // Extract mask and set it
+        if let Some((mask_data, mw, mh)) = self.device.end_offscreen_as_mask(luminosity) {
+            let _ = self.device.set_soft_mask(Some((&mask_data, mw, mh)));
+        }
+        // Restore the original opacity
+        self.device.set_opacity(saved_opacity);
+        if group_key.is_some() {
+            self.soft_mask_group_stack.pop();
+        }
+    }
+
+    // === Shading Operator ===
+
+    fn handle_shading_fill(&mut self, args: &[crate::core::parser::PDFObject]) -> PDFResult<()> {
+        use super::shading::ShadingKind;
+
+        let shading_name = match args.first() {
+            Some(PDFObject::Name(n)) => n.as_str(),
+            _ => return Ok(()),
+        };
+
+        let resources = match self.resources.as_ref() {
+            Some(PDFObject::Dictionary(d)) => d.clone(),
+            _ => return Ok(()),
+        };
+
+        let shading_ref = match resources.get("Shading").cloned() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let shading_obj =
+            resolve_object_clone(shading_ref, &mut self.resolver).unwrap_or(PDFObject::Null);
+        let shading_dict = match &shading_obj {
+            PDFObject::Dictionary(d) => d,
+            PDFObject::Stream { dict, .. } => dict,
+            _ => return Ok(()),
+        };
+
+        let shading_type = shading_dict
+            .get("ShadingType")
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as i32;
+
+        if shading_type != 2 && shading_type != 3 {
+            return Ok(());
+        }
+
+        let n_components = match shading_dict.get("ColorSpace") {
+            Some(PDFObject::Name(n)) => match n.as_str() {
+                "DeviceGray" | "G" => 1,
+                "DeviceCMYK" | "CMYK" => 4,
+                _ => 3,
+            },
+            _ => 3,
+        };
+
+        let coords: Vec<f64> = match shading_dict.get("Coords") {
+            Some(PDFObject::Array(arr)) => arr.iter().filter_map(|v| v.as_number()).collect(),
+            _ => return Ok(()),
+        };
+
+        let domain = match shading_dict.get("Domain") {
+            Some(PDFObject::Array(arr)) => {
+                let vals: Vec<f64> = arr.iter().filter_map(|v| v.as_number()).collect();
+                if vals.len() >= 2 {
+                    [vals[0], vals[1]]
+                } else {
+                    [0.0, 1.0]
+                }
+            }
+            _ => [0.0, 1.0],
+        };
+
+        let extend = match shading_dict.get("Extend") {
+            Some(PDFObject::Array(arr)) => {
+                let vals: Vec<bool> = arr
+                    .iter()
+                    .filter_map(|v| match v.as_ref() {
+                        PDFObject::Boolean(b) => Some(*b),
+                        _ => None,
+                    })
+                    .collect();
+                [
+                    vals.first().copied().unwrap_or(true),
+                    vals.get(1).copied().unwrap_or(true),
+                ]
+            }
+            _ => [true, true],
+        };
+
+        let function = match shading_dict.get("Function") {
+            Some(f) => parse_shading_function(f, &mut self.resolver),
+            None => return Ok(()),
+        };
+
+        let bbox = match shading_dict.get("BBox") {
+            Some(PDFObject::Array(arr)) => {
+                let vals: Vec<f64> = arr.iter().filter_map(|v| v.as_number()).collect();
+                if vals.len() >= 4 {
+                    Some([vals[0], vals[1], vals[2], vals[3]])
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        let kind = if shading_type == 2 {
+            if coords.len() < 4 {
+                return Ok(());
+            }
+            ShadingKind::Axial {
+                x0: coords[0],
+                y0: coords[1],
+                x1: coords[2],
+                y1: coords[3],
+                t0: domain[0],
+                t1: domain[1],
+                function,
+                extend_start: extend[0],
+                extend_end: extend[1],
+            }
+        } else {
+            if coords.len() < 6 {
+                return Ok(());
+            }
+            ShadingKind::Radial {
+                x0: coords[0],
+                y0: coords[1],
+                r0: coords[2],
+                x1: coords[3],
+                y1: coords[4],
+                r1: coords[5],
+                t0: domain[0],
+                t1: domain[1],
+                function,
+                extend_start: extend[0],
+                extend_end: extend[1],
+            }
+        };
+
+        let shading = super::shading::Shading {
+            kind,
+            n_components,
+            bbox,
+            matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        };
+        let ctm = self.current_state().ctm;
+        self.device.draw_shading(&shading, &ctm)
     }
 
     // === XObject Operator ===
@@ -2209,9 +2527,19 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 (decoded_data, color_space_name)
             };
 
-        // Apply /Decode array inversion for non-CMYK images.
-        // CMYK JPEGs: the JPEG decoder handles colorspace conversion internally,
-        // so the Decode array (used for Adobe CMYK inversion) should not be re-applied.
+        // Handle DeviceCMYK images: convert CMYK → RGB via ICC profile.
+        // (only when the `rendering` feature is enabled — which provides moxcms)
+        #[cfg(feature = "rendering")]
+        let (decoded_data, color_space_name) = if color_space_name == Some("DeviceCMYK") {
+            let rgb = crate::rendering::cmyk_icc::cmyk_image_to_rgb(&decoded_data);
+            (rgb, Some("DeviceRGB"))
+        } else {
+            (decoded_data, color_space_name)
+        };
+
+        // Apply /Decode array inversion.
+        // After ICC conversion (rendering feature), CMYK data is RGB so inversion applies.
+        // Without ICC, CMYK JPEGs handle colorspace internally — skip inversion.
         let is_cmyk = matches!(color_space_name, Some("DeviceCMYK"));
         let decoded_data = if !is_cmyk {
             if let Some(PDFObject::Array(decode_arr)) = xobject_dict.get("Decode") {
@@ -2224,6 +2552,10 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         };
 
         // Create image data for the device
+        let interpolate = matches!(
+            xobject_dict.get("Interpolate"),
+            Some(PDFObject::Boolean(true))
+        );
         let image = super::ImageData {
             width: decoded_width,
             height: decoded_height,
@@ -2231,6 +2563,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             has_alpha: decoded_has_alpha,
             bits_per_component: decoded_bpc,
             is_mask: is_image_mask,
+            interpolate,
             mask_color: {
                 let c = self.current_state().fill_color;
                 match c {
@@ -2398,6 +2731,163 @@ fn extract_number(args: &[crate::core::parser::PDFObject], index: usize) -> PDFR
     }
 }
 
+/// Parse a shading function from a PDFObject (Type 2 exponential or Type 4 PostScript).
+fn parse_shading_function(
+    obj: &PDFObject,
+    resolver: &mut Option<&mut dyn PageResolver>,
+) -> super::shading::ShadingFunction {
+    let resolved = resolve_object_clone(obj.clone(), resolver).unwrap_or(PDFObject::Null);
+    match &resolved {
+        PDFObject::Dictionary(dict) => {
+            let ft = dict
+                .get("FunctionType")
+                .and_then(|v| v.as_number())
+                .unwrap_or(2.0) as i32;
+            if ft == 2 {
+                let c0 = number_array(dict.get("C0")).unwrap_or_default();
+                let c1 = number_array(dict.get("C1")).unwrap_or_default();
+                let n = dict.get("N").and_then(|v| v.as_number()).unwrap_or(1.0);
+                super::shading::ShadingFunction::Exponential { c0, c1, n }
+            } else if ft == 3 {
+                let domain_arr = number_array(dict.get("Domain")).unwrap_or_else(|| vec![0.0, 1.0]);
+                let domain = [
+                    domain_arr.first().copied().unwrap_or(0.0),
+                    domain_arr.get(1).copied().unwrap_or(1.0),
+                ];
+                let bounds = number_array(dict.get("Bounds")).unwrap_or_default();
+                let encode = number_array(dict.get("Encode")).unwrap_or_default();
+                let functions: Vec<super::shading::ShadingFunction> = match dict.get("Functions") {
+                    Some(PDFObject::Array(arr)) => arr
+                        .iter()
+                        .map(|f| parse_shading_function(f, resolver))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                super::shading::ShadingFunction::Stitching {
+                    functions,
+                    bounds,
+                    encode,
+                    domain,
+                }
+            } else {
+                super::shading::ShadingFunction::Exponential {
+                    c0: vec![0.0],
+                    c1: vec![1.0],
+                    n: 1.0,
+                }
+            }
+        }
+        PDFObject::Stream { dict, data } => super::shading::ShadingFunction::PostScript {
+            program: data.clone(),
+            domain: number_array(dict.get("Domain")).unwrap_or_default(),
+            range: number_array(dict.get("Range")).unwrap_or_default(),
+        },
+        _ => super::shading::ShadingFunction::Exponential {
+            c0: vec![0.0],
+            c1: vec![1.0],
+            n: 1.0,
+        },
+    }
+}
+
+fn bundled_standard_font_data(base_font: &str) -> Option<Vec<u8>> {
+    let font = match base_font {
+        "Helvetica" | "ArialMT" | "Arial" | "LiberationSans" | "NimbusSanL-Regu" => {
+            include_bytes!("../../assets/fonts/LiberationSans-Regular.ttf").as_slice()
+        }
+        "Helvetica-Bold"
+        | "Arial-BoldMT"
+        | "Arial-Bold"
+        | "Arial,Bold"
+        | "LiberationSans-Bold"
+        | "NimbusSanL-Bold" => {
+            include_bytes!("../../assets/fonts/LiberationSans-Bold.ttf").as_slice()
+        }
+        "Helvetica-Oblique"
+        | "Arial-ItalicMT"
+        | "Arial-Italic"
+        | "Helvetica-Italic"
+        | "LiberationSans-Italic"
+        | "NimbusSanL-ReguItal" => {
+            include_bytes!("../../assets/fonts/LiberationSans-Italic.ttf").as_slice()
+        }
+        "Helvetica-BoldOblique"
+        | "Arial-BoldItalicMT"
+        | "Helvetica-BoldItalic"
+        | "LiberationSans-BoldItalic"
+        | "NimbusSanL-BoldItal" => {
+            include_bytes!("../../assets/fonts/LiberationSans-BoldItalic.ttf").as_slice()
+        }
+        "Times-Roman" | "Times" | "Times New Roman" | "TimesNewRomanPSMT" | "TimesNewRoman"
+        | "TimesNewRomanPS" | "LiberationSerif" | "NimbusRomNo9L-Regu" => {
+            include_bytes!("../../assets/fonts/LiberationSerif-Regular.ttf").as_slice()
+        }
+        "Times-Bold"
+        | "TimesNewRomanPS-BoldMT"
+        | "TimesNewRomanPS-Bold"
+        | "TimesNewRoman-Bold"
+        | "LiberationSerif-Bold"
+        | "NimbusRomNo9L-Medi" => {
+            include_bytes!("../../assets/fonts/LiberationSerif-Bold.ttf").as_slice()
+        }
+        "Times-Italic"
+        | "TimesNewRomanPS-ItalicMT"
+        | "TimesNewRomanPS-Italic"
+        | "TimesNewRoman-Italic"
+        | "LiberationSerif-Italic"
+        | "NimbusRomNo9L-ReguItal" => {
+            include_bytes!("../../assets/fonts/LiberationSerif-Italic.ttf").as_slice()
+        }
+        "Times-BoldItalic"
+        | "TimesNewRomanPS-BoldItalicMT"
+        | "TimesNewRomanPS-BoldItalic"
+        | "TimesNewRoman-BoldItalic"
+        | "LiberationSerif-BoldItalic"
+        | "NimbusRomNo9L-MediItal" => {
+            include_bytes!("../../assets/fonts/LiberationSerif-BoldItalic.ttf").as_slice()
+        }
+        "Courier" | "CourierNew" | "CourierNewPSMT" | "LiberationMono" | "NimbusMonL-Regu" => {
+            include_bytes!("../../assets/fonts/LiberationMono-Regular.ttf").as_slice()
+        }
+        "Courier-Bold"
+        | "CourierNewPS-BoldMT"
+        | "CourierNew-Bold"
+        | "LiberationMono-Bold"
+        | "NimbusMonL-Bold" => {
+            include_bytes!("../../assets/fonts/LiberationMono-Bold.ttf").as_slice()
+        }
+        "Courier-Oblique"
+        | "CourierNewPS-ItalicMT"
+        | "CourierNew-Italic"
+        | "LiberationMono-Italic"
+        | "NimbusMonL-ReguObli" => {
+            include_bytes!("../../assets/fonts/LiberationMono-Italic.ttf").as_slice()
+        }
+        "Courier-BoldOblique"
+        | "CourierNewPS-BoldItalicMT"
+        | "CourierNew-BoldItalic"
+        | "LiberationMono-BoldItalic"
+        | "NimbusMonL-BoldObli" => {
+            include_bytes!("../../assets/fonts/LiberationMono-BoldItalic.ttf").as_slice()
+        }
+        _ => {
+            let lower = base_font.to_ascii_lowercase();
+            if lower.contains("mono") || lower.contains("courier") || lower.contains("typewriter") {
+                include_bytes!("../../assets/fonts/LiberationMono-Regular.ttf").as_slice()
+            } else if lower.contains("sans")
+                || lower.contains("helvetica")
+                || lower.contains("arial")
+            {
+                include_bytes!("../../assets/fonts/LiberationSans-Regular.ttf").as_slice()
+            } else {
+                include_bytes!("../../assets/fonts/LiberationSerif-Regular.ttf").as_slice()
+            }
+        }
+    };
+
+    Some(font.to_vec())
+}
+
 fn parse_four_number_array(obj: Option<&PDFObject>) -> Option<[f64; 4]> {
     let PDFObject::Array(values) = obj? else {
         return None;
@@ -2520,6 +3010,197 @@ fn mode_clips(mode: super::graphics_state::TextRenderingMode) -> bool {
             | super::graphics_state::TextRenderingMode::FillStrokeClip
             | super::graphics_state::TextRenderingMode::Clip
     )
+}
+
+fn resolve_object_clone(
+    object: PDFObject,
+    resolver: &mut Option<&mut dyn PageResolver>,
+) -> Option<PDFObject> {
+    match object {
+        PDFObject::Ref(r) => resolver
+            .as_mut()?
+            .resolve_ref(r.num, r.generation)
+            .ok()
+            .map(|o| (*o).clone()),
+        other => Some(other),
+    }
+}
+
+fn color_from_color_space(
+    color_space: &PDFObject,
+    args: &[PDFObject],
+    resolver: &mut Option<&mut dyn PageResolver>,
+) -> Option<Color> {
+    match color_space {
+        PDFObject::Name(name) => color_from_named_space(name, args),
+        PDFObject::Array(arr) if arr.len() >= 4 => {
+            if !matches!(&*arr[0], PDFObject::Name(name) if name == "Separation") {
+                return None;
+            }
+            let tint = extract_number(args, 0).ok()?;
+            let alternate = resolve_object_clone(arr[2].as_ref().clone(), resolver)?;
+            let tint_fn = resolve_object_clone(arr[3].as_ref().clone(), resolver)?;
+            let alternate_components = components_for_color_space(&alternate).max(1);
+            let components = eval_tint_function(&tint_fn, &[tint], alternate_components)?;
+            color_from_components(&alternate, &components)
+        }
+        _ => None,
+    }
+}
+
+fn color_from_named_space(name: &str, args: &[PDFObject]) -> Option<Color> {
+    match name {
+        "DeviceGray" | "G" => Some(Color::Gray(extract_number(args, 0).ok()?)),
+        "DeviceRGB" | "RGB" => Some(Color::RGB(
+            extract_number(args, 0).ok()?,
+            extract_number(args, 1).ok()?,
+            extract_number(args, 2).ok()?,
+        )),
+        "DeviceCMYK" | "CMYK" => Some(Color::CMYK(
+            extract_number(args, 0).ok()?,
+            extract_number(args, 1).ok()?,
+            extract_number(args, 2).ok()?,
+            extract_number(args, 3).ok()?,
+        )),
+        _ => None,
+    }
+}
+
+fn color_from_components(color_space: &PDFObject, components: &[f64]) -> Option<Color> {
+    match color_space {
+        PDFObject::Name(name) => match name.as_str() {
+            "DeviceGray" | "G" => Some(Color::Gray(*components.first()?)),
+            "DeviceRGB" | "RGB" => Some(Color::RGB(
+                *components.first()?,
+                *components.get(1)?,
+                *components.get(2)?,
+            )),
+            "DeviceCMYK" | "CMYK" => Some(Color::CMYK(
+                *components.first()?,
+                *components.get(1)?,
+                *components.get(2)?,
+                *components.get(3)?,
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn components_for_color_space(color_space: &PDFObject) -> usize {
+    match color_space {
+        PDFObject::Name(name) => match name.as_str() {
+            "DeviceGray" | "G" => 1,
+            "DeviceRGB" | "RGB" => 3,
+            "DeviceCMYK" | "CMYK" => 4,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn eval_tint_function(
+    function: &PDFObject,
+    input: &[f64],
+    output_count: usize,
+) -> Option<Vec<f64>> {
+    let dict = match function {
+        PDFObject::Dictionary(dict) => dict,
+        PDFObject::Stream { dict, .. } => dict,
+        _ => return None,
+    };
+    match dict.get("FunctionType") {
+        Some(PDFObject::Number(n)) if (*n as i32) == 2 => eval_type2_function(dict, input),
+        Some(PDFObject::Number(n)) if (*n as i32) == 4 => {
+            let PDFObject::Stream { data, .. } = function else {
+                return None;
+            };
+            eval_type4_function(dict, data, input, output_count)
+        }
+        _ => None,
+    }
+}
+
+fn eval_type2_function(dict: &HashMap<String, PDFObject>, input: &[f64]) -> Option<Vec<f64>> {
+    // Ported from pdf.js `PDFFunctionFactory.constructInterpolated`
+    // (`src/core/function.js`): y_j = C0_j + x^N * (C1_j - C0_j).
+    let x = input.first().copied().unwrap_or(0.0).clamp(0.0, 1.0);
+    let c0 = number_array(dict.get("C0"))?;
+    let c1 = number_array(dict.get("C1"))?;
+    let n = match dict.get("N") {
+        Some(PDFObject::Number(n)) => *n,
+        _ => 1.0,
+    };
+    let scale = x.powf(n);
+    Some(
+        c0.iter()
+            .zip(c1.iter())
+            .map(|(start, end)| start + scale * (end - start))
+            .collect(),
+    )
+}
+
+fn eval_type4_function(
+    _dict: &HashMap<String, PDFObject>,
+    data: &[u8],
+    input: &[f64],
+    output_count: usize,
+) -> Option<Vec<f64>> {
+    // Minimal PostScript calculator evaluator for tint transforms, following
+    // pdf.js `PostScriptEvaluator` behavior for stack arithmetic operators.
+    let program = std::str::from_utf8(data).ok()?;
+    let mut stack = input.to_vec();
+    for token in program
+        .replace(['{', '}'], " ")
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+    {
+        if let Ok(value) = token.parse::<f64>() {
+            stack.push(value);
+            continue;
+        }
+        match token {
+            "dup" => stack.push(*stack.last()?),
+            "exch" => {
+                let len = stack.len();
+                if len < 2 {
+                    return None;
+                }
+                stack.swap(len - 1, len - 2);
+            }
+            "pop" => {
+                stack.pop()?;
+            }
+            "add" => binary_stack_op(&mut stack, |a, b| a + b)?,
+            "sub" => binary_stack_op(&mut stack, |a, b| a - b)?,
+            "mul" => binary_stack_op(&mut stack, |a, b| a * b)?,
+            "div" => binary_stack_op(&mut stack, |a, b| a / b)?,
+            _ => return None,
+        }
+    }
+    if stack.len() < output_count {
+        return None;
+    }
+    Some(stack[stack.len() - output_count..].to_vec())
+}
+
+fn binary_stack_op(stack: &mut Vec<f64>, op: impl FnOnce(f64, f64) -> f64) -> Option<()> {
+    let b = stack.pop()?;
+    let a = stack.pop()?;
+    stack.push(op(a, b));
+    Some(())
+}
+
+fn number_array(object: Option<&PDFObject>) -> Option<Vec<f64>> {
+    let PDFObject::Array(arr) = object? else {
+        return None;
+    };
+    arr.iter()
+        .map(|item| match &**item {
+            PDFObject::Number(n) => Some(*n),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Resolve and expand an Indexed color space lookup table.
@@ -2650,15 +3331,53 @@ fn apply_predictor_from_parms(
         Some(PDFObject::Number(n)) => *n as usize,
         _ => 1,
     };
-    let bpc = match parms_dict.get("BitsPerComponent") {
+    // Use the image XObject's BitsPerComponent when available — the DecodeParms
+    // value can be wrong (e.g. 1 when the image is actually 8 bpc).
+    let bpc = match dict.get("BitsPerComponent") {
         Some(PDFObject::Number(n)) => *n as usize,
-        _ => 8,
+        _ => match parms_dict.get("BitsPerComponent") {
+            Some(PDFObject::Number(n)) => *n as usize,
+            _ => 8,
+        },
     };
     let cols = match parms_dict.get("Columns") {
         Some(PDFObject::Number(n)) => *n as usize,
         _ => default_columns as usize,
     };
-    crate::core::decode::decode_png_predictor(&data, colors, bpc, cols).unwrap_or(data)
+    // Compute row sizes
+    let row_bytes = (cols * colors * bpc + 7) / 8;
+    let pred_stride = 1 + row_bytes; // stride with predictor byte per row
+    let height = match dict.get("Height") {
+        Some(PDFObject::Number(h)) => *h as usize,
+        _ => 0,
+    };
+
+    let data_len = data.len();
+    let pred_target = if height > 0 {
+        (height * pred_stride).min(data_len)
+    } else {
+        (data_len / pred_stride) * pred_stride
+    };
+    let mut aligned = data;
+    aligned.truncate(pred_target);
+
+    // Try PNG predictor
+    let decoded = crate::core::decode::decode_png_predictor(&aligned, colors, bpc, cols);
+    match decoded {
+        Ok(out) => out,
+        Err(_) => {
+            // Predictor failed — data likely has no PNG prediction.
+            // Fall back to the exact raw pixel count; malformed streams can
+            // declare Predictor=15 even when the decoded bytes are plain pixels.
+            let raw_target = if height > 0 {
+                height * row_bytes
+            } else {
+                (data_len / row_bytes) * row_bytes
+            };
+            aligned.truncate(raw_target.min(aligned.len()));
+            aligned
+        }
+    }
 }
 
 /// Parse Lab color space parameters from the CS array.

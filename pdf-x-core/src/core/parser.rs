@@ -522,13 +522,45 @@ impl Parser {
 
         // Read the stream data
         // We're already positioned at stream_start_pos (right after the newline)
-        let data = if let Some(len) = length {
+        let data: Vec<u8> = if let Some(len) = length {
             // We know the length, read exactly that many bytes
             let mut bytes = Vec::with_capacity(len);
             for _ in 0..len {
                 match self.lexer.get_stream_byte() {
                     Ok(b) => bytes.push(b),
                     Err(_) => break, // EOF or error
+                }
+            }
+            // Verify the length by checking if we're at endstream.
+            // Some PDFs have incorrect /Length values that are too short.
+            // Peek ahead for endstream; if we find non-whitespace content before
+            // it, the declared length was wrong — extend to the real boundary.
+            let end = b"endstream";
+            let peek_pos = self.lexer.get_position();
+            let mut lookahead = Vec::new();
+            for _ in 0..64 {
+                match self.lexer.get_stream_byte() {
+                    Ok(b) => {
+                        lookahead.push(b);
+                        let slen = lookahead.len();
+                        if slen >= end.len() && lookahead[slen - end.len()..] == end[..] {
+                            let content_before = &lookahead[..slen - end.len()];
+                            let has_content =
+                                content_before.iter().any(|b| !b.is_ascii_whitespace());
+                            if has_content {
+                                bytes.extend_from_slice(content_before);
+                            } else {
+                                // Length was correct — rewind to before endstream
+                                self.lexer.set_position(peek_pos)?;
+                            }
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        // EOF — rewind
+                        self.lexer.set_position(peek_pos)?;
+                        break;
+                    }
                 }
             }
             bytes
