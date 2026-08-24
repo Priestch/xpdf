@@ -1,9 +1,8 @@
+use pdf_x_core::PDFDocument;
 /// Comprehensive rendering debug trace
 ///
 /// This test renders a PDF page with full logging to diagnose rendering issues.
 use pdf_x_core::rendering::device::Device;
-use pdf_x_core::rendering::{Color, Paint};
-use pdf_x_core::{PDFDocument, Page};
 use pdf_x_device_tinyskia::SkiaDevice;
 use std::fs::File;
 use std::io::Write;
@@ -45,18 +44,19 @@ fn debug_rendering_trace() {
     };
 
     let mut doc = PDFDocument::open(pdf_data).expect("Failed to open PDF");
-    log!("✓ PDF opened, {} pages", doc.page_count());
+    log!(
+        "✓ PDF opened, {} pages",
+        doc.page_count().expect("Failed to count pages")
+    );
 
     let page_num = 0;
     log!("\n--- Rendering page {} ---", page_num);
 
-    let page = doc.page(page_num).expect("Failed to get page");
-    let page_obj = page.page_obj();
-
+    let page = doc.get_page(page_num).expect("Failed to get page");
     // Get MediaBox
-    let media_box = page_obj
+    let media_box = page
         .get("MediaBox")
-        .or_else(|| page_obj.get("CropBox"))
+        .or_else(|| page.get("CropBox"))
         .expect("No MediaBox");
 
     log!("MediaBox: {:?}", media_box);
@@ -123,7 +123,7 @@ fn debug_rendering_trace() {
     log!("\n--- Starting page rendering ---");
     let render_start = std::time::Instant::now();
 
-    match page.render(&mut device) {
+    match page.render(doc.doc_store_mut(), &mut device) {
         Ok(_) => {
             let elapsed = render_start.elapsed();
             log!("✓ Page rendered in {:.2}ms", elapsed.as_secs_f64() * 1000.0);
@@ -204,7 +204,7 @@ fn debug_rendering_trace() {
             i + 1,
             color,
             count,
-            *count as f64 / total_pixels as f64 * 100.0
+            **count as f64 / total_pixels as f64 * 100.0
         );
     }
 

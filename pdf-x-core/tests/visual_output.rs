@@ -3,7 +3,7 @@
 use pdf_x_core::PDFDocument;
 use pdf_x_device_tinyskia::RenderToImage;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 
 // Simple PNG writer (based on PNG spec)
 fn write_simple_png(path: &str, width: u32, height: u32, data: &[u8]) -> std::io::Result<()> {
@@ -54,16 +54,15 @@ fn write_simple_png(path: &str, width: u32, height: u32, data: &[u8]) -> std::io
 }
 
 fn write_chunk(writer: &mut BufWriter<File>, name: &[u8; 4], data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-
     let len = (data.len() as u32).to_be_bytes();
     writer.write_all(&len)?;
 
     writer.write_all(name)?;
 
-    let mut crc = crc32fast::hash(data);
-    let name_crc = crc32fast::hash(name);
-    crc = crc32fast::hash_combine(name_crc, crc);
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(name);
+    hasher.update(data);
+    let crc = hasher.finalize();
 
     writer.write_all(data)?;
     writer.write_all(&crc.to_be_bytes())?;

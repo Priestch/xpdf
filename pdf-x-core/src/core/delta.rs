@@ -704,10 +704,11 @@ mod tests {
     #[test]
     fn test_delta_layer_creation() {
         let delta = DeltaLayer::new(100);
+        let history = CommandHistory::new();
         assert_eq!(delta.next_obj_num(), 100);
         assert_eq!(delta.change_count(), 0);
-        assert!(!delta.can_undo());
-        assert!(!delta.can_redo());
+        assert!(!history.can_undo());
+        assert!(!history.can_redo());
     }
 
     #[test]

@@ -513,8 +513,7 @@ fn test_draw_image() {
 fn test_skia_draw_rectangle() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     let mut font_cache = FontCache::new();
-    let mut font_cache_device_1 = std::collections::HashMap::new();
-    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache, &mut font_cache_device_1);
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
 
     device.begin_path();
     device.rect(10.0, 10.0, 80.0, 80.0);
@@ -537,8 +536,7 @@ fn test_skia_draw_rectangle() {
 fn test_skia_draw_path() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     let mut font_cache = FontCache::new();
-    let mut font_cache_device_2 = std::collections::HashMap::new();
-    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache, &mut font_cache_device_2);
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
 
     device.begin_path();
     device.move_to(10.0, 10.0);
@@ -561,8 +559,7 @@ fn test_skia_draw_path() {
 fn test_skia_transformations() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     let mut font_cache = FontCache::new();
-    let mut font_cache_device_3 = std::collections::HashMap::new();
-    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache, &mut font_cache_device_3);
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
 
     device.save_state();
     device.concat_matrix(&[0.5, 0.0, 0.0, 0.5, 25.0, 25.0]);

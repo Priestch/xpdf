@@ -69,7 +69,7 @@ proptest! {
         };
 
         // Execute command
-        let exec_result = command.execute(&mut delta);
+        let exec_result = command.execute(&mut delta, None);
         prop_assert!(exec_result.is_ok());
 
         // Verify change was applied
@@ -202,7 +202,11 @@ pub struct TestModifyCommand {
 }
 
 impl Command for TestModifyCommand {
-    fn execute(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a pdf_x_core::core::delta::BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
         if let Some(obj) = delta.get(&self.obj_ref) {
             self.old_value = Some(obj.clone());
         } else {

@@ -1,6 +1,4 @@
 //! Deep investigation of issue7200.pdf coordinate transforms
-use pdf_x_core::PDFDocument;
-
 #[test]
 fn investigate_issue7200_transforms() {
     let pdf_path = "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/issue7200.pdf";
@@ -54,14 +52,16 @@ fn investigate_issue7200_transforms() {
 
                 // Fetch the XObject dictionary
                 if let Ok(xobj_dict) = doc.doc_store_mut().resolve_if_ref(xobject) {
-                    if let pdf_x_core::PDFObject::Dictionary(xobj) = &xobj_dict {
+                    if let pdf_x_core::PDFObject::Dictionary(xobj) = xobj_dict.as_ref() {
                         println!("\nXObject entries:");
                         for (name, obj) in xobj.iter().take(5) {
                             println!("  {} -> {:?}", name, obj);
 
                             // Try to fetch the XObject
                             if let Ok(xobj_data) = doc.doc_store_mut().resolve_if_ref(obj) {
-                                if let pdf_x_core::PDFObject::Stream { dict, .. } = &xobj_data {
+                                if let pdf_x_core::PDFObject::Stream { dict, .. } =
+                                    xobj_data.as_ref()
+                                {
                                     if let Some(subtype) = dict.get("Subtype") {
                                         println!("    Subtype: {:?}", subtype);
                                     }
@@ -83,7 +83,7 @@ fn investigate_issue7200_transforms() {
     // Print content stream (first 500 bytes)
     if let Some(contents) = page.contents() {
         if let Ok(content_data) = doc.doc_store_mut().resolve_if_ref(contents) {
-            if let pdf_x_core::PDFObject::Stream { dict, data } = &content_data {
+            if let pdf_x_core::PDFObject::Stream { dict, data } = content_data.as_ref() {
                 println!(
                     "\n=== Content Stream (first {} bytes) ===",
                     data.len().min(500)

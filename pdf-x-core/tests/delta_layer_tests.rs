@@ -2,7 +2,7 @@
 //!
 //! Tests for the delta layer that tracks PDF document modifications.
 
-use pdf_x_core::core::delta::{Command, DeltaObject};
+use pdf_x_core::core::delta::{BaseObjectFetcher, Command, CommandHistory};
 use pdf_x_core::core::{
     DeltaLayer,
     parser::{PDFObject, Ref},
@@ -17,7 +17,11 @@ struct ModifyCommand {
 }
 
 impl Command for ModifyCommand {
-    fn execute(&mut self, delta: &mut DeltaLayer) -> pdf_x_core::core::error::PDFResult<()> {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> pdf_x_core::core::error::PDFResult<()> {
         // Store old value for undo
         if let Some(obj) = delta.get(&self.obj_ref) {
             self.old_value = Some(obj.object.clone());
@@ -53,11 +57,12 @@ impl Command for ModifyCommand {
 
 #[test]
 fn test_delta_layer_creation() {
+    let history = CommandHistory::new();
     let delta = DeltaLayer::new(100);
 
     assert_eq!(delta.change_count(), 0);
-    assert!(!delta.can_undo());
-    assert!(!delta.can_redo());
+    assert!(!history.can_undo());
+    assert!(!history.can_redo());
 }
 
 #[test]
@@ -148,6 +153,7 @@ fn test_delete_removes_from_modified() {
 
 #[test]
 fn test_command_execution() {
+    let mut history = CommandHistory::new();
     let mut delta = DeltaLayer::new(100);
     let obj_ref = Ref::new(5, 0);
     let new_value = PDFObject::Number(42.0);
@@ -159,10 +165,10 @@ fn test_command_execution() {
         had_old_value: false,
     });
 
-    delta.execute_command(cmd).unwrap();
+    history.execute(&mut delta, cmd, None).unwrap();
 
-    assert!(delta.can_undo());
-    assert!(!delta.can_redo());
+    assert!(history.can_undo());
+    assert!(!history.can_redo());
     assert_eq!(delta.change_count(), 1);
 
     let retrieved = delta.get(&obj_ref);
@@ -171,6 +177,7 @@ fn test_command_execution() {
 
 #[test]
 fn test_command_undo() {
+    let mut history = CommandHistory::new();
     let mut delta = DeltaLayer::new(100);
     let obj_ref = Ref::new(5, 0);
     let new_value = PDFObject::Number(42.0);
@@ -182,18 +189,19 @@ fn test_command_undo() {
         had_old_value: false,
     });
 
-    delta.execute_command(cmd).unwrap();
+    history.execute(&mut delta, cmd, None).unwrap();
     assert!(delta.get(&obj_ref).is_some());
 
     // Undo
-    delta.undo().unwrap();
-    assert!(!delta.can_undo());
-    assert!(delta.can_redo());
+    history.undo(&mut delta).unwrap();
+    assert!(!history.can_undo());
+    assert!(history.can_redo());
     assert!(delta.get(&obj_ref).is_none()); // Object removed after undo
 }
 
 #[test]
 fn test_command_redo() {
+    let mut history = CommandHistory::new();
     let mut delta = DeltaLayer::new(100);
     let obj_ref = Ref::new(5, 0);
     let new_value = PDFObject::Number(42.0);
@@ -205,21 +213,22 @@ fn test_command_redo() {
         had_old_value: false,
     });
 
-    delta.execute_command(cmd).unwrap();
+    history.execute(&mut delta, cmd, None).unwrap();
 
     // Undo
-    delta.undo().unwrap();
+    history.undo(&mut delta).unwrap();
     assert!(delta.get(&obj_ref).is_none());
 
     // Redo
-    delta.redo().unwrap();
-    assert!(delta.can_undo());
-    assert!(!delta.can_redo());
+    history.redo(&mut delta).unwrap();
+    assert!(history.can_undo());
+    assert!(!history.can_redo());
     assert!(delta.get(&obj_ref).is_some()); // Object back after redo
 }
 
 #[test]
 fn test_multiple_commands_undo_redo() {
+    let mut history = CommandHistory::new();
     let mut delta = DeltaLayer::new(100);
     let obj_ref1 = Ref::new(5, 0);
     let obj_ref2 = Ref::new(6, 0);
@@ -238,26 +247,26 @@ fn test_multiple_commands_undo_redo() {
         had_old_value: false,
     });
 
-    delta.execute_command(cmd1).unwrap();
-    delta.execute_command(cmd2).unwrap();
+    history.execute(&mut delta, cmd1, None).unwrap();
+    history.execute(&mut delta, cmd2, None).unwrap();
 
     // Both objects should be modified
     assert!(delta.get(&obj_ref1).is_some());
     assert!(delta.get(&obj_ref2).is_some());
 
     // Undo both
-    delta.undo().unwrap();
-    delta.undo().unwrap();
+    history.undo(&mut delta).unwrap();
+    history.undo(&mut delta).unwrap();
 
-    assert!(!delta.can_undo());
-    assert!(delta.can_redo());
+    assert!(!history.can_undo());
+    assert!(history.can_redo());
 
     // Redo both
-    delta.redo().unwrap();
-    delta.redo().unwrap();
+    history.redo(&mut delta).unwrap();
+    history.redo(&mut delta).unwrap();
 
-    assert!(delta.can_undo());
-    assert!(!delta.can_redo());
+    assert!(history.can_undo());
+    assert!(!history.can_redo());
 
     // Both objects should be modified again
     assert!(delta.get(&obj_ref1).is_some());
@@ -266,6 +275,7 @@ fn test_multiple_commands_undo_redo() {
 
 #[test]
 fn test_clear_resets_state() {
+    let mut history = CommandHistory::new();
     let mut delta = DeltaLayer::new(100);
 
     // Make some changes
@@ -275,34 +285,38 @@ fn test_clear_resets_state() {
 
     assert_eq!(delta.change_count(), 3);
 
-    // Clear
+    // Clear document state and the separate local command history.
     delta.clear();
+    history.clear();
 
     assert_eq!(delta.change_count(), 0);
-    assert!(!delta.can_undo());
-    assert!(!delta.can_redo());
+    assert!(!history.can_undo());
+    assert!(!history.can_redo());
     assert!(delta.get(&Ref::new(1, 0)).is_none());
     assert!(!delta.is_deleted(&Ref::new(3, 0)));
 }
 
 #[test]
 fn test_undo_when_empty_returns_error() {
+    let mut history = CommandHistory::new();
     let mut delta = DeltaLayer::new(100);
 
-    let result = delta.undo();
+    let result = history.undo(&mut delta);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_redo_when_empty_returns_error() {
+    let mut history = CommandHistory::new();
     let mut delta = DeltaLayer::new(100);
 
-    let result = delta.redo();
+    let result = history.redo(&mut delta);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_new_command_clears_redo_stack() {
+    let mut history = CommandHistory::new();
     let mut delta = DeltaLayer::new(100);
     let obj_ref = Ref::new(5, 0);
 
@@ -320,13 +334,13 @@ fn test_new_command_clears_redo_stack() {
         had_old_value: false,
     });
 
-    delta.execute_command(cmd1).unwrap();
-    delta.undo().unwrap();
-    assert!(delta.can_redo());
+    history.execute(&mut delta, cmd1, None).unwrap();
+    history.undo(&mut delta).unwrap();
+    assert!(history.can_redo());
 
     // New command should clear redo stack
-    delta.execute_command(cmd2).unwrap();
-    assert!(!delta.can_redo());
+    history.execute(&mut delta, cmd2, None).unwrap();
+    assert!(!history.can_redo());
 }
 
 #[test]
