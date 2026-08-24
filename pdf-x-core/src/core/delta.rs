@@ -37,6 +37,9 @@ pub struct DeltaLayer {
 
     /// Initial base PDF size (for clearing)
     base_pdf_size: u32,
+
+    /// Monotonic document-state revision used to invalidate derived caches.
+    revision: u64,
 }
 
 impl std::fmt::Debug for DeltaLayer {
@@ -47,12 +50,13 @@ impl std::fmt::Debug for DeltaLayer {
             .field("deleted", &self.deleted)
             .field("next_obj_num", &self.next_obj_num)
             .field("base_pdf_size", &self.base_pdf_size)
+            .field("revision", &self.revision)
             .finish()
     }
 }
 
 /// Object in the delta layer with metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeltaObject {
     /// The actual PDF object
     pub object: PDFObject,
@@ -192,6 +196,7 @@ impl DeltaLayer {
             deleted: HashSet::new(),
             next_obj_num: base_pdf_size,
             base_pdf_size,
+            revision: 0,
         }
     }
 
@@ -216,19 +221,20 @@ impl DeltaLayer {
     /// ```
     pub fn modify_object(&mut self, obj_ref: Ref, new_obj: PDFObject) {
         let key = (obj_ref.num, obj_ref.generation);
+        let replacement = DeltaObject {
+            object: new_obj,
+            obj_num: obj_ref.num,
+            generation: obj_ref.generation,
+        };
 
-        // Remove from deleted set if it was marked as deleted
-        self.deleted.remove(&key);
-
-        // Add to modified map
-        self.modified.insert(
-            key,
-            DeltaObject {
-                object: new_obj,
-                obj_num: obj_ref.num,
-                generation: obj_ref.generation,
-            },
-        );
+        let removed_deletion = self.deleted.remove(&key);
+        let changed_object = self.modified.get(&key) != Some(&replacement);
+        if changed_object {
+            self.modified.insert(key, replacement);
+        }
+        if removed_deletion || changed_object {
+            self.bump_revision();
+        }
     }
 
     /// Add a new object (doesn't exist in base PDF).
@@ -260,34 +266,51 @@ impl DeltaLayer {
         };
 
         self.new_objects.push(delta_obj);
+        self.bump_revision();
 
         Ref::new(obj_num, 0)
     }
 
     /// Restore an object at a previously allocated reference (used by redo).
     pub fn restore_new_object(&mut self, obj_ref: Ref, obj: PDFObject) {
-        self.deleted.remove(&obj_ref.as_id());
+        let mut changed = self.deleted.remove(&obj_ref.as_id());
         if let Some(existing) = self
             .new_objects
             .iter_mut()
             .find(|item| item.obj_num == obj_ref.num && item.generation == obj_ref.generation)
         {
-            existing.object = obj;
-            return;
+            if existing.object != obj {
+                existing.object = obj;
+                changed = true;
+            }
+        } else {
+            self.new_objects.push(DeltaObject {
+                object: obj,
+                obj_num: obj_ref.num,
+                generation: obj_ref.generation,
+            });
+            changed = true;
         }
-        self.new_objects.push(DeltaObject {
-            object: obj,
-            obj_num: obj_ref.num,
-            generation: obj_ref.generation,
-        });
-        self.next_obj_num = self.next_obj_num.max(obj_ref.num + 1);
+
+        let next_obj_num = self.next_obj_num.max(obj_ref.num.saturating_add(1));
+        if next_obj_num != self.next_obj_num {
+            self.next_obj_num = next_obj_num;
+            changed = true;
+        }
+        if changed {
+            self.bump_revision();
+        }
     }
 
     /// Remove a newly-created object while retaining its object number for redo.
     pub fn remove_new_object(&mut self, obj_ref: Ref) {
+        let previous_len = self.new_objects.len();
         self.new_objects
             .retain(|item| item.obj_num != obj_ref.num || item.generation != obj_ref.generation);
-        self.deleted.remove(&obj_ref.as_id());
+        let removed_deletion = self.deleted.remove(&obj_ref.as_id());
+        if self.new_objects.len() != previous_len || removed_deletion {
+            self.bump_revision();
+        }
     }
 
     /// Delete an object (mark as deleted).
@@ -307,10 +330,13 @@ impl DeltaLayer {
     /// ```
     pub fn delete_object(&mut self, obj_ref: Ref) {
         let key = (obj_ref.num, obj_ref.generation);
-        self.deleted.insert(key);
+        let inserted_deletion = self.deleted.insert(key);
 
         // Remove from modified if it was previously modified
-        self.modified.remove(&key);
+        let removed_modification = self.modified.remove(&key).is_some();
+        if inserted_deletion || removed_modification {
+            self.bump_revision();
+        }
     }
 
     /// Check if an object is deleted.
@@ -350,10 +376,26 @@ impl DeltaLayer {
     /// Command history is intentionally owned separately by [`CommandHistory`];
     /// clearing a serializable delta never mutates a local editor session.
     pub fn clear(&mut self) {
+        let changed = !self.modified.is_empty()
+            || !self.new_objects.is_empty()
+            || !self.deleted.is_empty()
+            || self.next_obj_num != self.base_pdf_size;
         self.modified.clear();
         self.new_objects.clear();
         self.deleted.clear();
         self.next_obj_num = self.base_pdf_size;
+        if changed {
+            self.bump_revision();
+        }
+    }
+
+    /// Monotonic revision of the serializable delta state.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Get the total count of changes (modifications + additions + deletions).
@@ -709,6 +751,35 @@ mod tests {
         assert_eq!(delta.change_count(), 0);
         assert!(!history.can_undo());
         assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn revision_tracks_effective_mutations() {
+        let mut delta = DeltaLayer::new(100);
+        let object_ref = Ref::new(5, 0);
+
+        assert_eq!(delta.revision(), 0);
+
+        delta.modify_object(object_ref, PDFObject::Number(42.0));
+        assert_eq!(delta.revision(), 1);
+
+        // Re-applying the exact same state is not a new document revision.
+        delta.modify_object(object_ref, PDFObject::Number(42.0));
+        assert_eq!(delta.revision(), 1);
+
+        delta.delete_object(object_ref);
+        assert_eq!(delta.revision(), 2);
+
+        // Re-applying an existing deletion is also a no-op.
+        delta.delete_object(object_ref);
+        assert_eq!(delta.revision(), 2);
+
+        delta.clear();
+        assert_eq!(delta.revision(), 3);
+
+        // Clearing an already-empty delta does not invalidate caches again.
+        delta.clear();
+        assert_eq!(delta.revision(), 3);
     }
 
     #[test]

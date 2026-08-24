@@ -72,10 +72,12 @@ pub struct PDFDocument {
     /// Whether the page reference cache has been built
     page_ref_cache_built: bool,
 
-    /// LRU cache of resolved pages (`Arc<ResolvedPage>`). `resolve_page` checks this
-    /// cache first and rebuilds on miss. Cleared when delta is modified.
+    /// Delta revision represented by the page-tree-derived caches.
+    page_cache_revision: u64,
+
+    /// LRU cache of resolved pages keyed by page index and delta revision.
     /// Default capacity: 10 pages (viewer rarely navigates more than ~5 pages back).
-    page_resolved_cache: LruCache<usize, Arc<super::resolved_page::ResolvedPage>>,
+    page_resolved_cache: LruCache<(usize, u64), Arc<super::resolved_page::ResolvedPage>>,
 
     /// Device-specific font parse arena (type-erased). The rendering backend (e.g.
     /// tinyskia) stores `HashMap<u32, Arc<StoredFont>>` here, keyed by font object
@@ -216,6 +218,7 @@ impl PDFDocument {
             encrypt_dict,
             page_ref_cache: FxHashMap::default(),
             page_ref_cache_built: false,
+            page_cache_revision: 0,
             page_resolved_cache: LruCache::new(NonZeroUsize::new(10).unwrap()),
             font_cache: None,
         })
@@ -356,6 +359,7 @@ impl PDFDocument {
             encrypt_dict,
             page_ref_cache: FxHashMap::default(),
             page_ref_cache_built: false,
+            page_cache_revision: 0,
             page_resolved_cache: LruCache::new(NonZeroUsize::new(10).unwrap()),
             font_cache: None,
         })
@@ -569,7 +573,23 @@ impl PDFDocument {
 
     fn invalidate_edit_caches(&mut self) {
         self.page_cache.clear();
+        self.page_ref_cache.clear();
+        self.page_ref_cache_built = false;
         self.page_resolved_cache.clear();
+        self.page_cache_revision = self.doc_store.delta().revision();
+    }
+
+    /// Synchronize page-tree-derived caches after mutations made through the public
+    /// `doc_store_mut().delta_mut()` escape hatch.
+    fn sync_page_cache_revision(&mut self) -> u64 {
+        let revision = self.doc_store.delta().revision();
+        if revision != self.page_cache_revision {
+            self.page_cache.clear();
+            self.page_ref_cache.clear();
+            self.page_ref_cache_built = false;
+            self.page_cache_revision = revision;
+        }
+        revision
     }
 
     /// Mutable access to the device-specific font arena (type-erased).
@@ -594,13 +614,16 @@ impl PDFDocument {
     ///
     /// Checks the LRU cache first; on miss, resolves through `DocStore::resolve_page`
     /// (delta → base, BFS over reachable objects), then caches the result.
-    /// The cache is cleared when the delta is modified.
+    /// Cache entries are revision-scoped, including mutations made through `delta_mut()`.
     pub fn resolve_page(
         &mut self,
         page_index: usize,
     ) -> PDFResult<Arc<crate::core::resolved_page::ResolvedPage>> {
-        // Fast path: cache hit.
-        if let Some(cached) = self.page_resolved_cache.get(&page_index) {
+        let revision = self.sync_page_cache_revision();
+        let cache_key = (page_index, revision);
+
+        // Fast path: cache hit for this exact document revision.
+        if let Some(cached) = self.page_resolved_cache.get(&cache_key) {
             return Ok(Arc::clone(cached));
         }
 
@@ -608,7 +631,7 @@ impl PDFDocument {
         let page = self.get_page(page_index)?;
         let resolved = Arc::new(self.doc_store_mut().resolve_page(&page)?);
         self.page_resolved_cache
-            .put(page_index, Arc::clone(&resolved));
+            .put(cache_key, Arc::clone(&resolved));
         Ok(resolved)
     }
 
@@ -982,6 +1005,8 @@ impl PDFDocument {
     /// println!("Page index: {}", page.index());
     /// ```
     pub fn get_page(&mut self, page_index: usize) -> PDFResult<Page> {
+        self.sync_page_cache_revision();
+
         // Check cache first
         if let Some(cached_page) = self.page_cache.get(page_index) {
             return Ok(cached_page.clone());

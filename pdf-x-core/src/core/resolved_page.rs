@@ -651,6 +651,40 @@ mod tests {
     }
 
     #[test]
+    fn document_resolved_page_cache_tracks_direct_delta_mutations() {
+        let mut doc = PDFDocument::open(pdf_with_contents()).expect("pdf should parse and open");
+
+        let before = doc.resolve_page(0).expect("baseline cached resolve");
+        let same_revision = doc.resolve_page(0).expect("same-revision cache hit");
+        assert!(Arc::ptr_eq(&before, &same_revision));
+        assert_eq!(before.contents(), b"q Q\n");
+
+        // Mutate the page dictionary through the public DocStore/Delta escape hatch.
+        // This intentionally bypasses PDFDocument's command methods and their explicit
+        // cache invalidation, so revision-based invalidation must catch it.
+        let page = doc.get_page(0).expect("page 0");
+        let (num, generation) = page.reference().expect("indirect page reference");
+        let mut page_dict = match page.dict() {
+            PDFObject::Dictionary(dict) => dict.clone(),
+            other => panic!("expected page dictionary, got {other:?}"),
+        };
+        page_dict.insert(
+            "Contents".to_string(),
+            PDFObject::Stream {
+                dict: HashMap::new(),
+                data: b"Q q".to_vec(),
+            },
+        );
+        doc.doc_store_mut()
+            .delta_mut()
+            .modify_object(Ref::new(num, generation), PDFObject::Dictionary(page_dict));
+
+        let after = doc.resolve_page(0).expect("post-mutation cached resolve");
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.contents(), b"Q q");
+    }
+
+    #[test]
     fn resolved_page_is_send_sync_static() {
         // Decision C contract: a resolved page is self-contained and can cross threads so
         // a native shell can render it off the live DocStore.
