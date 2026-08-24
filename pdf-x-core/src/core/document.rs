@@ -1,12 +1,13 @@
 use super::base_stream::BaseStream;
 use super::chunk_manager::ChunkLoader;
-use super::delta::DeltaLayer;
+use super::delta::{AddHighlightCommand, CommandHistory, DeltaLayer};
 use super::doc_store::DocStore;
 use super::encryption::{EncryptDict, EncryptionVersion};
 use super::error::{PDFError, PDFResult};
 use super::file_chunked_stream::FileChunkedStream;
 use super::page::{Page, PageTreeCache};
-use super::parser::PDFObject;
+use super::parser::{PDFObject, Ref};
+use super::pdf_writer::PDFWriter;
 use super::stream::Stream;
 use super::xref::XRef;
 use lru::LruCache;
@@ -48,6 +49,9 @@ pub struct LinearizedInfo {
 pub struct PDFDocument {
     /// The `delta → base` resolution authority. Owns the `XRef` and `DeltaLayer`.
     doc_store: DocStore,
+
+    /// Local editor-session undo/redo state. Never serialized with the delta.
+    command_history: CommandHistory,
 
     /// The document catalog (root dictionary)
     catalog: Option<PDFObject>,
@@ -205,6 +209,7 @@ impl PDFDocument {
 
         Ok(PDFDocument {
             doc_store,
+            command_history: CommandHistory::new(),
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
@@ -214,6 +219,34 @@ impl PDFDocument {
             page_resolved_cache: LruCache::new(NonZeroUsize::new(10).unwrap()),
             font_cache: None,
         })
+    }
+
+    /// Open a PDF and authenticate with `password` when the document is encrypted.
+    ///
+    /// Empty-password documents still work via the auto-auth inside [`open`]; a
+    /// non-empty password is applied with [`authenticate_with_password`] so the
+    /// decryptor is installed before any page fetch. Returns
+    /// `PDFError::ValidationError` if the password is rejected.
+    ///
+    /// Mirrors hayro's `Pdf::new_with_password`.
+    pub fn open_with_password(data: Vec<u8>, password: &[u8]) -> PDFResult<Self> {
+        let mut doc = Self::open(data)?;
+        if doc.is_encrypted() && !password.is_empty() {
+            let ok = doc.authenticate_with_password(password)?;
+            if !ok {
+                return Err(PDFError::validation_error(
+                    "incorrect password for encrypted PDF",
+                ));
+            }
+        } else if doc.is_encrypted() {
+            // Empty password was already tried during open; if still no key, reject.
+            if doc.get_encryption_key().is_err() {
+                return Err(PDFError::validation_error(
+                    "encrypted PDF requires a password",
+                ));
+            }
+        }
+        Ok(doc)
     }
 
     /// Opens a PDF document from a file using progressive/chunked loading.
@@ -316,6 +349,7 @@ impl PDFDocument {
 
         Ok(PDFDocument {
             doc_store,
+            command_history: CommandHistory::new(),
             catalog,
             page_cache: PageTreeCache::new(),
             linearized,
@@ -451,6 +485,93 @@ impl PDFDocument {
         &mut self.doc_store
     }
 
+    /// Add a standard highlight annotation in PDF user-space coordinates.
+    pub fn add_highlight(
+        &mut self,
+        page_index: usize,
+        rect: [f64; 4],
+        color: [f64; 3],
+    ) -> PDFResult<()> {
+        if self.is_encrypted() {
+            return Err(PDFError::Generic(
+                "Saving edits to encrypted PDFs is not supported".into(),
+            ));
+        }
+        let page = self.get_page(page_index)?;
+        let (num, generation) = page.reference().ok_or_else(|| {
+            PDFError::Generic("Cannot edit a page without an indirect object reference".into())
+        })?;
+        let mut page_object = page.dict().clone();
+        if let PDFObject::Dictionary(dict) = &mut page_object {
+            if let Some(PDFObject::Ref(reference)) = dict.get("Annots").cloned() {
+                let resolved = self
+                    .doc_store
+                    .resolve_ref(reference.num, reference.generation)?;
+                if !matches!(resolved.as_ref(), PDFObject::Array(_)) {
+                    return Err(PDFError::Generic(
+                        "Page Annots reference is not an array".into(),
+                    ));
+                }
+                dict.insert("Annots".into(), resolved.as_ref().clone());
+            }
+        }
+        let command =
+            AddHighlightCommand::new(Ref::new(num, generation), page_object, rect, color)?;
+        self.command_history
+            .execute(self.doc_store.delta_mut(), Box::new(command), None)?;
+        self.invalidate_edit_caches();
+        Ok(())
+    }
+
+    /// Undo the most recent edit command.
+    pub fn undo(&mut self) -> PDFResult<()> {
+        self.command_history.undo(self.doc_store.delta_mut())?;
+        self.invalidate_edit_caches();
+        Ok(())
+    }
+
+    /// Redo the most recently undone edit command.
+    pub fn redo(&mut self) -> PDFResult<()> {
+        self.command_history.redo(self.doc_store.delta_mut())?;
+        self.invalidate_edit_caches();
+        Ok(())
+    }
+
+    /// Return `(dirty, can_undo, can_redo)` for editor shells.
+    pub fn editor_state(&self) -> (bool, bool, bool) {
+        let delta = self.doc_store.delta();
+        (
+            delta.change_count() > 0,
+            self.command_history.can_undo(),
+            self.command_history.can_redo(),
+        )
+    }
+
+    /// Serialize current edits as bytes to append to `original`.
+    pub fn incremental_update(&self, original: &[u8]) -> PDFResult<Vec<u8>> {
+        if self.is_encrypted() {
+            return Err(PDFError::Generic(
+                "Saving edits to encrypted PDFs is not supported".into(),
+            ));
+        }
+        if self.doc_store.delta().change_count() == 0 {
+            return Err(PDFError::Generic("Document has no unsaved edits".into()));
+        }
+        let prev = Self::find_startxref(original)?;
+        PDFWriter::write_incremental_update_with_trailer(
+            self.doc_store.delta(),
+            original.len(),
+            self.doc_store.delta().next_obj_num(),
+            prev,
+            self.doc_store.xref().trailer(),
+        )
+    }
+
+    fn invalidate_edit_caches(&mut self) {
+        self.page_cache.clear();
+        self.page_resolved_cache.clear();
+    }
+
     /// Mutable access to the device-specific font arena (type-erased).
     ///
     /// Device backends (e.g. tinyskia) initialize this on first use via
@@ -515,7 +636,7 @@ impl PDFDocument {
                 .clone()
         };
 
-        self.xref_mut().fetch_if_ref(&pages_ref)
+        self.doc_store.resolve_if_ref(&pages_ref)
     }
 
     /// Gets the page count from the /Pages dictionary.
@@ -573,7 +694,9 @@ impl PDFDocument {
                     visited_refs.insert(ref_key);
 
                     // Fetch the object
-                    let obj = self.xref_mut().fetch(ref_obj.num, ref_obj.generation)?;
+                    let obj = self
+                        .doc_store
+                        .resolve_ref(ref_obj.num, ref_obj.generation)?;
                     (obj, Some(ref_key))
                 }
                 _ => (current_node, node_ref),
@@ -611,7 +734,9 @@ impl PDFDocument {
                 PDFObject::Array(arr) => arr.clone(),
                 PDFObject::Ref(ref_obj) => {
                     // Kids is a reference, fetch it
-                    let fetched = self.xref_mut().fetch(ref_obj.num, ref_obj.generation)?;
+                    let fetched = self
+                        .doc_store
+                        .resolve_ref(ref_obj.num, ref_obj.generation)?;
                     match &*fetched {
                         PDFObject::Array(arr) => arr.clone(),
                         _ => {
@@ -960,7 +1085,7 @@ impl PDFDocument {
             // Check if this dictionary has the property
             if let Some(value) = dict.get(key) {
                 // Found it! Resolve if it's a reference
-                return self.xref_mut().fetch_if_ref(value);
+                return self.doc_store.resolve_if_ref(value);
             }
 
             // Not found, try parent
@@ -982,7 +1107,9 @@ impl PDFDocument {
                     visited_refs.insert(ref_key);
 
                     // Fetch the parent dictionary
-                    let parent_obj = self.xref_mut().fetch(ref_obj.num, ref_obj.generation)?;
+                    let parent_obj = self
+                        .doc_store
+                        .resolve_ref(ref_obj.num, ref_obj.generation)?;
                     current_dict = (*parent_obj).clone();
                 }
                 _ => {
@@ -1311,7 +1438,7 @@ impl PDFDocument {
 
         // For linearized PDFs, try to fetch the first page object directly
         // without parsing the entire page tree
-        match self.xref_mut().fetch(first_page_obj_num, 0) {
+        match self.doc_store.resolve_ref(first_page_obj_num, 0) {
             Ok(page_obj) => {
                 // Create a page object with the first page index (0)
                 // We don't have the reference, so use None for page_ref
@@ -1382,7 +1509,7 @@ impl PDFDocument {
         };
 
         // Fetch the info object
-        let info_obj = self.xref_mut().fetch_if_ref(&info_ref)?;
+        let info_obj = self.doc_store.resolve_if_ref(&info_ref)?;
         Ok(Some(info_obj))
     }
 
@@ -1411,7 +1538,7 @@ impl PDFDocument {
             }
         };
 
-        let outlines = self.xref_mut().fetch_if_ref(&outlines_ref)?;
+        let outlines = self.doc_store.resolve_if_ref(&outlines_ref)?;
         Ok(Some(outlines))
     }
 
@@ -1444,7 +1571,7 @@ impl PDFDocument {
         if let PDFObject::Dictionary(cat_dict) = catalog {
             match cat_dict.get("Dests") {
                 Some(dests_ref) => {
-                    let dests = self.xref_mut().fetch_if_ref(dests_ref)?;
+                    let dests = self.doc_store.resolve_if_ref(dests_ref)?;
                     Ok(Some(dests))
                 }
                 None => Ok(None),
@@ -1487,7 +1614,7 @@ impl PDFDocument {
             match dest_obj {
                 Some(dest) => {
                     // Resolve the destination
-                    let dest = self.xref_mut().fetch_if_ref(dest)?;
+                    let dest = self.doc_store.resolve_if_ref(dest)?;
 
                     // Destinations can be:
                     // 1. An array: [page_ref, /Type, params...]
@@ -1533,8 +1660,9 @@ impl PDFDocument {
                         }
                         PDFObject::Ref(ref_obj) => {
                             // Fetch the referenced destination
-                            let resolved_dest =
-                                self.xref_mut().fetch(ref_obj.num, ref_obj.generation)?;
+                            let resolved_dest = self
+                                .doc_store
+                                .resolve_ref(ref_obj.num, ref_obj.generation)?;
                             match &*resolved_dest {
                                 PDFObject::Array(arr) => {
                                     if arr.is_empty() {
@@ -1598,7 +1726,7 @@ impl PDFDocument {
         if let PDFObject::Dictionary(cat_dict) = catalog {
             match cat_dict.get("PageLabels") {
                 Some(labels_ref) => {
-                    let labels = self.xref_mut().fetch_if_ref(labels_ref)?;
+                    let labels = self.doc_store.resolve_if_ref(labels_ref)?;
                     Ok(Some(labels))
                 }
                 None => Ok(None),
@@ -1631,7 +1759,7 @@ impl PDFDocument {
         // For now, we'll handle the simple dictionary case with /Nums array
         if let PDFObject::Dictionary(labels_dict) = &*labels_obj {
             if let Some(nums_obj) = labels_dict.get("Nums") {
-                let nums = match &*self.xref_mut().fetch_if_ref(nums_obj)? {
+                let nums = match &*self.doc_store.resolve_if_ref(nums_obj)? {
                     PDFObject::Array(arr) => arr.clone(),
                     _ => return Ok(default_label),
                 };
@@ -1665,7 +1793,7 @@ impl PDFDocument {
                             dict
                         }
                         PDFObject::Ref(ref_obj) => {
-                            match self.xref_mut().fetch(ref_obj.num, ref_obj.generation) {
+                            match self.doc_store.resolve_ref(ref_obj.num, ref_obj.generation) {
                                 Ok(obj) => match &*obj {
                                     PDFObject::Dictionary(_) => {
                                         // We need to convert from &HashMap<_, _, RandomState> to use
@@ -2319,5 +2447,34 @@ startxref
                 _ => panic!("Expected MediaBox to be an array"),
             }
         }
+    }
+
+    #[test]
+    fn highlight_undo_redo_and_incremental_reopen() {
+        let original = create_minimal_pdf();
+        let mut doc = PDFDocument::open(original.clone()).expect("minimal PDF should open");
+
+        doc.add_highlight(0, [10.0, 20.0, 110.0, 40.0], [1.0, 0.9, 0.1])
+            .expect("highlight should be added");
+        assert_eq!(doc.editor_state(), (true, true, false));
+        assert!(doc.get_page(0).unwrap().get("Annots").is_some());
+
+        doc.undo().expect("highlight should undo");
+        assert!(doc.get_page(0).unwrap().get("Annots").is_none());
+        doc.redo().expect("highlight should redo");
+        assert!(doc.get_page(0).unwrap().get("Annots").is_some());
+
+        let update = doc
+            .incremental_update(&original)
+            .expect("update should serialize");
+        let mut saved = original;
+        saved.extend_from_slice(&update);
+        let mut reopened = PDFDocument::open(saved).expect("incrementally saved PDF should reopen");
+        let page = reopened.get_page(0).expect("saved page should resolve");
+        let PDFObject::Array(annots) = page.get("Annots").expect("saved page should have Annots")
+        else {
+            panic!("Annots must be an array");
+        };
+        assert_eq!(annots.len(), 1);
     }
 }

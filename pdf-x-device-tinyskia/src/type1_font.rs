@@ -142,6 +142,21 @@ impl Type1Font {
         }
     }
 
+    /// Check if this is a CID-keyed CFF font.
+    pub fn is_cid_cff(&self) -> bool {
+        #[cfg(feature = "hayro-font")]
+        {
+            match &self.variant {
+                FontVariant::CFF(table) => table.is_cid(),
+                FontVariant::Type1(_) => false,
+            }
+        }
+        #[cfg(not(feature = "hayro-font"))]
+        {
+            false
+        }
+    }
+
     /// Get the font matrix for transformation
     #[cfg(feature = "hayro-font")]
     pub fn font_matrix(&self) -> hayro_font::Matrix {
@@ -165,12 +180,63 @@ impl Type1Font {
             let mut converter = PathConverter(path_builder);
 
             match &self.variant {
-                FontVariant::Type1(table) => table.outline(glyph_name, &mut converter),
-                FontVariant::CFF(table) => {
-                    // For CFF, we need to convert glyph name to glyph ID first
-                    let gid = table.glyph_index_by_name(glyph_name)?;
-                    table.outline(gid, &mut converter).ok().map(|_| ())
+                FontVariant::Type1(table) => {
+                    // Same 1000×FontMatrix normalization as outline_glyph_char / CFF.
+                    // Source: hayro/hayro-interpret/src/font/blob.rs
+                    let matrix = table.matrix();
+                    let mut matrix_converter = CffMatrixConverter {
+                        matrix,
+                        builder: &mut converter,
+                    };
+                    table.outline(glyph_name, &mut matrix_converter)
                 }
+                FontVariant::CFF(table) => {
+                    let gid = table.glyph_index_by_name(glyph_name)?;
+                    outline_cff_glyph(table, gid, &mut converter)
+                }
+            }
+        }
+
+        #[cfg(not(feature = "hayro-font"))]
+        {
+            None
+        }
+    }
+
+    /// Outline a CID glyph from a CID-keyed CFF font.
+    pub fn outline_glyph_cid(&self, cid: u16, path_builder: &mut PathBuilder) -> Option<()> {
+        #[cfg(feature = "hayro-font")]
+        {
+            let mut converter = PathConverter(path_builder);
+
+            match &self.variant {
+                FontVariant::CFF(table) if table.is_cid() => {
+                    let gid = table.glyph_index_by_cid(cid)?;
+                    outline_cff_glyph(table, gid, &mut converter)
+                }
+                _ => None,
+            }
+        }
+
+        #[cfg(not(feature = "hayro-font"))]
+        {
+            None
+        }
+    }
+
+    /// Outline a CFF glyph by glyph id. Used for Type0/CIDFontType0C fonts
+    /// whose CFF program is not CID-keyed; PDF processors treat the default
+    /// CIDToGIDMap as Identity in that case.
+    pub fn outline_glyph_id(&self, gid: u16, path_builder: &mut PathBuilder) -> Option<()> {
+        #[cfg(feature = "hayro-font")]
+        {
+            let mut converter = PathConverter(path_builder);
+
+            match &self.variant {
+                FontVariant::CFF(table) => {
+                    outline_cff_glyph(table, hayro_font::GlyphId(gid), &mut converter)
+                }
+                _ => None,
             }
         }
 
@@ -205,11 +271,24 @@ impl Type1Font {
 
             match &self.variant {
                 FontVariant::Type1(table) => {
-                    // Type1 uses glyph names
-                    let name = table.code_to_string(code)?;
+                    // Prefer PDF /Encoding Differences (custom_encoding), then
+                    // the font program's built-in encoding. Source: pdf.js
+                    // `PartialEvaluator.translateFont` + Type1 charstring lookup.
+                    let name = self
+                        .get_glyph_name_for_code(code)
+                        .or_else(|| table.code_to_string(code).map(|s| s.to_string()))?;
                     #[cfg(feature = "debug-logging")]
-                    eprintln!("DEBUG: Type1 code_to_string({}) -> Some({})", code, name);
-                    table.outline(name, &mut converter)
+                    eprintln!("DEBUG: Type1 code {} -> name '{}'", code, name);
+                    // Charstring coords → 1000-unit PDF glyph space, same as CFF
+                    // and hayro Type1FontBlob::outline_glyph:
+                    //   Affine::scale(1000) * FontMatrix * path
+                    // Source: hayro/hayro-interpret/src/font/blob.rs
+                    let matrix = table.matrix();
+                    let mut matrix_converter = CffMatrixConverter {
+                        matrix,
+                        builder: &mut converter,
+                    };
+                    table.outline(&name, &mut matrix_converter)
                 }
                 FontVariant::CFF(table) => {
                     // For CFF, check custom encoding first
@@ -227,7 +306,7 @@ impl Type1Font {
                             "DEBUG: CFF glyph_index_by_name({}) -> Some({:?})",
                             glyph_name, gid
                         );
-                        return table.outline(gid, &mut converter).ok().map(|_| ());
+                        return outline_cff_glyph(table, gid, &mut converter);
                     }
 
                     // Fall back to direct code lookup (standard encoding)
@@ -236,7 +315,7 @@ impl Type1Font {
                     let gid = table.glyph_index(code)?;
                     #[cfg(feature = "debug-logging")]
                     eprintln!("DEBUG: CFF glyph_index({}) -> Some({:?})", code, gid);
-                    table.outline(gid, &mut converter).ok().map(|_| ())
+                    outline_cff_glyph(table, gid, &mut converter)
                 }
             }
         }
@@ -290,15 +369,18 @@ impl Type1Font {
                     500
                 }
                 FontVariant::CFF(table) => {
-                    // For CFF, try to get the glyph width
-                    if let Some(glyph_name) = self.get_glyph_name_for_code(code) {
-                        if let Some(gid) = table.glyph_index_by_name(&glyph_name) {
-                            if let Some(width) = table.glyph_width(gid) {
-                                return width;
-                            }
+                    // Prefer PDF/custom encoding name → GID, else font encoding
+                    // (Base14 CFF / Foxit). Widths are in 1000-unit PDF glyph space
+                    // after hayro-font's default FontMatrix * 1000 normalization.
+                    let gid = self
+                        .get_glyph_name_for_code(code)
+                        .and_then(|name| table.glyph_index_by_name(&name))
+                        .or_else(|| table.glyph_index(code));
+                    if let Some(gid) = gid {
+                        if let Some(width) = table.glyph_width(gid) {
+                            return width;
                         }
                     }
-                    // Fallback to default width
                     500
                 }
             }
@@ -368,6 +450,65 @@ impl<'a> HayroOutlineBuilder for PathConverter<'a> {
     }
 }
 
+#[cfg(feature = "hayro-font")]
+fn outline_cff_glyph(
+    table: &hayro_font::cff::Table<'_>,
+    glyph_id: hayro_font::GlyphId,
+    builder: &mut dyn HayroOutlineBuilder,
+) -> Option<()> {
+    let matrix = table.matrix();
+    let mut converter = CffMatrixConverter { matrix, builder };
+    table.outline(glyph_id, &mut converter).ok().map(|_| ())
+}
+
+#[cfg(feature = "hayro-font")]
+struct CffMatrixConverter<'a> {
+    matrix: hayro_font::Matrix,
+    builder: &'a mut dyn HayroOutlineBuilder,
+}
+
+#[cfg(feature = "hayro-font")]
+impl<'a> CffMatrixConverter<'a> {
+    fn transform(&self, x: f32, y: f32) -> (f32, f32) {
+        // Mirrors hayro's CFF blob path conversion:
+        // Affine::scale(1000) * convert_matrix(table.matrix()) * outline.
+        (
+            1000.0 * (self.matrix.sx * x + self.matrix.kx * y + self.matrix.tx),
+            1000.0 * (self.matrix.ky * x + self.matrix.sy * y + self.matrix.ty),
+        )
+    }
+}
+
+#[cfg(feature = "hayro-font")]
+impl<'a> HayroOutlineBuilder for CffMatrixConverter<'a> {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let (x, y) = self.transform(x, y);
+        self.builder.move_to(x, y);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        let (x, y) = self.transform(x, y);
+        self.builder.line_to(x, y);
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let (x1, y1) = self.transform(x1, y1);
+        let (x, y) = self.transform(x, y);
+        self.builder.quad_to(x1, y1, x, y);
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let (x1, y1) = self.transform(x1, y1);
+        let (x2, y2) = self.transform(x2, y2);
+        let (x, y) = self.transform(x, y);
+        self.builder.curve_to(x1, y1, x2, y2, x, y);
+    }
+
+    fn close(&mut self) {
+        self.builder.close();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +532,55 @@ mod tests {
         // Should still detect format even without hayro-font feature
         assert!(Type1Font::is_type1(&[0x80, 0x01]));
         assert!(Type1Font::is_type1(b"%!PS-AdobeFont"));
+    }
+
+    /// Empty CID glyphs (space) must not outline via identity GID fallback.
+    /// Antenna-Bold subset maps space CID 21 → empty; GID 21 is "S".
+    #[test]
+    #[cfg(feature = "hayro-font")]
+    fn cid_space_has_no_outline_but_identity_gid_would() {
+        // Prefer extracted CFF when present (written by visual probe); else skip.
+        let cff = match std::fs::read("/tmp/f7.cff") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let font = Type1Font::new(cff).expect("parse Antenna-Bold CFF");
+        assert!(font.is_cid_cff());
+        let mut pb = PathBuilder::new();
+        assert!(
+            font.outline_glyph_cid(21, &mut pb).is_none(),
+            "space CID must have no outline"
+        );
+        let mut pb2 = PathBuilder::new();
+        assert!(
+            font.outline_glyph_id(21, &mut pb2).is_some(),
+            "GID 21 is a real letter — must not be used as space fallback"
+        );
+    }
+}
+
+#[cfg(test)]
+mod foxit_base14_tests {
+    use super::*;
+
+    /// Foxit Base14 CFF programs must report AFM-compatible advances so
+    /// unembedded standard fonts match hayro/pdf.js spacing (not a flat 500).
+    #[test]
+    fn foxit_cff_glyph_widths_use_font_encoding() {
+        let serif = Type1Font::new(
+            include_bytes!("../../pdf-x-core/assets/fonts/FoxitSerifBold.pfb").to_vec(),
+        )
+        .expect("load FoxitSerifBold");
+        assert!(serif.is_cff());
+        assert_eq!(serif.glyph_width(' '), 250);
+        assert_eq!(serif.glyph_width('B'), 667);
+        assert_eq!(serif.glyph_width('8'), 500);
+
+        let sans =
+            Type1Font::new(include_bytes!("../../pdf-x-core/assets/fonts/FoxitSans.pfb").to_vec())
+                .expect("load FoxitSans");
+        assert_eq!(sans.glyph_width(' '), 278);
+        assert_eq!(sans.glyph_width('B'), 667);
+        assert_eq!(sans.glyph_width('8'), 556);
     }
 }

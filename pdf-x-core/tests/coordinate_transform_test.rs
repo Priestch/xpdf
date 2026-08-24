@@ -16,7 +16,8 @@ fn test_y_axis_flip() {
     pixmap.fill(tiny_skia::Color::WHITE);
 
     // Create device
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
     // Apply the PDF-to-screen coordinate transform for a 100x100 page
     // This should flip Y and translate by page height
@@ -107,7 +108,9 @@ fn test_coordinate_transform_preserves_width() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_2 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_2);
 
     // Apply transform with scale=2
     // Use set_matrix to replace the identity matrix

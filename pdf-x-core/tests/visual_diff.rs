@@ -11,6 +11,8 @@
 //!
 //! Tolerance: pixels within `MAX_PIXEL_DIFF` of the reference are considered
 //! matching (accounts for anti-aliasing differences between tiny-skia and MuPDF).
+//! mutool is the default oracle; cases where PDFium/hayro/spec disagree with
+//! mutool are tracked as explicit expected divergences in `scripts/visual_diff.py`.
 
 #![cfg(feature = "rendering")]
 
@@ -22,7 +24,8 @@ use pdf_x_device_tinyskia::RenderToImage;
 
 /// Per-channel tolerance for anti-aliasing differences.
 const MAX_PIXEL_DIFF: u8 = 15;
-/// Minimum match percentage to pass (allows minor anti-aliasing variance).
+/// Minimum match percentage for this curated smoke test. The full-corpus
+/// benchmark in `scripts/visual_diff.py` uses the stricter phase-0 threshold.
 const MIN_MATCH_PCT: f64 = 97.0;
 
 struct VisualCase {

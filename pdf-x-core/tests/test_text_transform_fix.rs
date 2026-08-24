@@ -20,7 +20,8 @@ mod text_transform_tests {
     fn test_text_transform_stays_on_screen() {
         // Create a 500x500 canvas
         let mut pixmap = Pixmap::new(500, 500).unwrap();
-        let mut device = SkiaDevice::new(pixmap.as_mut());
+        let mut font_cache_device_1 = std::collections::HashMap::new();
+        let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
         // Set up a typical PDF CTM that flips Y-axis
         // PDF: origin at bottom-left, Y increases upward

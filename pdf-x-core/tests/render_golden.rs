@@ -17,10 +17,11 @@
 //! UPDATE_GOLDEN=1 cargo test --test render_golden --features rendering
 //! ```
 //!
-//! Determinism note: tiny-skia and the embedded-font path (rustybuzz/ttf-parser,
-//! no system fonts) are deterministic run-to-run on a given host, so byte/pixel
-//! identity holds locally. Goldens are host-generated; cross-platform pixel
-//! drift (if it ever appears on CI) is a known limitation, not a regression.
+//! Determinism note: tiny-skia plus embedded fonts and bundled standard-font
+//! fallback (rustybuzz/ttf-parser, no system font scanning) are deterministic
+//! run-to-run on a given host, so byte/pixel identity holds locally. Goldens
+//! are host-generated; cross-platform pixel drift (if it ever appears on CI)
+//! is a known limitation, not a regression.
 
 #![cfg(feature = "rendering")]
 

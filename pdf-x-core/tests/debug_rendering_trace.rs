@@ -101,7 +101,8 @@ fn debug_rendering_trace() {
     log!("✓ Filled with white background");
 
     // Create device
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
     log!("✓ Created SkiaDevice");
 
     // Set up coordinate transform

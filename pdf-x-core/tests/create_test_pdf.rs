@@ -135,7 +135,7 @@ fn test_create_and_render_colored_pdf() {
 
     // Render the page
     println!("DEBUG: Starting page render...");
-    match page.render(&mut doc.xref_mut(), &mut device) {
+    match page.render(doc.doc_store_mut(), &mut device) {
         Ok(_) => println!("DEBUG: Page render completed"),
         Err(e) => {
             eprintln!("ERROR: Page render failed: {:?}", e);

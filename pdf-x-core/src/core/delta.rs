@@ -32,12 +32,6 @@ pub struct DeltaLayer {
     /// Returns error when attempting to fetch these
     deleted: HashSet<ObjectId>,
 
-    /// Command history for undo/redo
-    history: Vec<Box<dyn Command>>,
-
-    /// Undo stack (commands that can be redone)
-    undo_stack: Vec<Box<dyn Command>>,
-
     /// Next available object number for new objects
     next_obj_num: u32,
 
@@ -51,8 +45,6 @@ impl std::fmt::Debug for DeltaLayer {
             .field("modified", &self.modified)
             .field("new_objects", &self.new_objects)
             .field("deleted", &self.deleted)
-            .field("history_count", &self.history.len())
-            .field("undo_stack_count", &self.undo_stack.len())
             .field("next_obj_num", &self.next_obj_num)
             .field("base_pdf_size", &self.base_pdf_size)
             .finish()
@@ -85,7 +77,7 @@ pub type BaseObjectFetcher<'a> = dyn Fn(Ref) -> PDFResult<PDFObject> + 'a;
 ///
 /// All modifications through the delta layer should use commands
 /// to enable undo/redo functionality.
-pub trait Command {
+pub trait Command: Send {
     /// Execute the command
     ///
     /// # Arguments
@@ -102,6 +94,83 @@ pub trait Command {
 
     /// Redo the command
     fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()>;
+}
+
+/// Local undo/redo state for an editor session.
+///
+/// This is deliberately separate from [`DeltaLayer`]: the delta is the
+/// serializable document state, while command history is ephemeral UI state.
+#[derive(Default)]
+pub struct CommandHistory {
+    executed: Vec<Box<dyn Command>>,
+    redo: Vec<Box<dyn Command>>,
+}
+
+impl std::fmt::Debug for CommandHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandHistory")
+            .field("executed_count", &self.executed.len())
+            .field("redo_count", &self.redo.len())
+            .finish()
+    }
+}
+
+impl CommandHistory {
+    /// Create an empty local history.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Execute a command against `delta` and record it after success.
+    pub fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        mut command: Box<dyn Command>,
+        fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        command.execute(delta, fetch_base)?;
+        self.executed.push(command);
+        self.redo.clear();
+        Ok(())
+    }
+
+    /// Undo the most recently executed command.
+    pub fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        let mut command = self
+            .executed
+            .pop()
+            .ok_or_else(|| PDFError::Generic("Nothing to undo".into()))?;
+        command.undo(delta)?;
+        self.redo.push(command);
+        Ok(())
+    }
+
+    /// Redo the most recently undone command.
+    pub fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        let mut command = self
+            .redo
+            .pop()
+            .ok_or_else(|| PDFError::Generic("Nothing to redo".into()))?;
+        command.redo(delta)?;
+        self.executed.push(command);
+        Ok(())
+    }
+
+    /// Drop local undo/redo state without changing the document delta.
+    pub fn clear(&mut self) {
+        self.executed.clear();
+        self.redo.clear();
+    }
+
+    /// Whether an undo operation is available.
+    pub fn can_undo(&self) -> bool {
+        !self.executed.is_empty()
+    }
+
+    /// Whether a redo operation is available.
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
 }
 
 impl DeltaLayer {
@@ -121,8 +190,6 @@ impl DeltaLayer {
             modified: HashMap::new(),
             new_objects: Vec::new(),
             deleted: HashSet::new(),
-            history: Vec::new(),
-            undo_stack: Vec::new(),
             next_obj_num: base_pdf_size,
             base_pdf_size,
         }
@@ -197,6 +264,32 @@ impl DeltaLayer {
         Ref::new(obj_num, 0)
     }
 
+    /// Restore an object at a previously allocated reference (used by redo).
+    pub fn restore_new_object(&mut self, obj_ref: Ref, obj: PDFObject) {
+        self.deleted.remove(&obj_ref.as_id());
+        if let Some(existing) = self
+            .new_objects
+            .iter_mut()
+            .find(|item| item.obj_num == obj_ref.num && item.generation == obj_ref.generation)
+        {
+            existing.object = obj;
+            return;
+        }
+        self.new_objects.push(DeltaObject {
+            object: obj,
+            obj_num: obj_ref.num,
+            generation: obj_ref.generation,
+        });
+        self.next_obj_num = self.next_obj_num.max(obj_ref.num + 1);
+    }
+
+    /// Remove a newly-created object while retaining its object number for redo.
+    pub fn remove_new_object(&mut self, obj_ref: Ref) {
+        self.new_objects
+            .retain(|item| item.obj_num != obj_ref.num || item.generation != obj_ref.generation);
+        self.deleted.remove(&obj_ref.as_id());
+    }
+
     /// Delete an object (mark as deleted).
     ///
     /// Deleted objects will return an error when attempting to fetch them.
@@ -252,77 +345,20 @@ impl DeltaLayer {
             .find(|obj| obj.obj_num == obj_ref.num && obj.generation == obj_ref.generation)
     }
 
-    /// Execute a command and add it to history.
+    /// Clear all state differences (reset to the immutable base PDF).
     ///
-    /// # Arguments
-    /// * `cmd` - The command to execute
-    /// * `fetch_base` - Optional callback to fetch objects from the base PDF
-    pub fn execute_command<'a>(
-        &mut self,
-        mut cmd: Box<dyn Command>,
-        fetch_base: Option<&'a BaseObjectFetcher<'a>>,
-    ) -> PDFResult<()> {
-        cmd.execute(self, fetch_base)?;
-        self.history.push(cmd);
-        self.undo_stack.clear(); // Clear redo stack on new command
-        Ok(())
-    }
-
-    /// Undo the last command.
-    ///
-    /// # Returns
-    /// Error if there's nothing to undo
-    pub fn undo(&mut self) -> PDFResult<()> {
-        let mut cmd = self
-            .history
-            .pop()
-            .ok_or_else(|| PDFError::Generic("Nothing to undo".into()))?;
-
-        cmd.undo(self)?;
-        self.undo_stack.push(cmd);
-        Ok(())
-    }
-
-    /// Redo the last undone command.
-    ///
-    /// # Returns
-    /// Error if there's nothing to redo
-    pub fn redo(&mut self) -> PDFResult<()> {
-        let mut cmd = self
-            .undo_stack
-            .pop()
-            .ok_or_else(|| PDFError::Generic("Nothing to redo".into()))?;
-
-        cmd.redo(self)?;
-        self.history.push(cmd);
-        Ok(())
-    }
-
-    /// Clear all modifications (reset to clean state).
-    ///
-    /// This preserves the base PDF size but removes all tracked changes.
+    /// Command history is intentionally owned separately by [`CommandHistory`];
+    /// clearing a serializable delta never mutates a local editor session.
     pub fn clear(&mut self) {
         self.modified.clear();
         self.new_objects.clear();
         self.deleted.clear();
-        self.history.clear();
-        self.undo_stack.clear();
         self.next_obj_num = self.base_pdf_size;
     }
 
     /// Get the total count of changes (modifications + additions + deletions).
     pub fn change_count(&self) -> usize {
         self.modified.len() + self.new_objects.len() + self.deleted.len()
-    }
-
-    /// Check if undo is available.
-    pub fn can_undo(&self) -> bool {
-        !self.history.is_empty()
-    }
-
-    /// Check if redo is available.
-    pub fn can_redo(&self) -> bool {
-        !self.undo_stack.is_empty()
     }
 
     /// Get the next object number that will be assigned.
@@ -502,6 +538,161 @@ impl Command for RotatePageCommand {
         dict.insert("Rotate".to_string(), PDFObject::Number(self.degrees as f64));
 
         delta.modify_object(self.page_ref, PDFObject::Dictionary(dict));
+        Ok(())
+    }
+}
+
+/// Reversible command that appends a standard highlight annotation to a page.
+pub struct AddHighlightCommand {
+    page_ref: Ref,
+    original_page: PDFObject,
+    rect: [f64; 4],
+    color: [f64; 3],
+    annotation_ref: Option<Ref>,
+    appearance_ref: Option<Ref>,
+    annotation: Option<PDFObject>,
+    appearance: Option<PDFObject>,
+    modified_page: Option<PDFObject>,
+}
+
+impl AddHighlightCommand {
+    /// Create a page highlight command using PDF user-space coordinates.
+    pub fn new(
+        page_ref: Ref,
+        original_page: PDFObject,
+        rect: [f64; 4],
+        color: [f64; 3],
+    ) -> PDFResult<Self> {
+        if rect[2] <= rect[0] || rect[3] <= rect[1] {
+            return Err(PDFError::Generic(
+                "Highlight rectangle must have positive size".into(),
+            ));
+        }
+        if !matches!(original_page, PDFObject::Dictionary(_)) {
+            return Err(PDFError::Generic("Page object is not a dictionary".into()));
+        }
+        Ok(Self {
+            page_ref,
+            original_page,
+            rect,
+            color,
+            annotation_ref: None,
+            appearance_ref: None,
+            annotation: None,
+            appearance: None,
+            modified_page: None,
+        })
+    }
+
+    fn number_array(values: &[f64]) -> PDFObject {
+        PDFObject::Array(
+            values
+                .iter()
+                .map(|n| Box::new(PDFObject::Number(*n)))
+                .collect(),
+        )
+    }
+
+    fn build_objects(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        let width = self.rect[2] - self.rect[0];
+        let height = self.rect[3] - self.rect[1];
+        let content = format!(
+            "q {} {} {} rg 0 0 {} {} re f Q\n",
+            self.color[0], self.color[1], self.color[2], width, height
+        )
+        .into_bytes();
+        let mut ap_dict = HashMap::new();
+        ap_dict.insert("Type".into(), PDFObject::Name("XObject".into()));
+        ap_dict.insert("Subtype".into(), PDFObject::Name("Form".into()));
+        ap_dict.insert(
+            "BBox".into(),
+            Self::number_array(&[0.0, 0.0, width, height]),
+        );
+        ap_dict.insert("Length".into(), PDFObject::Number(content.len() as f64));
+        let appearance = PDFObject::Stream {
+            dict: ap_dict,
+            data: content,
+        };
+        let appearance_ref = delta.add_object(appearance.clone());
+
+        let mut normal_ap = HashMap::new();
+        normal_ap.insert("N".into(), PDFObject::Ref(appearance_ref));
+        let mut annot_dict = HashMap::new();
+        annot_dict.insert("Type".into(), PDFObject::Name("Annot".into()));
+        annot_dict.insert("Subtype".into(), PDFObject::Name("Highlight".into()));
+        annot_dict.insert("Rect".into(), Self::number_array(&self.rect));
+        annot_dict.insert(
+            "QuadPoints".into(),
+            Self::number_array(&[
+                self.rect[0],
+                self.rect[3],
+                self.rect[2],
+                self.rect[3],
+                self.rect[0],
+                self.rect[1],
+                self.rect[2],
+                self.rect[1],
+            ]),
+        );
+        annot_dict.insert("C".into(), Self::number_array(&self.color));
+        annot_dict.insert("F".into(), PDFObject::Number(4.0));
+        annot_dict.insert("AP".into(), PDFObject::Dictionary(normal_ap));
+        let annotation = PDFObject::Dictionary(annot_dict);
+        let annotation_ref = delta.add_object(annotation.clone());
+
+        let mut page_dict = match &self.original_page {
+            PDFObject::Dictionary(dict) => dict.clone(),
+            _ => unreachable!(),
+        };
+        let mut annots = match page_dict.remove("Annots") {
+            Some(PDFObject::Array(items)) => items,
+            Some(other) => smallvec::smallvec![Box::new(other)],
+            None => smallvec::SmallVec::new(),
+        };
+        annots.push(Box::new(PDFObject::Ref(annotation_ref)));
+        page_dict.insert("Annots".into(), PDFObject::Array(annots));
+        let modified_page = PDFObject::Dictionary(page_dict);
+        delta.modify_object(self.page_ref, modified_page.clone());
+
+        self.annotation_ref = Some(annotation_ref);
+        self.appearance_ref = Some(appearance_ref);
+        self.annotation = Some(annotation);
+        self.appearance = Some(appearance);
+        self.modified_page = Some(modified_page);
+        Ok(())
+    }
+}
+
+impl Command for AddHighlightCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        self.build_objects(delta)
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        delta.modify_object(self.page_ref, self.original_page.clone());
+        if let Some(reference) = self.annotation_ref {
+            delta.remove_new_object(reference);
+        }
+        if let Some(reference) = self.appearance_ref {
+            delta.remove_new_object(reference);
+        }
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        let annotation_ref = self
+            .annotation_ref
+            .ok_or_else(|| PDFError::Generic("Missing highlight annotation reference".into()))?;
+        let appearance_ref = self
+            .appearance_ref
+            .ok_or_else(|| PDFError::Generic("Missing highlight appearance reference".into()))?;
+        delta.restore_new_object(appearance_ref, self.appearance.clone().unwrap());
+        delta.restore_new_object(annotation_ref, self.annotation.clone().unwrap());
+        delta.modify_object(self.page_ref, self.modified_page.clone().unwrap());
         Ok(())
     }
 }

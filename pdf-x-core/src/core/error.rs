@@ -34,6 +34,12 @@ pub enum PDFError {
     /// recovery can rebuild the xref and retry.
     BadXRefOffset { num: u32, reason: String },
 
+    /// No xref entry for this object number. Can be a legitimate free/absent object, but
+    /// also the signature of a *partial* xref parse (e.g. linearized first-page section
+    /// with a broken `/Prev` that was skipped, so early objects never got indexed). Lazy
+    /// fetch-time recovery rebuilds the table from a full-file scan and retries once.
+    ObjectNotInXRef { num: u32 },
+
     /// Parse error with context
     ParseError {
         message: String,
@@ -62,6 +68,16 @@ pub enum PDFError {
 
     /// Feature not yet implemented
     Unsupported { feature: String },
+
+    /// A configured resource limit was exceeded while processing untrusted input.
+    LimitExceeded {
+        /// Name of the exhausted limit.
+        resource: &'static str,
+        /// Configured maximum.
+        limit: usize,
+        /// Observed or requested amount.
+        actual: usize,
+    },
 
     /// Validation error
     ValidationError { message: String },
@@ -108,6 +124,9 @@ impl fmt::Display for PDFError {
             PDFError::BadXRefOffset { num, reason } => {
                 write!(f, "Bad xref offset for object {num}: {reason}")
             }
+            PDFError::ObjectNotInXRef { num } => {
+                write!(f, "Object {num} not found in xref")
+            }
             PDFError::ParseError {
                 message,
                 context,
@@ -143,6 +162,16 @@ impl fmt::Display for PDFError {
             }
             PDFError::Unsupported { feature } => {
                 write!(f, "Unsupported feature: {}", feature)
+            }
+            PDFError::LimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Resource limit exceeded for {resource}: {actual} > {limit}"
+                )
             }
             PDFError::ValidationError { message } => {
                 write!(f, "Validation error: {}", message)

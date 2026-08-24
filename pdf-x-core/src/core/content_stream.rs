@@ -427,6 +427,87 @@ impl fmt::Display for Operation {
     }
 }
 
+fn normalize_inline_image_dict(
+    dict: std::collections::HashMap<String, PDFObject>,
+) -> std::collections::HashMap<String, PDFObject> {
+    let mut normalized = std::collections::HashMap::new();
+    let mut abbreviated = Vec::new();
+
+    for (key, value) in dict {
+        let normalized_key = expand_inline_key_name(&key).to_string();
+        let value = normalize_inline_image_value(&normalized_key, value);
+
+        if normalized_key == key {
+            normalized.insert(normalized_key, value);
+        } else {
+            abbreviated.push((normalized_key, value));
+        }
+    }
+
+    for (key, value) in abbreviated {
+        normalized.insert(key, value);
+    }
+
+    normalized
+}
+
+fn normalize_inline_image_value(key: &str, value: PDFObject) -> PDFObject {
+    match value {
+        PDFObject::Name(name) if key == "Filter" => {
+            PDFObject::Name(expand_inline_filter_name(&name).to_string())
+        }
+        PDFObject::Name(name) if key == "ColorSpace" => {
+            PDFObject::Name(expand_inline_color_space_name(&name).to_string())
+        }
+        PDFObject::Array(values) => PDFObject::Array(
+            values
+                .into_iter()
+                .map(|item| Box::new(normalize_inline_image_value(key, *item)))
+                .collect(),
+        ),
+        PDFObject::Dictionary(dict) => PDFObject::Dictionary(normalize_inline_image_dict(dict)),
+        other => other,
+    }
+}
+
+fn expand_inline_key_name(name: &str) -> &str {
+    match name {
+        "BPC" => "BitsPerComponent",
+        "CS" => "ColorSpace",
+        "D" => "Decode",
+        "DP" => "DecodeParms",
+        "F" => "Filter",
+        "H" => "Height",
+        "IM" => "ImageMask",
+        "I" => "Interpolate",
+        "W" => "Width",
+        _ => name,
+    }
+}
+
+fn expand_inline_filter_name(name: &str) -> &str {
+    match name {
+        "AHx" => "ASCIIHexDecode",
+        "A85" => "ASCII85Decode",
+        "LZW" => "LZWDecode",
+        "Fl" => "FlateDecode",
+        "RL" => "RunLengthDecode",
+        "CCF" => "CCITTFaxDecode",
+        "DCT" => "DCTDecode",
+        _ => name,
+    }
+}
+
+fn expand_inline_color_space_name(name: &str) -> &str {
+    match name {
+        "G" => "DeviceGray",
+        "RGB" => "DeviceRGB",
+        "CMYK" => "DeviceCMYK",
+        "I" => "Indexed",
+        _ => name,
+    }
+}
+
 /// Text extraction information from content streams.
 #[derive(Debug, Clone)]
 pub struct TextItem {
@@ -1108,13 +1189,45 @@ impl ContentStreamEvaluator {
                     let cmd_str = self.extract_command(&obj)?;
 
                     let op = OpCode::from_command(&cmd_str)?;
-                    return Ok(Some(Operation::new(op, args)));
+                    if op == OpCode::BeginInlineImage {
+                        return self.read_inline_image_operation();
+                    }
+                    return Ok(Some(Operation::new(op, normalize_args(op, args))));
                 }
                 // Everything else is an operand
                 _ => {
                     args.push(obj);
                 }
             }
+        }
+    }
+
+    fn read_inline_image_operation(&mut self) -> PDFResult<Option<Operation>> {
+        let mut dict = std::collections::HashMap::new();
+
+        loop {
+            let key = match self.parser.get_object()? {
+                PDFObject::EOF => return Ok(None),
+                PDFObject::Command(cmd) if cmd == "ID" => {
+                    let data = match self.parser.get_object()? {
+                        PDFObject::InlineImageData(data) => data,
+                        _ => Vec::new(),
+                    };
+                    let normalized = normalize_inline_image_dict(dict);
+                    return Ok(Some(Operation::new(
+                        OpCode::BeginInlineImage,
+                        vec![PDFObject::Stream {
+                            dict: normalized,
+                            data,
+                        }],
+                    )));
+                }
+                PDFObject::Name(name) | PDFObject::Command(name) => name,
+                _ => continue,
+            };
+
+            let value = self.parser.get_object()?;
+            dict.insert(key, value);
         }
     }
 
@@ -1133,6 +1246,96 @@ impl ContentStreamEvaluator {
     pub fn has_more(&self) -> bool {
         self.parser.has_more()
     }
+}
+
+fn normalize_args(op: OpCode, args: Vec<PDFObject>) -> Vec<PDFObject> {
+    let Some(count) = fixed_arg_count(op) else {
+        return args;
+    };
+    if args.len() <= count {
+        return args;
+    }
+    args[args.len() - count..].to_vec()
+}
+
+fn fixed_arg_count(op: OpCode) -> Option<usize> {
+    Some(match op {
+        OpCode::SetLineWidth
+        | OpCode::SetLineCap
+        | OpCode::SetLineJoin
+        | OpCode::SetMiterLimit
+        | OpCode::SetRenderingIntent
+        | OpCode::SetFlatness
+        | OpCode::SetGState
+        | OpCode::SetCharSpacing
+        | OpCode::SetWordSpacing
+        | OpCode::SetHScale
+        | OpCode::SetLeading
+        | OpCode::SetTextRenderingMode
+        | OpCode::SetTextRise
+        | OpCode::ShowText
+        | OpCode::ShowSpacedText
+        | OpCode::NextLineShowText
+        | OpCode::PaintXObject
+        | OpCode::MarkPoint
+        | OpCode::BeginMarkedContent
+        | OpCode::ShadingFill => 1,
+
+        OpCode::SetDash
+        | OpCode::SetFont
+        | OpCode::MoveTo
+        | OpCode::LineTo
+        | OpCode::MoveText
+        | OpCode::SetLeadingMoveText => 2,
+
+        OpCode::SetFillRGBColor
+        | OpCode::SetStrokeRGBColor
+        | OpCode::NextLineSetSpacingShowText => 3,
+
+        OpCode::Rectangle
+        | OpCode::SetFillCMYKColor
+        | OpCode::SetStrokeCMYKColor
+        | OpCode::CurveTo2
+        | OpCode::CurveTo3
+        | OpCode::SetCharWidth => 4,
+
+        OpCode::Transform | OpCode::SetTextMatrix | OpCode::CurveTo => 6,
+        OpCode::SetCharWidthAndBounds => 6,
+
+        OpCode::Save
+        | OpCode::Restore
+        | OpCode::Stroke
+        | OpCode::CloseStroke
+        | OpCode::Fill
+        | OpCode::EOFill
+        | OpCode::FillStroke
+        | OpCode::EOFillStroke
+        | OpCode::CloseFillStroke
+        | OpCode::CloseEOFillStroke
+        | OpCode::ClosePath
+        | OpCode::EndPath
+        | OpCode::Clip
+        | OpCode::EOClip
+        | OpCode::BeginText
+        | OpCode::EndText
+        | OpCode::NextLine
+        | OpCode::EndMarkedContent
+        | OpCode::BeginCompat
+        | OpCode::EndCompat => 0,
+
+        OpCode::SetStrokeColorSpace
+        | OpCode::SetFillColorSpace
+        | OpCode::SetStrokeColor
+        | OpCode::SetStrokeColorN
+        | OpCode::SetFillColor
+        | OpCode::SetFillColorN
+        | OpCode::SetStrokeGray
+        | OpCode::SetFillGray
+        | OpCode::MarkPointProps
+        | OpCode::BeginMarkedContentProps
+        | OpCode::BeginInlineImage
+        | OpCode::EndInlineImage => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1230,6 +1433,38 @@ mod tests {
         // End text
         let op4 = eval.read_operation().unwrap().unwrap();
         assert_eq!(op4.op, OpCode::EndText);
+    }
+
+    #[test]
+    fn test_fixed_arity_operators_ignore_extra_prefix_operands() {
+        let mut eval =
+            create_evaluator("BT\n. /F1 12 Tf\n. 5 Tr\n. 1 0 0 1 10 20 Tm\n. (Hi) Tj\nET");
+
+        assert_eq!(
+            eval.read_operation().unwrap().unwrap().op,
+            OpCode::BeginText
+        );
+
+        let font = eval.read_operation().unwrap().unwrap();
+        assert_eq!(font.op, OpCode::SetFont);
+        assert_eq!(
+            font.args,
+            vec![PDFObject::Name("F1".into()), PDFObject::Number(12.0)]
+        );
+
+        let mode = eval.read_operation().unwrap().unwrap();
+        assert_eq!(mode.op, OpCode::SetTextRenderingMode);
+        assert_eq!(mode.args, vec![PDFObject::Number(5.0)]);
+
+        let matrix = eval.read_operation().unwrap().unwrap();
+        assert_eq!(matrix.op, OpCode::SetTextMatrix);
+        assert_eq!(matrix.args.len(), 6);
+        assert_eq!(matrix.args[4], PDFObject::Number(10.0));
+        assert_eq!(matrix.args[5], PDFObject::Number(20.0));
+
+        let text = eval.read_operation().unwrap().unwrap();
+        assert_eq!(text.op, OpCode::ShowText);
+        assert_eq!(text.args, vec![PDFObject::String(b"Hi".to_vec())]);
     }
 
     #[test]

@@ -66,6 +66,7 @@ or threading.**
 | Thread spawning, parallelism | **Shell** | parallel page render over snapshots |
 | Blocking I/O, network, filesystem | **Shell** | `fs::read`, `fetch` |
 | Parsing, resolution, interpretation, the `Need::Range` protocol, the doc store, caching | **Core** | plain sync `fn`, owned data |
+| Native font discovery / platform assets | **Shell adapter** | optional resolver hook for URW/Nimbus/system fonts; core keeps deterministic bundled fallbacks |
 
 What this rule does **not** mean:
 - It does **not** forbid multithreading. A native shell may render pages in parallel over
@@ -334,10 +335,12 @@ The viewer pipeline runs end-to-end: `PDFDocument::open` → xref/parser → `Pa
 Tauri app.
 
 **Implemented**: core PDF parsing (document structure, xref, objects); encryption/decryption
-(RC4, AES-128, AES-256); annotation parsing + outline extraction; content-stream interpretation
-+ tiny-skia rendering (`render_page_to_image`); chunked data sources
-(file / HTTP / async HTTP / memory); delta scaffolding (`DeltaLayer`, `Command` trait,
-`RotatePageCommand`, `PDFWriter::write_incremental_update`).
+(RC4, AES-128, AES-256; empty-password auto-auth + `open_with_password` /
+`authenticate_with_password`); annotation parsing + outline extraction; content-stream
+interpretation + tiny-skia rendering (`render_page_to_image`); stream filters including
+Flate (with pdf.js/hayro tolerant fallback), LZW, ASCIIHex/85, RunLength, DCT, CCITT,
+JPX, JBIG2; chunked data sources (file / HTTP / async HTTP / memory); delta scaffolding
+(`DeltaLayer`, `Command` trait, `RotatePageCommand`, `PDFWriter::write_incremental_update`).
 
 **Phase 0 progress** (tracked in `phase-0-foundation-spec.md`):
 
@@ -360,13 +363,34 @@ Tauri app.
 - ✅ **Resolve-then-interpret** (decision C, live end-to-end): `ResolvedPage` carries an
   `objects` snapshot (every object reachable from `/Resources`, captured by `resolve_page`).
   `render_page_to_image` resolves to a `ResolvedPage` then calls the **pure**
-  `rendering::interpret` — it runs `RenderingContext` over a `SnapshotPageResolver` with no
-  live `DocStore`, no `Need`, no fetches beyond the frozen snapshot. Parity-tested against the
-  live `Page::render` path (same drawing).
+  `rendering::interpret` / `interpret_with_scale` — it runs `RenderingContext` over a
+  `SnapshotPageResolver` with no live `DocStore`, no `Need`, no fetches beyond the frozen
+  snapshot. Parity-tested against the live `Page::render` path (same drawing). Viewport
+  scale is applied inside `interpret_with_scale` so scale≠1 fills the canvas (not corner-stuck).
+- ✅ **Robustness / recovery** (viewer-green structural fixes on the hayro custom corpus):
+  - Lazy xref recovery: missing entry (`ObjectNotInXRef`) or stale offset (`BadXRefOffset`)
+    triggers a one-shot full-file `recover_by_scan` (pdf.js `indexObjects` / hayro `repair`)
+    — unblocks linearized files with a broken `/Prev` (e.g. `issue53.pdf`).
+  - Tolerant FlateDecode fallback after zlib/raw-deflate fail (`flate_fallback`, ported from
+    hayro ← pdf.js `flate_stream.js`) so partially corrupt content streams still paint.
+  - Encryption: empty user password auto-auth at open; non-empty via
+    `PDFDocument::open_with_password` / `authenticate_with_password` (decryptor install
+    clears the object cache). The `rendering` feature pulls in `crypto` (sha2) so AES-256
+    R=5/6 does not panic on normal render builds.
+  - Image XObject LZWDecode wired through the same filter path as Flate/DCT/… (PageMaker-era
+    fixtures such as `pdftc_900k_0974`).
+  - ASCII85Decode: bare `>` is a payload digit (only `~` starts EOD); incomplete final
+    groups pad with `'u'` (Adobe), not zero — fixes truncated Flate after A85 on
+    `password_2.pdf` (233 → 1788 content bytes).
+  - Visual dual-lag chase vs mutool/hayro at 72 DPI: remaining positive dual lag on the
+    custom corpus is AA / engine-policy, not missing draw/decode. Harness:
+    `scripts/visual_diff.py` (XFAIL table for documented mutool divergences).
 - 🔄 **Progressive loading** uses the legacy exception form on production paths (see above).
-- 🔄 **Core still feature-flags shell concerns**: rendering (`tiny-skia`) and HTTP
-  (`reqwest`/`tokio`) are pulled into the core; these must move behind traits/adapters.
+- ✅ **Device backend extracted**: tiny-skia lives in `pdf-x-device-tinyskia`; core's
+  `rendering` feature is a marker + moxcms/advanced-image-formats/crypto, not a hard tiny-skia
+  dep. HTTP/`reqwest`/`tokio` still need to stay shell-owned where present.
 
 > **Note on decision B wording**: "every object lookup goes through `DocStore`" is the
-> *target*. Today it is true for page-tree traversal (`get_page_dict`), `resolve_page`, and
-> `/Contents` in `Page::render`; nested resources and `extract_text` are not yet routed through.
+> *target*. Page-tree traversal, `resolve_page`, `/Contents`, nested resources, and
+> `extract_text` already route through it on the live path; inherited page-tree properties
+> still resolve via the base `XRef` until that last seam is closed.

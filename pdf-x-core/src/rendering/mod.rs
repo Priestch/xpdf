@@ -15,6 +15,9 @@ pub mod path;
 #[cfg(feature = "rendering")]
 pub mod cmyk_icc;
 
+#[cfg(feature = "rendering")]
+pub mod lab_icc;
+
 pub mod shading;
 
 // Re-export key types
@@ -37,9 +40,26 @@ pub use path::{Path, PathBuilder, PathElement};
 /// fully-resolved page and a device — **no `DocStore`, no `Need`, no I/O** — so it cannot
 /// block or hang a `drive` loop, and a native shell can run it on another thread. Resources
 /// are read from the page's pre-resolved `objects` snapshot via a [`SnapshotPageResolver`].
+///
+/// Uses a 1.0 viewport scale (72 DPI user-space mapping). Prefer
+/// [`interpret_with_scale`] when the shell has already sized the surface for a
+/// non-1 scale — previously `render_resolved_page` set a scaled device CTM that
+/// this function immediately overwrote with the unscaled page transform.
 pub fn interpret<D: Device>(
     page: &crate::core::resolved_page::ResolvedPage,
     device: &mut D,
+) -> crate::core::error::PDFResult<()> {
+    interpret_with_scale(page, device, 1.0)
+}
+
+/// Like [`interpret`], but multiplies the page viewport CTM by `scale`
+/// (device pixels per PDF user unit). Shells that allocate a pixmap of size
+/// `ceil(page_size * scale)` must pass the same scale here so content fills
+/// the surface (pdf.js `PageViewport` scale).
+pub fn interpret_with_scale<D: Device>(
+    page: &crate::core::resolved_page::ResolvedPage,
+    device: &mut D,
+    scale: f32,
 ) -> crate::core::error::PDFResult<()> {
     use crate::core::base_stream::BaseStream;
     use crate::core::content_stream::ContentStreamEvaluator;
@@ -51,8 +71,17 @@ pub fn interpret<D: Device>(
     use crate::rendering::graphics_state::FillRule;
 
     // Set initial CTM and clip to the view box (matches Page::render's pre-amble).
+    // Scale all six matrix components so both linear and translation terms map
+    // user space → device pixels (equivalent to pdf.js PageViewport scale).
     let [x0, y0, x1, y1] = page.view_box();
-    let page_transform = [1.0, 0.0, 0.0, -1.0, -x0, y1];
+    let mut page_transform =
+        crate::core::page::page_initial_transform(page.view_box(), page.rotation());
+    let s = scale as f64;
+    if (s - 1.0).abs() > f64::EPSILON {
+        for v in &mut page_transform {
+            *v *= s;
+        }
+    }
     device.set_matrix(&page_transform);
     device.begin_path();
     device.move_to(x0, y0);
@@ -74,19 +103,20 @@ pub fn interpret<D: Device>(
     let mut resolver = SnapshotPageResolver::new(page.objects());
     let mut ctx = RenderingContext::new(device);
     ctx.current_state_mut().set_matrix(&page_transform);
+    ctx.set_root_ctm(page_transform);
     if !matches!(page.resources(), PDFObject::Null) {
         ctx.set_xobject_resources(&mut resolver, page.resources());
     }
 
-    loop {
-        match evaluator.read_operation() {
-            Ok(Some(op)) => {
-                if let Err(e) = ctx.process_operation(&op) {
-                    eprintln!("Warning: interpret: failed to process {:?}: {}", op.op, e);
-                }
-            }
-            // End of stream, or a read error (e.g. a stray byte) — stop, like Page::render.
-            Ok(None) | Err(_) => return Ok(()),
-        }
+    while let Some(op) = evaluator.read_operation()? {
+        ctx.process_operation(&op)?;
     }
+
+    // PDF 32000-1 §12.5.5: paint annotation Normal appearance streams after the
+    // page content. Beamer/animated PDFs store slide bodies in Widget `/AP /N`
+    // Form XObjects (`animated-distributions.pdf`). Matches hayro's default
+    // `render_annotations: true` path.
+    // Source: hayro/hayro-interpret/src/interpret/mod.rs `interpret_page`.
+    ctx.paint_annotation_appearances(page.annotations())?;
+    Ok(())
 }

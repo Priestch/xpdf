@@ -66,7 +66,7 @@ fn debug_issue7200_transform() {
 
                 if let Some(xobject) = res_dict.get("XObject") {
                     println!("XObject found: {:?}", xobject);
-                    if let Ok(xobj_dict) = page.fetch_if_ref(xobject, &mut doc.xref_mut()) {
+                    if let Ok(xobj_dict) = doc.doc_store_mut().resolve_if_ref(xobject) {
                         println!(
                             "XObject dict type: {:?}",
                             std::mem::discriminant(&xobj_dict)
@@ -78,9 +78,7 @@ fn debug_issue7200_transform() {
                                 for (name, obj) in xobj.iter() {
                                     println!("\nXObject: {}", name);
 
-                                    if let Ok(xobj_data) =
-                                        page.fetch_if_ref(obj, &mut doc.xref_mut())
-                                    {
+                                    if let Ok(xobj_data) = doc.doc_store_mut().resolve_if_ref(obj) {
                                         if let pdf_x_core::PDFObject::Stream { dict, .. } =
                                             &xobj_data
                                         {
@@ -199,7 +197,7 @@ fn debug_issue7200_transform() {
     // Check content stream for transforms
     println!("\n=== Content Stream Analysis ===");
     if let Some(contents) = page.contents() {
-        if let Ok(content_data) = page.fetch_if_ref(contents, &mut doc.xref_mut()) {
+        if let Ok(content_data) = doc.doc_store_mut().resolve_if_ref(contents) {
             if let pdf_x_core::PDFObject::Stream { dict, data } = &content_data {
                 // Decode if needed
                 let decoded = if let Some(_filter) = dict.get("Filter") {

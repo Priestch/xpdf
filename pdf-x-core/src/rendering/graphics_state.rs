@@ -58,6 +58,9 @@ pub struct StrokeProps {
 
     /// Dash phase - offset into the dash pattern (default: 0)
     pub dash_offset: f64,
+
+    /// Minimum stroke width in device pixels used by the raster backend.
+    pub min_device_width: f64,
 }
 
 impl Default for StrokeProps {
@@ -69,6 +72,7 @@ impl Default for StrokeProps {
             miter_limit: 10.0,
             dash_array: Vec::new(),
             dash_offset: 0.0,
+            min_device_width: 0.2,
         }
     }
 }

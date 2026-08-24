@@ -7,7 +7,7 @@ license = "Apache-2.0"
 description = "Tauri desktop app for PDF-X"
 
 [dependencies]
-pdf-x-core = { path = "../pdf-x-core", features = ["rendering", "debug-logging"] }
+pdf-x-core = { path = "../pdf-x-core", features = ["rendering"] }
 # tiny-skia render backend adapter (Phase 0 step 5: backends are adapter crates).
 pdf-x-device-tinyskia = { path = "../pdf-x-device-tinyskia" }
 tauri = { version = "2.0", features = [] }

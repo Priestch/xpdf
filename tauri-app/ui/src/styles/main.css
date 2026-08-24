@@ -296,6 +296,8 @@ body {
   padding: 1rem 1.5rem;
   border-bottom: 1px solid #ddd;
   background: #f8f9fa;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .panel-toolbar h2 {
@@ -314,6 +316,25 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.edit-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 8px;
+  border-right: 1px solid #cbd0d5;
+}
+
+.page-controls button.active-tool {
+  background: #b88900;
+  color: #fff;
+}
+
+.dirty-indicator {
+  color: #8a5b00;
+  font-size: 0.8rem;
+  font-weight: 600;
 }
 
 .zoom-controls {
@@ -405,7 +426,7 @@ body {
 }
 
 .placeholder-content li {
-  padding: 0.5rem 0;
+  padding: 0;
   color: #666;
 }
 
@@ -697,17 +718,31 @@ body {
 }
 
 .page-render {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  position: relative;
+  width: fit-content;
+  margin: 0 auto;
   padding: 0.5rem 0;
+  line-height: 0;
+  user-select: none;
+}
+
+.page-render.highlight-mode {
+  cursor: crosshair;
 }
 
 .rendered-page-image {
+  display: block;
   max-width: none;
   max-height: none;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
   border-radius: 4px;
+}
+
+.highlight-selection {
+  position: absolute;
+  background: rgba(255, 221, 40, 0.38);
+  border: 1px solid #c89b00;
+  pointer-events: none;
 }
 
 .loading-indicator {

@@ -22,7 +22,7 @@ pub use skia_device::SkiaDevice;
 use pdf_x_core::core::PDFDocument;
 use pdf_x_core::core::error::{PDFError, PDFResult};
 use pdf_x_core::core::resolved_page::ResolvedPage;
-use pdf_x_core::rendering::{Device, interpret};
+use pdf_x_core::rendering::interpret_with_scale;
 
 use std::sync::Arc;
 
@@ -172,41 +172,16 @@ fn render_resolved_page(
 
     // Create rendering device
     let mut device = SkiaDevice::new(pixmap.as_mut(), font_cache);
-
-    // Apply PDF.js-like viewport transform.
-    // Reference: pdf.js/src/display/display_utils.js - PageViewport
-    let center_x = (x0 + x1) / 2.0;
-    let center_y = (y0 + y1) / 2.0;
-
-    let (rotate_a, rotate_b, rotate_c, rotate_d) = match rotation {
-        90 => (0.0, 1.0, 1.0, 0.0),
-        180 => (-1.0, 0.0, 0.0, 1.0),
-        270 => (0.0, -1.0, -1.0, 0.0),
-        _ => (1.0, 0.0, 0.0, -1.0),
-    };
-
-    let offset_canvas_x;
-    let offset_canvas_y;
-    if rotate_a == 0.0 {
-        offset_canvas_x = (center_y - y0).abs() * scale as f64;
-        offset_canvas_y = (center_x - x0).abs() * scale as f64;
-    } else {
-        offset_canvas_x = (center_x - x0).abs() * scale as f64;
-        offset_canvas_y = (center_y - y0).abs() * scale as f64;
+    if std::env::var_os("PDFX_NATIVE_STANDARD_FONTS").is_some() {
+        device.use_system_standard_fonts();
     }
 
-    device.set_matrix(&[
-        rotate_a * scale as f64,
-        rotate_b * scale as f64,
-        rotate_c * scale as f64,
-        rotate_d * scale as f64,
-        offset_canvas_x - rotate_a * scale as f64 * center_x - rotate_c * scale as f64 * center_y,
-        offset_canvas_y - rotate_b * scale as f64 * center_x - rotate_d * scale as f64 * center_y,
-    ]);
-
-    // Render via the pure interpret path: the ResolvedPage already has a frozen
-    // snapshot, so interpret runs with no live DocStore (decision C end-state).
-    interpret(resolved, &mut device)?;
+    // Viewport scale must be applied inside interpret (page CTM + root_ctm).
+    // Setting device.set_matrix here alone is not enough: interpret used to
+    // overwrite CTM with the unscaled page_initial_transform, leaving content
+    // at 1× in the corner of a scaled pixmap.
+    // Reference: pdf.js/src/display/display_utils.js - PageViewport
+    interpret_with_scale(resolved, &mut device, scale)?;
 
     // Extract pixel data
     let pixels = pixmap.data().to_vec();

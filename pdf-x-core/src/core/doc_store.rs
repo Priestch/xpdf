@@ -10,6 +10,7 @@
 use super::delta::DeltaLayer;
 use super::error::{PDFError, PDFResult};
 use super::parser::{PDFObject, Ref};
+use super::resource_budget::ResourceBudget;
 use super::xref::XRef;
 use std::sync::Arc;
 
@@ -21,14 +22,30 @@ use std::sync::Arc;
 pub struct DocStore {
     /// The base cross-reference table (owns the stream + cache + all object data).
     xref: XRef,
-    /// The edit delta overlaid on the base (empty in v1; seam is live).
+    /// The edit delta overlaid on the base.
     delta: DeltaLayer,
+    /// Limits applied while decoding and resolving untrusted input.
+    resource_budget: ResourceBudget,
 }
 
 impl DocStore {
     /// Take ownership of the base `XRef` and the edit `DeltaLayer`.
     pub(crate) fn new(xref: XRef, delta: DeltaLayer) -> Self {
-        Self { xref, delta }
+        Self {
+            xref,
+            delta,
+            resource_budget: ResourceBudget::default(),
+        }
+    }
+
+    /// Current limits for decoding and page resolution.
+    pub fn resource_budget(&self) -> ResourceBudget {
+        self.resource_budget
+    }
+
+    /// Replace limits for subsequent decoding and page resolution.
+    pub fn set_resource_budget(&mut self, budget: ResourceBudget) {
+        self.resource_budget = budget;
     }
 
     /// Resolve an indirect object reference: `delta → base`.

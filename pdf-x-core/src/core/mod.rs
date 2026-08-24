@@ -13,15 +13,19 @@ pub mod encoding;
 pub mod encryption;
 pub mod error;
 pub mod file_chunked_stream;
+pub(crate) mod flate_fallback;
 pub mod font;
 pub mod glyphlist;
 pub mod image;
+#[cfg(feature = "advanced-image-formats")]
+pub(crate) mod jbig2_pdf;
 pub mod lexer;
 pub mod outline;
 pub mod page;
 pub mod parser;
 pub mod pdf_writer;
 pub mod resolved_page;
+pub mod resource_budget;
 pub mod retry;
 pub mod stream;
 pub mod sub_stream;
@@ -43,7 +47,9 @@ pub use crypto::{
     AES128Cipher, AES256Cipher, ARC4Cipher, PDF17, PDF20, PDFPasswordAlgorithm, calculate_md5,
     calculate_sha256, calculate_sha384, calculate_sha512,
 };
-pub use delta::{Command, DeltaLayer, DeltaObject, RotatePageCommand};
+pub use delta::{
+    AddHighlightCommand, Command, CommandHistory, DeltaLayer, DeltaObject, RotatePageCommand,
+};
 pub use doc_store::DocStore;
 pub use document::{LinearizedInfo, PDFDocument};
 pub use encoding::Encoding;
@@ -60,6 +66,7 @@ pub use page::{Page, PageResolver};
 pub use parser::{PDFObject, Parser, Ref};
 pub use pdf_writer::PDFWriter;
 pub use resolved_page::{ResolvedPage, SnapshotPageResolver};
+pub use resource_budget::ResourceBudget;
 pub use stream::Stream;
 pub use sub_stream::SubStream;
 pub use xref::{XRef, XRefEntry};

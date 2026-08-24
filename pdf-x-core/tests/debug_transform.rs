@@ -68,7 +68,9 @@ fn test_debug_transforms() {
     let mut pixmap = Pixmap::new(width, height).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
     // Print the initial transform
     println!(
@@ -91,7 +93,7 @@ fn test_debug_transforms() {
     ]);
 
     // Render the page
-    match page.render(&mut doc.xref_mut(), &mut device) {
+    match page.render(doc.doc_store_mut(), &mut device) {
         Ok(_) => {}
         Err(e) => println!("Render error: {:?}", e),
     }

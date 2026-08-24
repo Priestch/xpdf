@@ -302,13 +302,19 @@ impl Font {
 
         match &*stream_obj {
             PDFObject::Stream { dict, data } => {
-                let filter_name = dict.get("Filter").and_then(|f| match f {
-                    PDFObject::Name(name) => Some(name.as_str()),
-                    _ => None,
-                });
-
-                let decompressed = decode::decode_stream(&data, filter_name)
-                    .map_err(|e| PDFError::Generic(format!("Font stream decode error: {}", e)))?;
+                // Use apply_filters (not decode_stream): FontFile streams commonly
+                // use /ASCIIHexDecode, /ASCII85Decode, filter arrays, etc.
+                // decode_stream only handles a bare FlateDecode name and rejects
+                // everything else as "Unsupported filter" — which broke extract
+                // for many Type1 embeddings (ASCIIHex FontFile).
+                // Source: same path as ToUnicode / page content decoding.
+                let decompressed = if let Some(filter) = dict.get("Filter") {
+                    decode::apply_filters(data, filter).map_err(|e| {
+                        PDFError::Generic(format!("Font stream decode error: {}", e))
+                    })?
+                } else {
+                    data.clone()
+                };
 
                 Ok(Some(decompressed))
             }

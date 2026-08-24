@@ -30,6 +30,9 @@ pub enum Token {
     /// Command/operator (like 'q', 'Q', 'BT', 'ET', etc.)
     Command(String),
 
+    /// Raw inline image data captured after an `ID` operator.
+    InlineImageData(Vec<u8>),
+
     /// Array start '['
     ArrayStart,
 
@@ -41,6 +44,44 @@ pub enum Token {
 
     /// Dictionary end '>>'
     DictEnd,
+}
+
+fn trim_inline_image_trailing_whitespace(data: &mut Vec<u8>) {
+    while data
+        .last()
+        .is_some_and(|byte| matches!(*byte, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20))
+    {
+        data.pop();
+    }
+}
+
+fn is_inline_image_ascii_context(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|byte| matches!(*byte, 0x09 | 0x0A | 0x0C | 0x0D | 0x20..=0x7E))
+}
+
+fn is_inline_image_boundary(byte: Option<u8>) -> bool {
+    byte.is_none_or(|byte| {
+        matches!(
+            byte,
+            0x00 | 0x09
+                | 0x0A
+                | 0x0C
+                | 0x0D
+                | 0x20
+                | 0x28
+                | 0x29
+                | 0x3C
+                | 0x3E
+                | 0x5B
+                | 0x5D
+                | 0x7B
+                | 0x7D
+                | 0x2F
+                | 0x25
+        )
+    })
 }
 
 /// PDF Lexer for tokenizing PDF syntax.
@@ -67,6 +108,9 @@ pub struct Lexer {
 
     /// Reusable buffer for building command/name strings (for String tokens)
     cmd_buf: String,
+
+    /// Pending inline image data to return immediately after the `ID` command.
+    pending_inline_image_data: Option<Vec<u8>>,
 }
 
 impl Lexer {
@@ -79,6 +123,7 @@ impl Lexer {
             current_char,
             str_buf: Vec::new(),
             cmd_buf: String::new(),
+            pending_inline_image_data: None,
         })
     }
 
@@ -177,6 +222,10 @@ impl Lexer {
     ///
     /// This is the main method analogous to PDF.js's Lexer.getObj()
     pub fn get_object(&mut self) -> PDFResult<Token> {
+        if let Some(data) = self.pending_inline_image_data.take() {
+            return Ok(Token::InlineImageData(data));
+        }
+
         // Skip whitespace and comments
         self.skip_whitespace_and_comments()?;
 
@@ -308,21 +357,15 @@ impl Lexer {
 
         // Must have at least one digit
         if ch < 0x30 || ch > 0x39 {
-            // Not a digit
-            // Return 0 for invalid numbers followed by whitespace/delimiters/EOF
-            // (consistent with Adobe Reader)
-            if Self::is_whitespace(ch) || ch == 0x28 || ch == 0x3C || ch == -1 {
-                return Ok(Token::Number(0.0));
+            // Not a digit after optional sign/dot (e.g. "-î" in a corrupt/edited
+            // array). Adobe/pdf.js yield 0 and keep going; hard-erroring here
+            // aborts page render on otherwise recoverable books
+            // (System Programming In Linux.pdf under ~/Books).
+            if ch >= 0 && !Self::is_whitespace(ch) && !Self::is_special(ch) {
+                // Consume the junk character so the next token starts cleanly.
+                let _ = self.next_char();
             }
-            return Err(PDFError::Generic(format!(
-                "Invalid number: {} (charCode {})",
-                if ch >= 0 {
-                    (ch as u8 as char).to_string()
-                } else {
-                    "EOF".to_string()
-                },
-                ch
-            )));
+            return Ok(Token::Number(0.0));
         }
 
         let mut base_value = (ch - 0x30) as f64; // '0'
@@ -634,16 +677,13 @@ impl Lexer {
 
             self.cmd_buf.push(ch as u8 as char);
 
-            // The `ID` operator (inline image data start) is followed
-            // immediately by raw binary data (PDF 32000-1 §7.4.4).
-            // Skip the image data here so the parser never sees it.
-            if self.cmd_buf == "ID" {
-                self.skip_inline_image_data()?;
-                // After skipping past EI, return the next real token
-                return self.get_object();
-            }
-
             ch = self.next_char()?;
+        }
+
+        if self.cmd_buf == "ID" {
+            let data = self.read_inline_image_data()?;
+            self.pending_inline_image_data = Some(data);
+            return Ok(Token::Command(self.cmd_buf.clone()));
         }
 
         // Check for boolean keywords
@@ -661,30 +701,68 @@ impl Lexer {
         Ok(Token::Command(self.cmd_buf.clone()))
     }
 
-    /// Skips raw inline image data (after `ID`) until `EI` is found.
+    /// Reads raw inline image data (after `ID`) until `EI` is found.
     ///
     /// Inline image data is raw binary (not valid PDF syntax). We scan
-    /// byte-by-byte for the two-byte sequence `EI` that ends the data.
-    /// After returning, the stream is positioned past the `I` of `EI`.
-    pub fn skip_inline_image_data(&mut self) -> PDFResult<()> {
+    /// byte-by-byte for the `EI` marker that ends the data.
+    /// After returning, the stream is positioned after the marker.
+    pub fn read_inline_image_data(&mut self) -> PDFResult<Vec<u8>> {
+        // The ID operator is followed by exactly one whitespace byte before image data.
+        if self.current_char >= 0 && Self::is_whitespace(self.current_char) {
+            self.next_char()?;
+        }
+
+        let mut data = Vec::new();
         loop {
-            let b = self.next_char()?;
+            let b = self.current_char;
             if b < 0 {
-                return Ok(()); // EOF reached without finding EI
+                return Ok(data); // EOF reached without finding EI
             }
             if b as u8 == b'E' {
                 match self.next_char() {
                     Ok(next_b) if next_b >= 0 && next_b as u8 == b'I' => {
-                        // Consume the byte past "I" so the stream is positioned
-                        // past the `EI` marker.
-                        let _ = self.next_char();
-                        return Ok(());
+                        let remaining = self.stream.length().saturating_sub(self.stream.pos());
+                        let following = self
+                            .stream
+                            .peek_bytes(remaining.min(16))
+                            .unwrap_or_default();
+                        let has_ei_delimiter = following
+                            .first()
+                            .is_none_or(|byte| Self::is_whitespace(*byte as i32));
+                        let has_ei_prefix_boundary = is_inline_image_boundary(data.last().copied());
+
+                        if has_ei_prefix_boundary
+                            && has_ei_delimiter
+                            && is_inline_image_ascii_context(&following)
+                        {
+                            // Consume the byte past "I" so the lexer is ready for
+                            // the next content-stream token.
+                            let _ = self.next_char();
+                            trim_inline_image_trailing_whitespace(&mut data);
+                            return Ok(data);
+                        }
+
+                        data.push(b as u8);
                     }
-                    Ok(_) => {}
-                    Err(_) => return Ok(()),
+                    Ok(_) => {
+                        data.push(b as u8);
+                    }
+                    Err(_) => {
+                        data.push(b as u8);
+                        trim_inline_image_trailing_whitespace(&mut data);
+                        return Ok(data);
+                    }
                 }
+            } else {
+                data.push(b as u8);
+                self.next_char()?;
             }
         }
+    }
+
+    /// Skips raw inline image data (after `ID`) until `EI`.
+    pub fn skip_inline_image_data(&mut self) -> PDFResult<()> {
+        self.read_inline_image_data().map(|_| ())
     }
 
     /// Skips the end-of-line marker after the 'stream' keyword.
@@ -1251,5 +1329,18 @@ mod tests {
         let mut lexer = Lexer::new(stream).unwrap();
 
         assert_eq!(lexer.get_object().unwrap(), Token::String(b"ABCD".to_vec()));
+    }
+
+    #[test]
+    fn test_inline_image_data_ignores_ei_without_prefix_boundary() {
+        let data = b"abcEI still image data\nEI Q".to_vec();
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let mut lexer = Lexer::new(stream).unwrap();
+
+        assert_eq!(
+            lexer.read_inline_image_data().unwrap(),
+            b"abcEI still image data".to_vec()
+        );
+        assert_eq!(lexer.get_object().unwrap(), Token::Command("Q".to_string()));
     }
 }

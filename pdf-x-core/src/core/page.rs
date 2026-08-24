@@ -468,25 +468,31 @@ impl Page {
             }
         };
 
-        // Process each content stream
+        // Concatenate decoded content streams BEFORE parsing. Real PDFs (e.g.
+        // font_truetype_slow_post_lookup.pdf) split /Contents mid-operator/mid-BT
+        // so each fragment is not a self-contained program. pdf.js / ResolvedPage
+        // concatenate first; parsing streams independently aborts with
+        // "ended with operands but no operator".
+        // Source: ResolvedPage::resolve_contents, pdf.js Page.getOperatorList.
+        let mut concatenated = Vec::new();
         for (dict, data) in content_streams {
-            // Decode the stream if it's compressed. Use apply_filters (handles both
-            // /Filter as a Name and as an Array, e.g. [/FlateDecode]) — the same path
-            // the render path uses. The previous hand-written match only handled a bare
-            // /FlateDecode Name and silently used raw compressed bytes for anything else
-            // (including single-element arrays like [/FlateDecode], which many producers
-            // emit), causing "Unknown PDF operator" errors on every such stream.
             let decoded_data = if let Some(filter) = dict.get("Filter") {
                 match super::decode::apply_filters(&data, filter) {
                     Ok(decoded) => decoded,
                     Err(_) => continue, // Skip this stream if decoding fails
                 }
             } else {
-                data // No filter, use raw data
+                data
             };
+            if !concatenated.is_empty() && !concatenated.ends_with(b"\n") {
+                concatenated.push(b'\n');
+            }
+            concatenated.extend(decoded_data);
+        }
 
+        if !concatenated.is_empty() {
             // Create a stream from the (decoded) content data
-            let stream = Box::new(Stream::from_bytes(decoded_data)) as Box<dyn super::BaseStream>;
+            let stream = Box::new(Stream::from_bytes(concatenated)) as Box<dyn super::BaseStream>;
             let lexer = Lexer::new(stream)?;
             let parser = super::Parser::new(lexer)?;
             let mut evaluator = ContentStreamEvaluator::new(parser);
@@ -497,24 +503,22 @@ impl Page {
             // path does the same. The previous self.resources() returned a raw Ref
             // which load_fonts skipped (not a Dictionary), so NO fonts were loaded
             // for any page with /Resources as an indirect object.
-            let page_resources = self.get_inheritable_resources(resolver.as_xref_mut())?;
+            let page_resources = self.get_inheritable_resources(resolver)?;
             if let Some(resources) = page_resources {
                 // Ignore font loading errors - text extraction will still work with fallback encoding
                 let _ = evaluator.load_fonts(&resources, resolver.as_xref_mut());
             }
 
-            // Extract text from this stream
+            // Extract text from the concatenated page content
             let text_items = evaluator.extract_text()?;
             all_text_items.extend(text_items);
 
-            // Recurse into Form XObjects referenced by `Do` in this stream — text
-            // inside Form XObjects must be extracted too (many PDFs put body text
-            // in Form XObjects, e.g. TAMReview.pdf). The evaluator collected the
-            // XObject names; we resolve each through the page resources and, if it
-            // is a Form XObject, decode + extract its text with the same machinery.
+            // Recurse into Form XObjects referenced by `Do` — text inside Form
+            // XObjects must be extracted too (many PDFs put body text in Form
+            // XObjects, e.g. TAMReview.pdf).
             let form_names = evaluator.take_form_xobject_names();
             if !form_names.is_empty() {
-                let resources = self.get_inheritable_resources(resolver.as_xref_mut())?;
+                let resources = self.get_inheritable_resources(resolver)?;
                 for name in form_names {
                     if let Some(ref res) = resources {
                         if let Err(e) = self.extract_text_from_form_xobject(
@@ -1042,7 +1046,8 @@ impl Page {
         // Set initial CTM to map view_box [x0,y0,x1,y1] to device pixels [0,0,w,h].
         // This handles non-zero MediaBox origins (e.g. [20,20,180,180]).
         let [x0, y0, x1, y1] = view_box;
-        let page_transform = [1.0, 0.0, 0.0, -1.0, -x0, y1];
+        let rotate = self.resolve_rotate_for_rendering(resolver);
+        let page_transform = page_initial_transform(view_box, rotate);
         device.set_matrix(&page_transform);
 
         // Set initial clip to the view box to prevent rendering outside page bounds
@@ -1056,16 +1061,16 @@ impl Page {
 
         // Resolve inheritable page resources once (fonts, XObjects, etc.)
         // Reference: pdf.js/src/core/document.js - #getInheritableProperty("Resources")
-        let page_resources = self.get_inheritable_resources(resolver.as_xref_mut())?;
+        let page_resources = self.get_inheritable_resources(resolver)?;
 
-        // Process each content stream
-        let mut total_operations = 0;
+        // Concatenate decoded content streams, then parse once.
+        // Some PDFs split /Contents mid-operator (font_truetype_slow_post_lookup);
+        // parsing fragments independently loses trailing ops and can abort early.
+        // Matches ResolvedPage::resolve_contents / pdf.js Page.getOperatorList.
+        // Also preserves graphics state across stream boundaries (no per-stream
+        // save/restore of the page CTM).
+        let mut concatenated = Vec::new();
         for (stream_idx, (dict, data)) in content_streams.into_iter().enumerate() {
-            // Save device state before processing this stream
-            // This ensures each stream starts with the same CTM
-            device.save_state();
-
-            // Decode the stream if it has filters
             let decoded_data = if let Some(filter) = dict.get("Filter") {
                 match super::decode::apply_filters(&data, filter) {
                     Ok(decoded) => decoded,
@@ -1074,91 +1079,75 @@ impl Page {
                             "Warning: Failed to decode content stream {}: {}",
                             stream_idx, e
                         );
-                        device.restore_state();
-                        continue; // Skip this stream if decoding fails
+                        continue;
                     }
                 }
             } else {
-                data.to_vec() // No filter, use raw data
+                data.to_vec()
             };
+            if !concatenated.is_empty() && !concatenated.ends_with(b"\n") {
+                concatenated.push(b'\n');
+            }
+            concatenated.extend(decoded_data);
+        }
 
+        // Resolve inheritable page resources once (fonts, XObjects, etc.)
+        // Reference: pdf.js/src/core/document.js - #getInheritableProperty("Resources")
+        // Note: page_resources was already resolved above the old loop; keep using it.
+
+        if !concatenated.is_empty() {
             eprintln!(
-                "Info: Processing content stream {} ({} bytes)",
-                stream_idx,
-                decoded_data.len()
+                "Info: Processing concatenated content ({} bytes)",
+                concatenated.len()
             );
 
-            // Create a stream from the (decoded) content data
-            let stream = Box::new(Stream::from_bytes(decoded_data)) as Box<dyn super::BaseStream>;
+            let stream = Box::new(Stream::from_bytes(concatenated)) as Box<dyn super::BaseStream>;
             let lexer = Lexer::new(stream)?;
             let parser = Parser::new(lexer)?;
             let mut evaluator = super::content_stream::ContentStreamEvaluator::new(parser);
 
-            // Merge any stream-level Resources with page-level Resources.
-            // Reference: pdf.js/src/core/document.js - #getMergedResources
-            let resources = self.merge_stream_resources(
-                resolver.as_xref_mut(),
-                dict.get("Resources"),
-                &page_resources,
-            )?;
+            // Page-level resources (stream-level Resources on individual content
+            // streams are rare; ResolvedPage also uses page resources for the
+            // concatenated program).
+            // Arc<PDFObject> → owned PDFObject for the font-loader / XObject resource APIs.
+            let resources_owned: Option<PDFObject> = page_resources.as_ref().map(|r| (**r).clone());
 
-            // Load fonts from merged resources (for proper text rendering)
             #[cfg(feature = "rendering")]
             self.load_fonts_for_rendering_with_resources(
                 resolver.as_xref_mut(),
                 device,
-                resources.as_ref(),
+                resources_owned.as_ref(),
             )?;
 
-            // Create a rendering context to process operations
             let mut ctx = RenderingContext::new(device);
-            // Sync context CTM with the device's page transform
             ctx.current_state_mut().set_matrix(&page_transform);
+            ctx.set_root_ctm(page_transform);
 
-            // Set xref and resources for XObject (image) rendering
-            // Note: We need to extend the lifetime of the fetched resources
-            // by storing it and passing a reference to the context
-            if let Some(ref resources_obj) = resources {
-                // Pass the resolver (delta-aware) so font/xobject/ext-gstate fetches
-                // honor delta overrides. Reborrow: resolver is used across iterations.
+            if let Some(ref resources_obj) = resources_owned {
                 ctx.set_xobject_resources(&mut *resolver, resources_obj);
             }
 
-            // Parse and process each operation in the content stream
-            let mut stream_operations = 0;
+            let mut total_operations = 0;
             loop {
                 match evaluator.read_operation() {
                     Ok(Some(op)) => {
-                        stream_operations += 1;
+                        total_operations += 1;
                         if let Err(e) = ctx.process_operation(&op) {
-                            // Log but continue processing - one bad operator shouldn't stop entire rendering
                             eprintln!("Warning: Failed to process operator {:?}: {}", op.op, e);
                         }
                     }
-                    Ok(None) => break, // End of stream
+                    Ok(None) => break,
                     Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to read operation in stream {}, stopping: {}",
-                            stream_idx, e
-                        );
-                        break; // Can't continue after a read error
+                        eprintln!("Warning: Failed to read operation, stopping: {}", e);
+                        break;
                     }
                 }
             }
             eprintln!(
-                "Info: Processed {} operations in stream {}",
-                stream_operations, stream_idx
+                "Info: Total {} operations processed for page {}",
+                total_operations, self.page_index
             );
-            total_operations += stream_operations;
-
-            // Restore device state after processing this stream
-            // This resets the CTM to the state before this stream
-            device.restore_state();
         }
-        eprintln!(
-            "Info: Total {} operations processed for page {}",
-            total_operations, self.page_index
-        );
 
         Ok(())
     }
@@ -1277,55 +1266,53 @@ impl Page {
 
     /// Gets fallback font data for standard PDF fonts.
     ///
-    /// Returns font data for common PDF base fonts (Helvetica, Times, Courier, etc.)
-    /// by embedding Liberation fonts at compile time (metric-compatible with PDF standard fonts).
+    /// Returns Foxit Base14 CFF programs (same as pdf.js / hayro) so unembedded
+    /// standard fonts share outlines with those engines.
     #[cfg(feature = "rendering")]
     fn get_fallback_font_data(base_font: &str) -> Option<Vec<u8>> {
         let data = match base_font {
-            // Helvetica family -> Liberation Sans
+            // Helvetica family -> Foxit Sans
             "Helvetica" | "Arial" | "sans-serif" => {
-                include_bytes!("../../assets/fonts/LiberationSans-Regular.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitSans.pfb").as_slice()
             }
             "Helvetica-Bold" | "Arial-Bold" => {
-                include_bytes!("../../assets/fonts/LiberationSans-Bold.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitSansBold.pfb").as_slice()
             }
             "Helvetica-Oblique" | "Helvetica-Italic" | "Arial-Italic" => {
-                include_bytes!("../../assets/fonts/LiberationSans-Italic.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitSansItalic.pfb").as_slice()
             }
             "Helvetica-BoldOblique" | "Helvetica-BoldItalic" | "Arial-BoldItalic" => {
-                include_bytes!("../../assets/fonts/LiberationSans-BoldItalic.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitSansBoldItalic.pfb").as_slice()
             }
 
-            // Times family -> Liberation Serif
+            // Times family -> Foxit Serif
             "Times" | "Times-Roman" | "serif" => {
-                include_bytes!("../../assets/fonts/LiberationSerif-Regular.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitSerif.pfb").as_slice()
             }
-            "Times-Bold" => {
-                include_bytes!("../../assets/fonts/LiberationSerif-Bold.ttf").as_slice()
-            }
+            "Times-Bold" => include_bytes!("../../assets/fonts/FoxitSerifBold.pfb").as_slice(),
             "Times-Italic" | "Times-Roman-Italic" => {
-                include_bytes!("../../assets/fonts/LiberationSerif-Italic.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitSerifItalic.pfb").as_slice()
             }
             "Times-BoldItalic" | "Times-Roman-BoldItalic" => {
-                include_bytes!("../../assets/fonts/LiberationSerif-BoldItalic.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitSerifBoldItalic.pfb").as_slice()
             }
 
-            // Courier family -> Liberation Mono
+            // Courier family -> Foxit Fixed
             "Courier" | "CourierNew" | "monospace" => {
-                include_bytes!("../../assets/fonts/LiberationMono-Regular.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitFixed.pfb").as_slice()
             }
             "Courier-Bold" | "CourierNew-Bold" => {
-                include_bytes!("../../assets/fonts/LiberationMono-Bold.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitFixedBold.pfb").as_slice()
             }
             "Courier-Oblique" | "Courier-Italic" | "CourierNew-Italic" => {
-                include_bytes!("../../assets/fonts/LiberationMono-Italic.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitFixedItalic.pfb").as_slice()
             }
             "Courier-BoldOblique" | "Courier-BoldItalic" | "CourierNew-BoldItalic" => {
-                include_bytes!("../../assets/fonts/LiberationMono-BoldItalic.ttf").as_slice()
+                include_bytes!("../../assets/fonts/FoxitFixedBoldItalic.pfb").as_slice()
             }
 
-            // Symbol and ZapfDingbats don't have Liberation equivalents
-            "Symbol" | "ZapfDingbats" => return None,
+            "Symbol" => include_bytes!("../../assets/fonts/FoxitSymbol.pfb").as_slice(),
+            "ZapfDingbats" => include_bytes!("../../assets/fonts/FoxitDingbats.pfb").as_slice(),
 
             _ => return None,
         };
@@ -1338,6 +1325,33 @@ impl Page {
         );
         Some(data.to_vec())
     }
+}
+
+pub(crate) fn page_initial_transform(view_box: [f64; 4], rotate: i32) -> [f64; 6] {
+    let [x0, y0, x1, y1] = view_box;
+    let center_x = (x0 + x1) * 0.5;
+    let center_y = (y0 + y1) * 0.5;
+    let (a, b, c, d) = match rotate.rem_euclid(360) {
+        90 => (0.0, 1.0, 1.0, 0.0),
+        180 => (-1.0, 0.0, 0.0, 1.0),
+        270 => (0.0, -1.0, -1.0, 0.0),
+        _ => (1.0, 0.0, 0.0, -1.0),
+    };
+
+    let (offset_x, offset_y) = if a == 0.0 {
+        ((center_y - y0).abs(), (center_x - x0).abs())
+    } else {
+        ((center_x - x0).abs(), (center_y - y0).abs())
+    };
+
+    [
+        a,
+        b,
+        c,
+        d,
+        offset_x - a * center_x - c * center_y,
+        offset_y - b * center_x - d * center_y,
+    ]
 }
 
 /// Page tree cache for efficient page lookups.

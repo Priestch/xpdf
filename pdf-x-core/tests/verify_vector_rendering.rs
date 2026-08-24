@@ -18,7 +18,9 @@ fn test_colored_shapes_rendering() {
     let mut pixmap = Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
     // Test 1: Red rectangle at (50, 50) size 100x100
     println!("DEBUG: Drawing red rectangle");
@@ -122,7 +124,9 @@ fn test_transformed_shapes() {
     let mut pixmap = Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_2 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_2);
 
     // Apply a transform (translate + scale)
     device.concat_matrix(&[2.0, 0.0, 0.0, 2.0, 50.0, 50.0]);

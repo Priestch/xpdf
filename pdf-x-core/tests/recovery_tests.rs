@@ -60,3 +60,52 @@ fn truncated_pdf_opens_via_recovery_scan() {
         "recovery must restore the same page count as the intact file"
     );
 }
+
+/// Linearized Illustrator export (`issue53.pdf`) whose first-page xref's `/Prev`
+/// points into the middle of the classic table (lands on free-flag `f`). The
+/// partial first-page section omits object 1 (`/Pages`); lazy fetch must
+/// `recover_by_scan` and still resolve the page tree. Content streams are
+/// separately broken-flate and recovered by the tolerant flate fallback.
+#[test]
+fn issue53_linearized_broken_prev_opens_via_lazy_recovery() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("hayro/hayro-tests/pdfs/custom/issue53.pdf");
+    if !path.exists() {
+        // hayro submodule not checked out in this environment — skip.
+        eprintln!("skip: {} not present", path.display());
+        return;
+    }
+    let data = std::fs::read(&path).expect("issue53.pdf readable");
+    let mut doc = PDFDocument::open(data).expect("issue53 opens despite broken /Prev xref");
+    let pages = doc.page_count().expect("page_count after lazy recovery");
+    assert_eq!(pages, 1, "issue53 is a single-page document");
+    // Touch the page tree so object 1 is actually fetched (triggers recovery).
+    let _page = doc
+        .get_page(0)
+        .expect("page 0 resolves after ObjectNotInXRef recovery");
+}
+
+/// Multi-fragment /Contents arrays must extract as one program (fragments can
+/// end mid-operator). Regression for font_truetype_slow_post_lookup.pdf.
+#[test]
+fn multi_contents_array_extracts_without_trailing_operand_error() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("hayro/hayro-tests/pdfs/custom/font_truetype_slow_post_lookup.pdf");
+    if !path.exists() {
+        return;
+    }
+    let data = std::fs::read(&path).expect("read");
+    let mut doc = PDFDocument::open(data).expect("open");
+    let text = doc
+        .extract_text_from_page_as_string(0)
+        .expect("extract must survive mid-stream Content splits");
+    assert!(
+        text.len() > 100,
+        "expected substantial extracted text, got {} chars",
+        text.len()
+    );
+}

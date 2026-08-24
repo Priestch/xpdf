@@ -128,7 +128,9 @@ fn analyze_page(pdf_path: &str, page_num: usize) -> Result<RenderAnalysis, Strin
 
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
     device.set_matrix(&[
         scale,
@@ -139,7 +141,7 @@ fn analyze_page(pdf_path: &str, page_num: usize) -> Result<RenderAnalysis, Strin
         (y1 as f64) * scale,
     ]);
 
-    page.render(&mut doc.xref_mut(), &mut device)
+    page.render(doc.doc_store_mut(), &mut device)
         .map_err(|e| format!("Render error: {:?}", e))?;
 
     Ok(RenderAnalysis::from_pixmap(&pixmap))

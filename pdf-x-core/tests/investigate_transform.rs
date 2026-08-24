@@ -53,14 +53,14 @@ fn investigate_issue7200_transforms() {
                 println!("XObject present: {:?}", xobject);
 
                 // Fetch the XObject dictionary
-                if let Ok(xobj_dict) = page.fetch_if_ref(xobject, &mut doc.xref_mut()) {
+                if let Ok(xobj_dict) = doc.doc_store_mut().resolve_if_ref(xobject) {
                     if let pdf_x_core::PDFObject::Dictionary(xobj) = &xobj_dict {
                         println!("\nXObject entries:");
                         for (name, obj) in xobj.iter().take(5) {
                             println!("  {} -> {:?}", name, obj);
 
                             // Try to fetch the XObject
-                            if let Ok(xobj_data) = page.fetch_if_ref(obj, &mut doc.xref_mut()) {
+                            if let Ok(xobj_data) = doc.doc_store_mut().resolve_if_ref(obj) {
                                 if let pdf_x_core::PDFObject::Stream { dict, .. } = &xobj_data {
                                     if let Some(subtype) = dict.get("Subtype") {
                                         println!("    Subtype: {:?}", subtype);
@@ -82,7 +82,7 @@ fn investigate_issue7200_transforms() {
 
     // Print content stream (first 500 bytes)
     if let Some(contents) = page.contents() {
-        if let Ok(content_data) = page.fetch_if_ref(contents, &mut doc.xref_mut()) {
+        if let Ok(content_data) = doc.doc_store_mut().resolve_if_ref(contents) {
             if let pdf_x_core::PDFObject::Stream { dict, data } = &content_data {
                 println!(
                     "\n=== Content Stream (first {} bytes) ===",

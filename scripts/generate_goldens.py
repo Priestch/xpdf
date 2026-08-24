@@ -7,6 +7,11 @@ Usage:
 
 Goldens are stored in tests/goldens/ (gitignored). Each PDF page
 becomes <name>_p<page>.png. Single-page PDFs use just <name>.png.
+
+These goldens are for mutool-based visual checks. Known reference
+divergences, such as /Separation /None following PDFium/hayro/spec behavior,
+must be handled by the diff harness instead of treating the mutool output as
+the final oracle.
 """
 import subprocess
 import sys

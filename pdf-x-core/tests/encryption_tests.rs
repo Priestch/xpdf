@@ -74,3 +74,75 @@ fn v4_aes128_password_installs_decryptor() {
     doc.get_page(0)
         .expect("page resolves after AES-128 decryptor install");
 }
+
+/// hayro-tests password fixtures: open locked, then authenticate with the known
+/// user password and resolve page 0. Proves decryptor install + cache clear.
+#[test]
+fn hayro_password_fixtures_authenticate_and_resolve() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("hayro/hayro-tests/pdfs/custom");
+    let cases: &[(&str, &str)] = &[
+        ("password_1.pdf", "supersecret"),
+        ("password_2.pdf", "samplefiles"),
+        ("password_encrypted_aes_128.pdf", "testpw"),
+        ("password_encrypted_aes_256.pdf", "testpw"),
+        ("password_encrypted_rc4_40.pdf", "testpw"),
+        ("password_encrypted_rc4_128.pdf", "testpw"),
+    ];
+    for &(name, password) in cases {
+        let path = root.join(name);
+        if !path.exists() {
+            eprintln!("skip: {} not present", path.display());
+            continue;
+        }
+        let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        let mut doc =
+            PDFDocument::open(data).unwrap_or_else(|e| panic!("{name}: open locked doc: {e}"));
+        assert!(doc.is_encrypted(), "{name} should report encrypted");
+        assert!(
+            doc.authenticate_with_password(password.as_bytes())
+                .unwrap_or_else(|e| panic!("{name}: authenticate: {e}")),
+            "{name}: password {password:?} must authenticate"
+        );
+        let pages = doc
+            .page_count()
+            .unwrap_or_else(|e| panic!("{name}: page_count after auth: {e}"));
+        assert!(pages >= 1, "{name}: expected >=1 page, got {pages}");
+        doc.get_page(0)
+            .unwrap_or_else(|e| panic!("{name}: get_page(0) after auth: {e}"));
+    }
+}
+
+#[test]
+fn password_2_extracts_body_text() {
+    use pdf_x_core::core::parser::PDFObject;
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("hayro/hayro-tests/pdfs/custom/password_2.pdf");
+    if !path.exists() {
+        return;
+    }
+    let data = std::fs::read(&path).expect("read");
+    let mut doc = PDFDocument::open(data).expect("open");
+    assert!(
+        doc.authenticate_with_password(b"samplefiles")
+            .expect("auth")
+    );
+    let text = doc
+        .extract_text_from_page_as_string(0)
+        .expect("extract text");
+    eprintln!("password_2 text:\n{text}");
+    assert!(
+        text.contains("Introduction to Password Protection"),
+        "title missing: {text:?}"
+    );
+    assert!(
+        text.contains("Why Use Password Protection")
+            || text.contains("unauthorized")
+            || text.contains("Benefits of Securing"),
+        "body text missing — content stream may abort early: {text:?}"
+    );
+}

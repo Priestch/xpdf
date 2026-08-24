@@ -90,7 +90,7 @@ fn test_toc_style_word_spacing_flows_to_tj_text_runs() {
     let page = doc.get_page(0).expect("failed to get page 0");
     let mut device = TestDevice::new(612.0, 792.0);
 
-    page.render(&mut doc.xref_mut(), &mut device)
+    page.render(doc.doc_store_mut(), &mut device)
         .expect("failed to render page");
 
     let draw_ops: Vec<&str> = device

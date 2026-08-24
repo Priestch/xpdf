@@ -495,17 +495,15 @@ impl XRef {
             Some(PDFObject::Number(n)) => *n as usize,
             _ => return,
         };
-        let filter = dict
-            .get("Filter")
-            .and_then(|f| match f {
-                PDFObject::Name(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .map(str::to_owned);
-
-        let mut decoded = match decode::decode_stream(&data, filter.as_deref()) {
-            Ok(d) => d,
-            Err(_) => return,
+        // apply_filters handles Name and Array filters (e.g. [/FlateDecode]).
+        // decode_stream only accepts a bare FlateDecode name and returns raw
+        // bytes for arrays — ObjStm then parses zlib as objects ("xÚ…").
+        let mut decoded = match dict.get("Filter") {
+            Some(filter) => match decode::apply_filters(&data, filter) {
+                Ok(d) => d,
+                Err(_) => return,
+            },
+            None => data.clone(),
         };
         // PNG predictor (mirror fetch_compressed).
         if let Some(PDFObject::Dictionary(parms)) = dict.get("DecodeParms") {
@@ -763,14 +761,12 @@ impl XRef {
             }
         };
 
-        // Decompress the stream data if needed
-        let filter_name = dict.get("Filter").and_then(|f| match f {
-            PDFObject::Name(name) => Some(name.as_str()),
-            _ => None,
-        });
-
-        let mut decompressed_data = decode::decode_stream(data, filter_name)
-            .map_err(|e| PDFError::Generic(format!("XRef stream decode error: {}", e)))?;
+        // Decompress: apply_filters handles Name and [/FlateDecode] arrays.
+        let mut decompressed_data = match dict.get("Filter") {
+            Some(filter) => decode::apply_filters(data, filter)
+                .map_err(|e| PDFError::Generic(format!("XRef stream decode error: {}", e)))?,
+            None => data.to_vec(),
+        };
 
         // Apply PNG predictor if specified in DecodeParms
         if let Some(decode_parms) = dict.get("DecodeParms") {
@@ -1112,14 +1108,16 @@ impl XRef {
                     )));
                 }
 
-                // Decompress the stream data if needed
-                let filter_name = dict.get("Filter").and_then(|f| match f {
-                    PDFObject::Name(name) => Some(name.as_str()),
-                    _ => None,
-                });
-
-                let mut decompressed_data = decode::decode_stream(data, filter_name)
-                    .map_err(|e| PDFError::Generic(format!("ObjStm decode error: {}", e)))?;
+                // Decompress: apply_filters handles Name and Array (e.g. [/FlateDecode]).
+                // Using decode_stream with only Name caused silent no-op when Filter
+                // is an array — zlib bytes were then parsed as objects
+                // ("Expected object number, got Command(\"xÚ…\")") on Antenna
+                // House / Foxit books under ~/Books.
+                let mut decompressed_data = match dict.get("Filter") {
+                    Some(filter) => decode::apply_filters(data, filter)
+                        .map_err(|e| PDFError::Generic(format!("ObjStm decode error: {}", e)))?,
+                    None => data.clone(),
+                };
 
                 // Apply PNG predictor if specified in DecodeParms
                 if let Some(decode_parms) = dict.get("DecodeParms") {
@@ -1270,10 +1268,11 @@ impl XRef {
     /// This resolves an indirect reference like "5 0 R" to its actual object.
     /// The object is cached after being parsed. Returns an Arc to avoid expensive cloning.
     ///
-    /// **Lazy recovery:** if the fetch fails on a bad/stale offset (common in corrupt or
-    /// regenerated PDFs whose xref parses but points at the wrong bytes), the first such
-    /// failure triggers a full-file `recover_by_scan` once and retries — mirroring hayro's
-    /// `get_with` → `repair()` model. Subsequent failures pass through.
+    /// **Lazy recovery:** if the fetch fails on a bad/stale offset *or* a missing xref
+    /// entry (common in corrupt / linearized PDFs whose first-page xref parses but omits
+    /// later objects — e.g. a broken `/Prev` was skipped), the first such failure triggers
+    /// a full-file `recover_by_scan` once and retries — mirroring hayro's `get_with` →
+    /// `repair()` model. Subsequent failures pass through.
     pub fn fetch(&mut self, obj_num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
         // Circular-reference guard: a ref already being resolved on the stack (e.g. an
         // object whose indirect /Length refers back into its own dependency cycle) would
@@ -1290,10 +1289,19 @@ impl XRef {
 
         match result {
             Ok(obj) => Ok(obj),
-            Err(e) if !self.recovered && matches!(e, PDFError::BadXRefOffset { .. }) => {
-                // The xref entry's offset points at the wrong bytes (a corrupt/regenerated
-                // PDF whose xref parses but is stale). Rebuild the xref from real object
-                // offsets once, then retry — hayro's `get_with` → `repair()` model.
+            // Lazy recovery (hayro `get_with` → `repair()`):
+            // - BadXRefOffset: entry exists but offset is stale/wrong.
+            // - ObjectNotInXRef: entry missing entirely — common for linearized first-page
+            //   xrefs whose `/Prev` points into the middle of a classic table and was
+            //   skipped (issue53.pdf: `/Prev 49380` lands on the free-entry `f` flag).
+            // Rebuild once from a full-file object scan, then retry the fetch.
+            Err(e)
+                if !self.recovered
+                    && matches!(
+                        e,
+                        PDFError::BadXRefOffset { .. } | PDFError::ObjectNotInXRef { .. }
+                    ) =>
+            {
                 self.recovered = true;
                 let _ = self.recover_by_scan();
                 self.fetch_inner(obj_num, generation).map_err(|_| e)
@@ -1311,7 +1319,7 @@ impl XRef {
         // Get xref entry
         let entry = self
             .get_entry(obj_num)
-            .ok_or_else(|| PDFError::Generic(format!("Object {} not found in xref", obj_num)))?;
+            .ok_or(PDFError::ObjectNotInXRef { num: obj_num })?;
 
         match entry {
             XRefEntry::Free { .. } => Err(PDFError::Generic(format!(
@@ -1564,6 +1572,11 @@ impl XRef {
     ) {
         self.decryptor = decryptor;
         self.encrypt_obj_num = encrypt_obj_num;
+        // Objects fetched while locked (or under a previous key) may sit in the
+        // cache as ciphertext / garbage. Drop them so the next fetch re-reads
+        // and decrypts with the newly installed key. Mirrors pdf.js building a
+        // fresh CipherTransform and not reusing pre-auth object snapshots.
+        self.cache.borrow_mut().clear();
     }
 
     /// Decrypt an object's encrypted streams/strings in place, per the installed
@@ -1959,6 +1972,67 @@ mod tests {
             assert_eq!(*index, 1);
         } else {
             panic!("Expected compressed entry, got {:?}", entry2);
+        }
+    }
+
+    /// Lazy recovery: a missing xref entry (not just a bad offset) must trigger
+    /// `recover_by_scan` once so linearized PDFs with a broken `/Prev` still resolve
+    /// early objects. Regression for hayro-tests `issue53.pdf` (Object 1 not found).
+    #[test]
+    fn fetch_missing_entry_triggers_recover_by_scan() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"%PDF-1.4\n");
+        // Real objects live in the file body but are deliberately ABSENT from the xref.
+        data.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        data.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        // A partial first-page-style xref that only indexes object 2 — object 1 is missing,
+        // mirroring issue53's linearized section (objects 4..17 only) after /Prev is skipped.
+        let xref_off = data.len();
+        data.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n2 1\n");
+        // offset of obj 2: find it
+        let obj2_off = data
+            .windows(b"2 0 obj".len())
+            .position(|w| w == b"2 0 obj")
+            .unwrap();
+        data.extend_from_slice(format!("{obj2_off:010} 00000 n \n").as_bytes());
+        data.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\n");
+        data.extend_from_slice(format!("startxref\n{xref_off}\n%%EOF\n").as_bytes());
+
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let mut xref = XRef::new(stream);
+        // Install the partial table only (skip parse of startxref path).
+        xref.entries.clear();
+        xref.entries.push(Some(XRefEntry::Free {
+            next_free: 0,
+            generation: 65535,
+        })); // obj 0
+        xref.entries.push(None); // obj 1 MISSING
+        xref.entries.push(Some(XRefEntry::Uncompressed {
+            offset: obj2_off as u64,
+            generation: 0,
+        }));
+        let mut trailer_dict = std::collections::HashMap::new();
+        trailer_dict.insert("Root".to_string(), PDFObject::Ref(Ref::new(1, 0)));
+        trailer_dict.insert("Size".to_string(), PDFObject::Number(3.0));
+        xref.trailer = Some(PDFObject::Dictionary(trailer_dict));
+        xref.recovered = false;
+
+        assert!(!xref.recovered, "precondition: recovery has not run yet");
+        let obj = xref
+            .fetch(1, 0)
+            .expect("missing entry must recover via full-file scan and fetch obj 1");
+        assert!(
+            xref.recovered,
+            "fetch of missing entry must set recovered flag"
+        );
+        match obj.as_ref() {
+            PDFObject::Dictionary(dict) => {
+                assert!(
+                    dict.get("Type").is_some() || dict.get("Pages").is_some(),
+                    "recovered obj 1 should be the catalog dict, got {dict:?}"
+                );
+            }
+            other => panic!("expected dictionary catalog, got {other:?}"),
         }
     }
 

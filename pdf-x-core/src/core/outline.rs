@@ -300,8 +300,8 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
 
         // Fetch the outline dictionary
         let outline_obj = match doc
-            .xref_mut()
-            .fetch_if_ref(&PDFObject::Ref(Ref::new(num, generation)))
+            .doc_store_mut()
+            .resolve_if_ref(&PDFObject::Ref(Ref::new(num, generation)))
         {
             Ok(obj) => obj,
             Err(PDFError::DataMissing { .. }) => {

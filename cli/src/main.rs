@@ -266,6 +266,9 @@ fn print_object(obj: &PDFObject, indent: usize) {
                 println!("{}<{}>", indent_str, hex_str);
             }
         }
+        PDFObject::InlineImageData(data) => {
+            println!("{}inline image data ({} bytes)", indent_str, data.len())
+        }
         PDFObject::Name(n) => println!("{}/{}", indent_str, n),
         PDFObject::Command(c) => println!("{}{}", indent_str, c),
         PDFObject::Array(arr) => {
@@ -362,6 +365,7 @@ fn print_object_inline(obj: &PDFObject) {
                 println!("<{}>", hex_str);
             }
         }
+        PDFObject::InlineImageData(data) => println!("inline image data ({} bytes)", data.len()),
         PDFObject::Name(n) => println!("/{}", n),
         PDFObject::Command(c) => println!("{}", c),
         PDFObject::Array(_) => println!("[...]"),

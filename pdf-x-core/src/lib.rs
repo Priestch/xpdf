@@ -106,13 +106,13 @@ pub mod rendering;
 
 // Re-export main types for convenience
 pub use core::{
-    Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags, AnnotationRect,
-    AnnotationType, BaseStream, ByteSource, DeltaLayer, DestinationType, DocStore,
-    FileAttachmentAnnotation, FileChunkedStream, FormFieldType, ImageDecoder, ImageFormat, Lexer,
-    LinearizedInfo, LinkAction, LinkAnnotation, MemoryByteSource, Need, OutlineDestination,
-    OutlineItem, PDFDocument, PDFError, PDFObject, PDFResult, Page, PageResolver, Parser,
-    PopupAnnotation, ResolvedPage, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef,
-    XRefEntry,
+    AddHighlightCommand, Annotation, AnnotationBorder, AnnotationColor, AnnotationData,
+    AnnotationFlags, AnnotationRect, AnnotationType, BaseStream, ByteSource, DeltaLayer,
+    DestinationType, DocStore, FileAttachmentAnnotation, FileChunkedStream, FormFieldType,
+    ImageDecoder, ImageFormat, Lexer, LinearizedInfo, LinkAction, LinkAnnotation, MemoryByteSource,
+    Need, OutlineDestination, OutlineItem, PDFDocument, PDFError, PDFObject, PDFResult, Page,
+    PageResolver, Parser, PopupAnnotation, ResolvedPage, Stream, TextAnnotation, TextItem, Token,
+    WidgetAnnotation, XRef, XRefEntry,
 };
 
 // Re-export rendering types. The `Device` trait + `RenderingContext` + `interpret`

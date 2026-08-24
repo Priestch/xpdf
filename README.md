@@ -16,8 +16,12 @@
 - **Composable Core** - One sync, runtime-free library used by native/web/wasm shells
 - **Progressive Loading** - Bounded-memory loading on every source (file, HTTP, memory)
 - **Async HTTP Loading** - Range requests from URLs (optional `async` feature)
+- **Rendering** - Feature `rendering` (pulls image formats + `crypto`): page → RGBA via a
+  `Device` backend (`pdf-x-device-tinyskia`)
+- **Encryption** - RC4 / AES-128 / AES-256; empty-password auto-auth; `open_with_password`
 - **Text Extraction** - Extract text with position and font information
 - **Linearized PDF Support** - Fast first-page display for web-optimized PDFs
+- **Robust recovery** - Broken xref / partial flate streams recover like pdf.js/hayro
 - **Editor-Ready** - Delta layer + incremental-update writer built into object resolution
 - **High Performance** - Optimized with LRU caching, FxHashMap, and SmallVec
 - **Memory Safe** - Built with Rust's safety guarantees
@@ -32,8 +36,11 @@ Add to your `Cargo.toml`:
 [dependencies]
 pdf-x = "0.1.0"
 
-# Optional: Enable async HTTP loading
-pdf-x = { version = "0.1.0", features = ["async"] }
+# Optional features:
+#   rendering — Device surface + ICC + advanced image formats + crypto (AES-256)
+#   crypto    — SHA-2 only (also pulled in by `rendering`)
+#   async     — HTTP range loading
+pdf-x = { version = "0.1.0", features = ["rendering"] }
 ```
 
 ## 🎯 Quick Start
@@ -41,9 +48,12 @@ pdf-x = { version = "0.1.0", features = ["async"] }
 ```rust
 use pdf_x::core::PDFDocument;
 
-// Open a PDF file
+// Open a PDF file (empty-password encrypted docs auto-authenticate)
 let pdf_data = std::fs::read("document.pdf")?;
 let mut doc = PDFDocument::open(pdf_data)?;
+
+// Or open a password-protected PDF:
+// let mut doc = PDFDocument::open_with_password(pdf_data, b"user-password")?;
 
 // Get page count
 let page_count = doc.page_count()?;
@@ -56,6 +66,37 @@ let text_items = page.extract_text(&mut doc.xref_mut())?;
 for item in text_items {
     println!("Text: '{}' at {:?}", item.text, item.position);
 }
+```
+
+### Render a page (native)
+
+```bash
+# Build the raw RGBA example (rendering feature includes crypto + JPX/JBIG2)
+cargo build --release -p pdf-x-core --example render_page_png --features pdf-x-core/rendering
+
+# Usage: render_page_png <pdf> <page0> <scale> <out.raw> [password]
+# out.raw = u32le width, u32le height, RGBA8 pixels
+target/release/examples/render_page_png document.pdf 0 1.0 /tmp/page.raw
+target/release/examples/render_page_png secret.pdf 0 1.0 /tmp/page.raw mypassword
+# or: PDFX_PASSWORD=mypassword target/release/examples/render_page_png secret.pdf 0 1.0 /tmp/page.raw
+```
+
+### Visual dual-lag harness
+
+```bash
+# Compare pdf-x vs mutool (default) or hayro at 72 DPI
+python3 scripts/visual_diff.py hayro/hayro-tests/pdfs/custom/some.pdf
+python3 scripts/visual_diff.py --oracle hayro hayro/hayro-tests/pdfs/custom/some.pdf
+```
+
+### Quick page preview (real PDFs)
+
+```bash
+# Render page 0 to PNG (optional mutool side-by-side)
+python3 scripts/view_page.py document.pdf --scale 1.25 --compare --out-dir /tmp/views
+
+# Smoke-scan a folder for crash / blank / dark-collapse vs mutool
+python3 scripts/scan_real_pdfs.py ~/Downloads --limit 40 --compare-dark
 ```
 
 ## 📚 Examples
@@ -85,6 +126,7 @@ PDF-X is a **composable core + shells** architecture:
 
 - **`pdf-x-core`** (sync, runtime-free, WASM-clean): `DocStore` (single `delta → base` resolution point) → `Resolver` (owns progressive loading) → `Interpreter` over immutable `ResolvedPage` → `Device` trait. No tokio, no threads, no rendering backend baked in.
 - **Shells** (`tauri-app`, future web/wasm): provide I/O, async, threading, and the `Device` backend; drive the pull-based `Need::Range` data protocol.
+- Standard font fallback in core is deterministic and bundled; native shells may later inject platform fonts through an adapter hook without adding filesystem scanning to core.
 
 Core phases (ported from PDF.js): data source → parser → document → content/interpretation, with the delta editor layer wired into object resolution.
 

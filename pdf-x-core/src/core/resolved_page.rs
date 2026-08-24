@@ -45,12 +45,19 @@ pub struct ResolvedPage {
     resources: PDFObject,
     /// Decoded content-stream bytes (all content streams concatenated, filters applied).
     contents: Vec<u8>,
-    /// Pre-resolved snapshot of every object reachable from `/Resources` (fonts, xobjects,
-    /// ext-gstate, color spaces, and their sub-objects, recursively). Captured during
-    /// `resolve_page` so `interpret` needs no live `DocStore` — it reads from this frozen
-    /// map. Keyed by `(object_num, generation)`. Uses `Arc<PDFObject>` so the snapshot
+    /// Pre-resolved snapshot of every object reachable from `/Resources` and from
+    /// each annotation's `/AP` appearance graph (fonts, xobjects, appearance streams,
+    /// ext-gstate, color spaces, and their sub-objects, recursively). Action/dest
+    /// refs on annots are **not** followed — that would pull destination page trees.
+    /// Captured during `resolve_page` so `interpret` needs no live `DocStore`.
+    /// Keyed by `(object_num, generation)`. Uses `Arc<PDFObject>` so the snapshot
     /// shares allocations with the XRef cache (no deep clone on capture).
     objects: std::collections::HashMap<(u32, u32), Arc<PDFObject>>,
+    /// Resolved annotation dictionaries for this page (Widget/AP appearances, etc.).
+    /// Empty when `/Annots` is absent. Only `/AP` appearance streams (and their
+    /// resources) are folded into `objects` — not `/A`/`/Dest`/`/P` graphs.
+    /// Source: hayro `interpret_page` annotation pass (PDF 32000-1 §12.5.5).
+    annotations: Vec<PDFObject>,
 }
 
 impl ResolvedPage {
@@ -74,6 +81,10 @@ impl ResolvedPage {
     pub fn objects(&self) -> &std::collections::HashMap<(u32, u32), Arc<PDFObject>> {
         &self.objects
     }
+    /// Resolved page annotation dictionaries (for appearance-stream painting).
+    pub fn annotations(&self) -> &[PDFObject] {
+        &self.annotations
+    }
 }
 
 impl DocStore {
@@ -90,20 +101,36 @@ impl DocStore {
         let view_box = page.resolve_view_box_for_rendering(self);
         let rotation = page.resolve_rotate_for_rendering(self);
 
-        // /Resources resolved delta-aware (direct page-dict value; inheritance is a
-        // later refinement).
-        let resources = match page.resources() {
-            Some(r) => self.resolve_if_ref(r)?,
-            None => Arc::new(PDFObject::Null),
-        };
+        // /Resources is inheritable in the page tree. Resolve it through the
+        // same page helper used by the legacy render path so parent Pages
+        // resource dictionaries are available during pure interpretation.
+        let resources = page
+            .get_inheritable_resources(self)?
+            .unwrap_or_else(|| Arc::new(PDFObject::Null));
 
-        let contents = self.resolve_contents(page)?;
+        let budget = self.resource_budget();
+        let contents = self.resolve_contents(page, budget)?;
 
         // Capture every object reachable from /Resources into an immutable snapshot, so
         // `interpret` can run with no live DocStore. RenderingContext fetches resources
         // by name from /Resources, so walking its ref-graph captures all fetch targets
         // (fonts/xobjects/ext-gstate/color spaces + their sub-objects, recursively).
-        let objects = capture_reachable(self, &resources)?;
+        let mut objects = std::collections::HashMap::new();
+        capture_reachable_into(self, &resources, &mut objects, budget)?;
+
+        // Annotation appearance streams (Widget `/AP /N` Form XObjects) are not under
+        // /Resources. Beamer-style animated PDFs put almost all slide content there
+        // (`animated-distributions.pdf`). Resolve `/Annots` and fold **appearance**
+        // ref-graphs into the same snapshot so pure interpret can paint them.
+        //
+        // Important: do NOT walk the full annotation dict. Link annotations carry
+        // `/A /D` destinations and `/P` parent-page refs that point at other pages;
+        // following those pulls the destination page tree (and often most of the
+        // document) into the snapshot. A real index page with ~100 links then
+        // spends minutes resolving unrelated pages.
+        // Source: hayro/hayro-interpret/src/interpret/mod.rs `interpret_page`
+        // (only reads `/AP /N`, never action/dest graphs).
+        let annotations = self.resolve_annotations(page, &mut objects, budget)?;
 
         Ok(ResolvedPage {
             view_box,
@@ -111,11 +138,71 @@ impl DocStore {
             resources: (*resources).clone(),
             contents,
             objects,
+            annotations,
         })
     }
 
+    /// Resolve `/Annots` and merge each annotation's **appearance** objects into `objects`.
+    ///
+    /// Only `/AP` (and its transitive refs: `/N` Form XObject + its `/Resources`) is
+    /// captured. Action/dest/parent refs on the annot dict are intentionally ignored.
+    fn resolve_annotations(
+        &mut self,
+        page: &Page,
+        objects: &mut std::collections::HashMap<(u32, u32), Arc<PDFObject>>,
+        budget: crate::core::resource_budget::ResourceBudget,
+    ) -> PDFResult<Vec<PDFObject>> {
+        let Some(annots_obj) = page.annotations() else {
+            return Ok(Vec::new());
+        };
+        let resolved = self.resolve_if_ref(annots_obj)?;
+        let arr = match &*resolved {
+            PDFObject::Array(a) => a,
+            PDFObject::Dictionary(_) => {
+                // Single annotation written without an array wrapper.
+                Self::capture_annotation_appearance(self, &resolved, objects, budget)?;
+                return Ok(vec![(*resolved).clone()]);
+            }
+            _ => return Ok(Vec::new()),
+        };
+
+        let mut out = Vec::with_capacity(arr.len());
+        for entry in arr.iter() {
+            let annot = match self.resolve_if_ref(entry.as_ref()) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            Self::capture_annotation_appearance(self, &annot, objects, budget)?;
+            out.push((*annot).clone());
+        }
+        Ok(out)
+    }
+
+    /// Snapshot only the objects needed to paint an annotation's Normal appearance.
+    fn capture_annotation_appearance(
+        store: &mut DocStore,
+        annot: &PDFObject,
+        objects: &mut std::collections::HashMap<(u32, u32), Arc<PDFObject>>,
+        budget: crate::core::resource_budget::ResourceBudget,
+    ) -> PDFResult<()> {
+        let PDFObject::Dictionary(dict) = annot else {
+            return Ok(());
+        };
+        // Appearance streams live under `/AP` (dict of states, or rarely a stream).
+        // Nothing else on the annot is needed for paint_annotation_appearances.
+        let Some(ap) = dict.get("AP") else {
+            return Ok(());
+        };
+        capture_reachable_into(store, ap, objects, budget)?;
+        Ok(())
+    }
+
     /// Resolve and decode the page's `/Contents` (single stream or array of streams).
-    fn resolve_contents(&mut self, page: &Page) -> PDFResult<Vec<u8>> {
+    fn resolve_contents(
+        &mut self,
+        page: &Page,
+        budget: crate::core::resource_budget::ResourceBudget,
+    ) -> PDFResult<Vec<u8>> {
         let Some(contents_obj) = page.contents() else {
             return Ok(Vec::new());
         };
@@ -123,14 +210,14 @@ impl DocStore {
         let mut out = Vec::new();
         match &*resolved {
             PDFObject::Stream { dict, data } => {
-                out.extend(decode_stream(dict, data)?);
+                append_decoded_stream(&mut out, dict, data, budget)?;
             }
             PDFObject::Array(arr) => {
                 for obj in arr.iter() {
                     let entry = self.resolve_if_ref(obj.as_ref())?;
                     match &*entry {
                         PDFObject::Stream { dict, data } => {
-                            out.extend(decode_stream(dict, data)?);
+                            append_decoded_stream(&mut out, dict, data, budget)?;
                         }
                         _ => {
                             return Err(PDFError::Generic(
@@ -147,80 +234,161 @@ impl DocStore {
     }
 }
 
-/// Apply the stream's `/Filter` (if any) to its bytes.
-fn decode_stream(
+/// Decode one content stream and enforce the cumulative page-content budget.
+fn append_decoded_stream(
+    out: &mut Vec<u8>,
     dict: &std::collections::HashMap<String, PDFObject>,
     data: &[u8],
-) -> PDFResult<Vec<u8>> {
-    match dict.get("Filter") {
-        Some(f) => decode::apply_filters(data, f),
-        None => Ok(data.to_vec()),
+    budget: crate::core::resource_budget::ResourceBudget,
+) -> PDFResult<()> {
+    let decoded = match dict.get("Filter") {
+        Some(PDFObject::Name(name)) if name == "FlateDecode" || name == "Fl" => {
+            decode::decode_flate_with_budget(data, budget)?
+        }
+        Some(f) => decode::apply_filters(data, f)?,
+        None => data.to_vec(),
+    };
+    let actual = out.len().saturating_add(decoded.len());
+    if actual > budget.max_decompressed_bytes {
+        return Err(PDFError::LimitExceeded {
+            resource: "resolved page content bytes",
+            limit: budget.max_decompressed_bytes,
+            actual,
+        });
     }
+    out.extend(decoded);
+    Ok(())
 }
 
-/// Resolve every object reachable from `root` (following indirect references recursively)
-/// into an immutable snapshot. `root` is typically the page's `/Resources` dictionary.
-/// This is the resolve-phase work that lets `interpret` be pure. Each captured object is
-/// stored as `Arc<PDFObject>`, sharing allocation with the XRef cache.
-fn capture_reachable(
+/// Resolve every indirect object reachable from `root` into `snapshot` while
+/// enforcing object-count, depth and retained-byte limits.
+fn capture_reachable_into(
     store: &mut DocStore,
     root: &PDFObject,
-) -> PDFResult<std::collections::HashMap<(u32, u32), Arc<PDFObject>>> {
-    let mut snapshot: std::collections::HashMap<(u32, u32), Arc<PDFObject>> =
-        std::collections::HashMap::new();
-    let mut queue: Vec<(u32, u32)> = find_refs(root);
-    while let Some(id) = queue.pop() {
+    snapshot: &mut std::collections::HashMap<(u32, u32), Arc<PDFObject>>,
+    budget: crate::core::resource_budget::ResourceBudget,
+) -> PDFResult<()> {
+    let mut retained_bytes = snapshot
+        .values()
+        .map(|object| estimate_object_bytes(object))
+        .sum::<usize>();
+    let mut queue = find_refs_bounded(root, budget.max_reference_depth)?
+        .into_iter()
+        .map(|id| (id, 1usize))
+        .collect::<Vec<_>>();
+
+    while let Some((id, depth)) = queue.pop() {
         if snapshot.contains_key(&id) {
             continue;
         }
-        // Tolerant: skip objects that fail to resolve (e.g. malformed/unusual objects in
-        // real-world PDFs). The lazy Page::render path skips bad resources the same way;
-        // an eager snapshot must be at least as resilient. Interpretation handles any
-        // resource missing from the snapshot via RenderingContext's existing tolerance.
-        let obj = match store.resolve_ref(id.0, id.1) {
-            Ok(obj) => obj,
-            Err(e) => {
-                eprintln!(
-                    "Warning: resolve_page snapshot skipped object {} {}: {}",
-                    id.0, id.1, e
-                );
-                continue;
+        if depth > budget.max_reference_depth {
+            return Err(PDFError::LimitExceeded {
+                resource: "resolved reference depth",
+                limit: budget.max_reference_depth,
+                actual: depth,
+            });
+        }
+        if snapshot.len() >= budget.max_resolved_objects {
+            return Err(PDFError::LimitExceeded {
+                resource: "resolved object count",
+                limit: budget.max_resolved_objects,
+                actual: snapshot.len().saturating_add(1),
+            });
+        }
+
+        let object = match store.resolve_ref(id.0, id.1) {
+            Ok(object) => object,
+            Err(PDFError::LimitExceeded {
+                resource,
+                limit,
+                actual,
+            }) => {
+                return Err(PDFError::LimitExceeded {
+                    resource,
+                    limit,
+                    actual,
+                });
             }
+            Err(_) => continue,
         };
-        queue.extend(find_refs(&*obj));
-        snapshot.insert(id, obj);
+        let object_bytes = estimate_object_bytes(&object);
+        retained_bytes = retained_bytes.saturating_add(object_bytes);
+        if retained_bytes > budget.max_resolved_page_bytes {
+            return Err(PDFError::LimitExceeded {
+                resource: "resolved page snapshot bytes",
+                limit: budget.max_resolved_page_bytes,
+                actual: retained_bytes,
+            });
+        }
+        queue.extend(
+            find_refs_bounded(&object, budget.max_reference_depth)?
+                .into_iter()
+                .map(|child| (child, depth.saturating_add(1))),
+        );
+        snapshot.insert(id, object);
     }
-    Ok(snapshot)
+    Ok(())
 }
 
-/// Recursively collect all `(num, generation)` references inside an object (not following
-/// them — `capture_reachable` does that by resolving each).
-fn find_refs(obj: &PDFObject) -> Vec<(u32, u32)> {
-    let mut out = Vec::new();
-    collect_refs(obj, &mut out);
-    out
+/// Collect references without recursive Rust calls so hostile container nesting
+/// cannot overflow the process stack.
+fn find_refs_bounded(obj: &PDFObject, max_depth: usize) -> PDFResult<Vec<(u32, u32)>> {
+    let mut refs = Vec::new();
+    let mut stack = vec![(obj, 0usize)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > max_depth {
+            return Err(PDFError::LimitExceeded {
+                resource: "PDF object container depth",
+                limit: max_depth,
+                actual: depth,
+            });
+        }
+        match current {
+            PDFObject::Ref(reference) => refs.push((reference.num, reference.generation)),
+            PDFObject::Dictionary(dict) => {
+                stack.extend(dict.values().map(|value| (value, depth.saturating_add(1))));
+            }
+            PDFObject::Array(array) => {
+                stack.extend(
+                    array
+                        .iter()
+                        .map(|value| (value.as_ref(), depth.saturating_add(1))),
+                );
+            }
+            PDFObject::Stream { dict, .. } => {
+                stack.extend(dict.values().map(|value| (value, depth.saturating_add(1))));
+            }
+            _ => {}
+        }
+    }
+    Ok(refs)
 }
 
-fn collect_refs(obj: &PDFObject, out: &mut Vec<(u32, u32)>) {
-    match obj {
-        PDFObject::Ref(r) => out.push((r.num, r.generation)),
-        PDFObject::Dictionary(d) => {
-            for v in d.values() {
-                collect_refs(v, out);
+fn estimate_object_bytes(root: &PDFObject) -> usize {
+    let mut total = std::mem::size_of::<PDFObject>();
+    let mut stack = vec![root];
+    while let Some(object) = stack.pop() {
+        match object {
+            PDFObject::String(bytes)
+            | PDFObject::HexString(bytes)
+            | PDFObject::InlineImageData(bytes) => total = total.saturating_add(bytes.len()),
+            PDFObject::Name(name) | PDFObject::Command(name) => {
+                total = total.saturating_add(name.len())
             }
-        }
-        PDFObject::Array(a) => {
-            for e in a.iter() {
-                collect_refs(e, out);
+            PDFObject::Dictionary(dict) => {
+                total = total.saturating_add(dict.keys().map(String::len).sum::<usize>());
+                stack.extend(dict.values());
             }
-        }
-        PDFObject::Stream { dict, .. } => {
-            for v in dict.values() {
-                collect_refs(v, out);
+            PDFObject::Array(array) => stack.extend(array.iter().map(|item| item.as_ref())),
+            PDFObject::Stream { dict, data } => {
+                total = total.saturating_add(data.len());
+                total = total.saturating_add(dict.keys().map(String::len).sum::<usize>());
+                stack.extend(dict.values());
             }
+            _ => {}
         }
-        _ => {}
     }
+    total
 }
 
 /// A [`PageResolver`] backed by a frozen object snapshot (no live `DocStore`).
@@ -327,6 +495,124 @@ mod tests {
         );
     }
 
+    /// Two-page PDF: page 0 has Link annots whose `/A /D` points at page 1, plus one
+    /// Widget with an `/AP /N` Form XObject. Used to prove resolve_page captures the
+    /// appearance graph but never the destination page tree.
+    fn pdf_with_link_annots_to_other_page() -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+
+        let o1 = buf.len();
+        buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let o2 = buf.len();
+        buf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+
+        // Page 0: empty content, two annots.
+        let o3 = buf.len();
+        buf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] \
+              /Contents 5 0 R /Annots [10 0 R 11 0 R] >>\nendobj\n",
+        );
+
+        // Page 1: destination page with a Form XObject resource that must NOT be
+        // pulled into page 0's snapshot via link destinations.
+        let o4 = buf.len();
+        buf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] \
+              /Contents 6 0 R /Resources << /XObject << /DestFm 7 0 R >> >> >>\nendobj\n",
+        );
+
+        let o5 = buf.len();
+        buf.extend_from_slice(b"5 0 obj\n<< /Length 4 >>\nstream\nq Q\nendstream\nendobj\n");
+
+        let o6 = buf.len();
+        buf.extend_from_slice(b"6 0 obj\n<< /Length 4 >>\nstream\nq Q\nendstream\nendobj\n");
+
+        // Destination-only form (unique marker stream body).
+        let o7 = buf.len();
+        buf.extend_from_slice(
+            b"7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length 9 >>\n\
+              stream\nDESTONLY\nendstream\nendobj\n",
+        );
+
+        // Link with no /AP — only /A /D → page 1. Old capture_reachable(annot) would
+        // follow this into page 1's resources.
+        let o10 = buf.len();
+        buf.extend_from_slice(
+            b"10 0 obj\n<< /Type /Annot /Subtype /Link /Rect [10 10 20 20] \
+              /Border [0 0 0] /A << /S /GoTo /D [4 0 R /Fit] >> /P 3 0 R >>\nendobj\n",
+        );
+
+        // Link with /AP /N form appearance (object 12) AND a dest to page 1.
+        let o11 = buf.len();
+        buf.extend_from_slice(
+            b"11 0 obj\n<< /Type /Annot /Subtype /Link /Rect [30 30 40 40] \
+              /Border [0 0 0] /A << /S /GoTo /D [4 0 R /Fit] >> \
+              /AP << /N 12 0 R >> /P 3 0 R >>\nendobj\n",
+        );
+
+        let o12 = buf.len();
+        buf.extend_from_slice(
+            b"12 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length 8 >>\n\
+              stream\nAPFORM\nendstream\nendobj\n",
+        );
+
+        let xref_offset = buf.len();
+        // Objects: 1..7, 10..12 — size must cover highest number + 1.
+        buf.extend_from_slice(b"xref\n0 13\n");
+        buf.extend_from_slice(format!("{:010} 65535 f \r\n", 0).as_bytes());
+        for off in [o1, o2, o3, o4, o5, o6, o7] {
+            buf.extend_from_slice(format!("{:010} 00000 n \r\n", off).as_bytes());
+        }
+        // free 8, 9
+        buf.extend_from_slice(format!("{:010} 00000 f \r\n", 0).as_bytes());
+        buf.extend_from_slice(format!("{:010} 00000 f \r\n", 0).as_bytes());
+        for off in [o10, o11, o12] {
+            buf.extend_from_slice(format!("{:010} 00000 n \r\n", off).as_bytes());
+        }
+        buf.extend_from_slice(b"trailer\n<< /Size 13 /Root 1 0 R >>\nstartxref\n");
+        buf.extend_from_slice(format!("{}\n", xref_offset).as_bytes());
+        buf.extend_from_slice(b"%%EOF");
+        buf
+    }
+
+    #[test]
+    fn resolve_page_captures_annot_ap_not_dest_page_tree() {
+        let mut doc = PDFDocument::open(pdf_with_link_annots_to_other_page())
+            .expect("pdf with link annots should open");
+        let page = doc.get_page(0).expect("page 0");
+        let resolved = doc
+            .doc_store_mut()
+            .resolve_page(&page)
+            .expect("resolve_page");
+
+        assert_eq!(
+            resolved.annotations().len(),
+            2,
+            "both Link annots must be listed"
+        );
+
+        // Appearance Form XObject (12 0) is required for paint_annotation_appearances.
+        assert!(
+            resolved.objects().contains_key(&(12, 0)),
+            "must snapshot /AP /N Form XObject"
+        );
+
+        // Destination page (4), its contents (6), and its exclusive resource (7) must
+        // NOT be pulled in via /A /D or /P. That was the multi-minute regression on
+        // index pages with hundreds of naked Link annots.
+        for id in [4u32, 6, 7] {
+            assert!(
+                !resolved.objects().contains_key(&(id, 0)),
+                "must not snapshot dest-page object {} via link actions",
+                id
+            );
+        }
+    }
+
     #[test]
     fn resolve_page_honors_delta_override_of_contents() {
         // The seam proof: overriding the /Contents object (4 0) in the delta must change
@@ -386,6 +672,7 @@ mod tests {
             resources: PDFObject::Null,
             contents: Vec::new(),
             objects: std::collections::HashMap::new(),
+            annotations: Vec::new(),
         };
         let mut device = TestDevice::new(10.0, 10.0);
         interpret(&page, &mut device).expect("interpret runs with no DocStore (pure)");

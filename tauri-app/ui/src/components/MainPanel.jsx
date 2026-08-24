@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
 
 const MIN_ZOOM = 50;
 const MAX_ZOOM = 300;
@@ -32,11 +33,23 @@ function MainPanel({ documentLoaded, metadata }) {
   const [error, setError] = useState(null);
   const [textTraceEnabled, setTextTraceEnabled] = useState(false);
   const [zoomPercent, setZoomPercent] = useState(100);
+  const [editorState, setEditorState] = useState({ dirty: false, can_undo: false, can_redo: false });
+  const [highlightMode, setHighlightMode] = useState(false);
+  const [selection, setSelection] = useState(null);
+  const [renderRevision, setRenderRevision] = useState(0);
+  const pageRenderRef = useRef(null);
   const [devicePixelRatio, setDevicePixelRatio] = useState(
     Math.max(1, window.devicePixelRatio || 1)
   );
   const renderRequestRef = useRef(0);
   const renderScale = computeRenderScale(zoomPercent, devicePixelRatio);
+
+  useEffect(() => {
+    setCurrentPage(0);
+    setEditorState({ dirty: false, can_undo: false, can_redo: false });
+    setHighlightMode(false);
+    setSelection(null);
+  }, [metadata]);
 
   useEffect(() => {
     const syncDpr = () => setDevicePixelRatio(Math.max(1, window.devicePixelRatio || 1));
@@ -86,7 +99,84 @@ function MainPanel({ documentLoaded, metadata }) {
     };
 
     renderCurrentPage();
-  }, [currentPage, documentLoaded, metadata, textTraceEnabled, renderScale]);
+  }, [currentPage, documentLoaded, metadata, textTraceEnabled, renderScale, renderRevision]);
+
+  const runEdit = async (command) => {
+    try {
+      setError(null);
+      const nextState = await invoke(command);
+      setEditorState(nextState);
+      setRenderRevision((value) => value + 1);
+    } catch (err) {
+      setError(err.toString());
+    }
+  };
+
+  const handleSaveAs = async () => {
+    try {
+      const path = await save({ filters: [{ name: 'PDF', extensions: ['pdf'] }] });
+      if (!path) return;
+      const nextState = await invoke('save_pdf_as', { filePath: path });
+      setEditorState(nextState);
+      setRenderRevision((value) => value + 1);
+    } catch (err) {
+      setError(err.toString());
+    }
+  };
+
+  const pointerPosition = (event) => {
+    const bounds = pageRenderRef.current.getBoundingClientRect();
+    return {
+      x: clamp(event.clientX - bounds.left, 0, bounds.width),
+      y: clamp(event.clientY - bounds.top, 0, bounds.height),
+      width: bounds.width,
+      height: bounds.height,
+    };
+  };
+
+  const handlePointerDown = (event) => {
+    if (!highlightMode || !renderedPage) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const point = pointerPosition(event);
+    setSelection({ startX: point.x, startY: point.y, x: point.x, y: point.y });
+  };
+
+  const handlePointerMove = (event) => {
+    if (!selection) return;
+    const point = pointerPosition(event);
+    setSelection((current) => ({ ...current, x: point.x, y: point.y }));
+  };
+
+  const handlePointerUp = async (event) => {
+    if (!selection || !renderedPage) return;
+    const point = pointerPosition(event);
+    const left = Math.min(selection.startX, point.x);
+    const right = Math.max(selection.startX, point.x);
+    const top = Math.min(selection.startY, point.y);
+    const bottom = Math.max(selection.startY, point.y);
+    setSelection(null);
+    if (right - left < 4 || bottom - top < 4) return;
+    const pageWidth = renderedPage.width / renderedPage.requestedScale;
+    const pageHeight = renderedPage.height / renderedPage.requestedScale;
+    const bounds = pageRenderRef.current.getBoundingClientRect();
+    const rect = [
+      left / bounds.width * pageWidth,
+      pageHeight - bottom / bounds.height * pageHeight,
+      right / bounds.width * pageWidth,
+      pageHeight - top / bounds.height * pageHeight,
+    ];
+    try {
+      const nextState = await invoke('add_highlight', {
+        pageIndex: currentPage,
+        rect,
+        color: [1.0, 0.92, 0.2],
+      });
+      setEditorState(nextState);
+      setRenderRevision((value) => value + 1);
+    } catch (err) {
+      setError(err.toString());
+    }
+  };
 
   const handlePageChange = (newPage) => {
     if (newPage >= 0 && newPage < (metadata?.page_count || 0)) {
@@ -149,6 +239,20 @@ function MainPanel({ documentLoaded, metadata }) {
           </div>
         )}
         <div className="page-controls">
+          <div className="edit-controls">
+            <button
+              className={highlightMode ? 'active-tool' : ''}
+              onClick={() => setHighlightMode((value) => !value)}
+              disabled={metadata?.is_encrypted}
+              title="Highlight"
+            >
+              Highlight
+            </button>
+            <button onClick={() => runEdit('undo_edit')} disabled={!editorState.can_undo} title="Undo">↶</button>
+            <button onClick={() => runEdit('redo_edit')} disabled={!editorState.can_redo} title="Redo">↷</button>
+            <button onClick={handleSaveAs} disabled={!editorState.dirty} title="Save As">Save As</button>
+            {editorState.dirty && <span className="dirty-indicator">Unsaved</span>}
+          </div>
           <div className="zoom-controls">
             <button onClick={handleZoomOut} disabled={isLoading || zoomPercent <= MIN_ZOOM}>
               -
@@ -199,7 +303,13 @@ function MainPanel({ documentLoaded, metadata }) {
         )}
 
         {!isLoading && renderedPage && (
-          <div className="page-render">
+          <div
+            className={`page-render ${highlightMode ? 'highlight-mode' : ''}`}
+            ref={pageRenderRef}
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+          >
             <img
               src={`data:image/png;base64,${renderedPage.image_data}`}
               alt={`Page ${currentPage + 1}`}
@@ -209,6 +319,14 @@ function MainPanel({ documentLoaded, metadata }) {
                 height: `${imageHeight}px`,
               }}
             />
+            {selection && (
+              <div className="highlight-selection" style={{
+                left: `${Math.min(selection.startX, selection.x)}px`,
+                top: `${Math.min(selection.startY, selection.y)}px`,
+                width: `${Math.abs(selection.x - selection.startX)}px`,
+                height: `${Math.abs(selection.y - selection.startY)}px`,
+              }} />
+            )}
           </div>
         )}
 

@@ -81,6 +81,9 @@ pub enum PDFObject {
         data: Vec<u8>,
     },
 
+    /// Raw inline image data captured after the `ID` operator.
+    InlineImageData(Vec<u8>),
+
     /// Indirect object reference (like "5 0 R")
     Ref(Ref),
 
@@ -258,11 +261,20 @@ impl Parser {
             // Dictionary start: << ... >>
             Token::DictStart => self.parse_dictionary(),
 
-            // Array/dict end tokens are errors here (should be consumed by parse_array/parse_dictionary)
-            Token::ArrayEnd => Err(PDFError::Generic("Unexpected array end token".to_string())),
-            Token::DictEnd => Err(PDFError::Generic(
-                "Unexpected dictionary end token".to_string(),
-            )),
+            // Stray `]` / `>>` outside the matching parse_array/parse_dictionary loop.
+            // Real-world PDFs (Antenna House / Foxit-edited books) sometimes emit an
+            // extra closer; pdf.js/Adobe recover rather than abort the page. Returning
+            // Null lets dictionary/array recovery continue instead of failing render
+            // with "Unexpected array end token" (Creating Web Animations, Fundamentals
+            // of Data Visualization under ~/Books).
+            Token::ArrayEnd => {
+                eprintln!("Warning: unexpected ']' — treating as null");
+                Ok(PDFObject::Null)
+            }
+            Token::DictEnd => {
+                eprintln!("Warning: unexpected '>>' — treating as null");
+                Ok(PDFObject::Null)
+            }
 
             // Number: could be the start of an indirect reference (N1 N2 R)
             Token::Number(n) => {
@@ -293,6 +305,7 @@ impl Parser {
             Token::String(s) => Ok(PDFObject::String(s)),
             Token::HexString(s) => Ok(PDFObject::HexString(s)),
             Token::Name(n) => Ok(PDFObject::Name(n)),
+            Token::InlineImageData(data) => Ok(PDFObject::InlineImageData(data)),
             Token::Command(c) => Ok(PDFObject::Command(c)), // Keep as Command for content streams
         }
     }
@@ -323,8 +336,13 @@ impl Parser {
                     // Try to recover by inserting null and continuing
                     eprintln!("Warning: Error parsing array element: {:?}, using null", e);
                     array.push(Box::new(PDFObject::Null));
-                    // Try to recover by finding the next token that looks like array end
-                    // Skip ahead until we find ']' or some reasonable stopping point
+                    // If the failure already consumed a closing `]` (legacy hard-error
+                    // path) or we are staring at one, end the array. Otherwise skip a
+                    // few tokens looking for `]`.
+                    if matches!(&self.buf1, Some(Token::ArrayEnd)) {
+                        self.shift()?; // consume ']'
+                        break;
+                    }
                     let mut recovery_attempts = 0;
                     while recovery_attempts < 10 {
                         if let Some(Token::ArrayEnd) = &self.buf1 {
@@ -333,8 +351,10 @@ impl Parser {
                         if let Some(Token::EOF) = &self.buf1 {
                             break;
                         }
-                        if recovery_attempts > 0 {
-                            self.shift()?; // Try to advance
+                        // Always advance — previously attempt 0 did not shift and
+                        // could spin on the same bad token.
+                        if self.shift().is_err() {
+                            break;
                         }
                         recovery_attempts += 1;
                     }
@@ -886,5 +906,51 @@ mod tests {
     fn test_unterminated_dictionary() {
         let result = parse_string("<< /Type /Font");
         assert!(result.is_err());
+    }
+
+    /// Extra `]` after a complete array must not abort parsing of a following dict.
+    /// Real books (Antenna House / Foxit) occasionally emit a stray closer.
+    #[test]
+    fn test_stray_array_end_recovers_as_null_and_continues() {
+        // After `[]` the next top-level token is a stray `]`, then a dict.
+        // get_object on `]` yields Null; subsequent get_object yields the dict.
+        let data = b"[] ] << /Type /Page >>";
+        let stream = Box::new(Stream::from_bytes(data.to_vec()));
+        let lexer = Lexer::new(stream).unwrap();
+        let mut parser = Parser::new(lexer).unwrap();
+        let first = parser.get_object().expect("empty array");
+        assert!(matches!(first, PDFObject::Array(_)));
+        let stray = parser
+            .get_object()
+            .expect("stray ] must recover as Null, not Err");
+        assert_eq!(stray, PDFObject::Null);
+        let dict = parser.get_object().expect("dict after stray ]");
+        match dict {
+            PDFObject::Dictionary(d) => {
+                assert_eq!(d.get("Type"), Some(&PDFObject::Name("Page".into())));
+            }
+            other => panic!("expected dictionary after recovery, got {other:?}"),
+        }
+    }
+
+    /// Sign/dot not followed by a digit (e.g. `-î`) yields Number(0), not hard error.
+    #[test]
+    fn test_invalid_number_recovers_as_zero() {
+        // Leading minus then non-digit byte 0xEE — seen in Foxit-edited arrays.
+        let data = b"[- \xEE 3]";
+        let stream = Box::new(Stream::from_bytes(data.to_vec()));
+        let lexer = Lexer::new(stream).unwrap();
+        let mut parser = Parser::new(lexer).unwrap();
+        let obj = parser
+            .get_object()
+            .expect("array with junk number must parse");
+        match obj {
+            PDFObject::Array(arr) => {
+                assert!(arr.len() >= 2, "expected recovered elements, got {arr:?}");
+                // First element is the recovered 0 from `-î`
+                assert_eq!(arr[0].as_ref(), &PDFObject::Number(0.0));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
     }
 }

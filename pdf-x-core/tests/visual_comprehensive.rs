@@ -215,7 +215,8 @@ fn render_page(pdf_path: &str, page_num: usize, output_path: &str) -> Result<(f6
     pixmap.fill(tiny_skia::Color::WHITE);
 
     // Create rendering device
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
     // Apply coordinate transform (PDF Y-up to screen Y-down)
     device.set_matrix(&[
@@ -228,7 +229,7 @@ fn render_page(pdf_path: &str, page_num: usize, output_path: &str) -> Result<(f6
     ]);
 
     // Render the page
-    page.render(&mut doc.xref_mut(), &mut device)
+    page.render(doc.doc_store_mut(), &mut device)
         .map_err(|e| format!("Render error: {:?}", e))?;
 
     // Calculate pixel statistics

@@ -42,13 +42,29 @@ moxcms = { workspace = true, optional = true }
 default = ["jpeg-decoding"]
 jpeg-decoding = ["zune-jpeg"]
 png-decoding = ["image"]
-advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2", "hayro-ccitt"]
+advanced-image-formats = [
+    "image",
+    "hayro-jpeg2000",
+    "hayro-jpeg2000/image",
+    "hayro-jbig2",
+    "hayro-ccitt",
+]
 crypto = ["sha2"]  # AES implementation is now built-in, only SHA-2 is external
 # Backend-agnostic rendering surface (Device trait, RenderingContext, `interpret`) is
 # always compiled (no external deps). The tiny-skia backend now lives in
 # `pdf-x-device-tinyskia`. This feature is retained as a marker so existing
 # `required-features = ["rendering"]` test targets keep working unchanged.
-rendering = ["dep:moxcms"]
+#
+# Pull in advanced-image-formats so JPX/JBIG2 (and CCITT via that feature set)
+# decode under normal rendering builds. Without this, Filter=[AHx, JPXDecode]
+# images on stream_jpx_6.pdf etc. stay white (decode_jpx is feature-gated).
+#
+# Also pull in `crypto` (sha2): AES-256 (R=5/6) key derivation needs SHA-2.
+# Without it, empty-password AES-256 corpora (catalog-in-objstm-aes,
+# encrypted_aes_256, …) panic at open instead of decrypting. RC4/AES-128
+# work without sha2, but rendering builds should handle the full encrypted
+# corpus uniformly. `crypto` remains a standalone feature for non-render use.
+rendering = ["dep:moxcms", "advanced-image-formats", "crypto"]
 debug-logging = []  # Enable verbose debug logging for rendering operations
 
 [dev-dependencies]
@@ -57,6 +73,7 @@ tempfile = "3.14"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.5"
 hex = "0.4"
+crc32fast = "1.4"
 # Isolated PNG codec for the golden render-output regression harness.
 # Acceptable per CLAUDE.md (isolated-operation codec; no full-file PDF dependency).
 png = "0.17"
@@ -111,3 +128,4 @@ required-features = ["rendering", "crypto"]
 name = "render"
 path = "examples/render.rs"
 required-features = ["rendering"]
+

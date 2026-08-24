@@ -1,8 +1,11 @@
 # Phase 0 — Foundation Spec
 
-> Status: **proposed**. This is a design spec, not a description of current code. It defines the
-> target interfaces for the Phase 0 refactor (decisions A/B/C from `CLAUDE.md`) and the correctness
-> strategy that makes the implementation right. Nothing here is merged until the migration steps land.
+> Status: **mostly landed (2026-07)**. Target interfaces for decisions A/B/C are live on the
+> viewer path (`DocStore`, `ResolvedPage`, pure `interpret` / `interpret_with_scale`, device
+> adapter crate). This document remains the design reference; §4 steps 1–5 are implemented at
+> the level described in `docs/architecture.md` → *Current Project Status*. Residual Phase-0
+> work is progressive-loading production-path cleanup and inherited page-tree seams, not a
+> greenfield rewrite.
 
 ## 1. Purpose
 
@@ -169,7 +172,7 @@ tools as oracles.** Different layers need different correctness signals.
 | Parser / xref / object streams | Structure correct | **qpdf `--check`** on our output; parse every corpus file without panic |
 | Encryption (RC4/AES) | Decrypt matches reference | Decrypt corpus files, compare to unencrypted equivalents; vectors from pdf.js |
 | Writer (incremental update, compact, linearization) | Output is spec-valid & editable | **qpdf `--check`** + reopen in ourselves, pdf.js, and a reader; round-trip equality |
-| Interpretation (graphics/text) | Pixels/text match reference | **Reference-image diff** (perceptual, tolerance-bounded) seeded from pdf.js/hayro refs; **differential text** vs `mutool draw -t` / pdf.js |
+| Interpretation (graphics/text) | Pixels/text match reference | **Reference-image diff** at 72 DPI with mutool as the default oracle; documented exceptions use PDFium/hayro/spec behavior when mutool disagrees; **differential text** vs `mutool draw -t` / pdf.js |
 | Progressive loading (our differentiator) | Minimal, bounded fetching | **Property tests**: assert exact `Need::Range` set per operation; assert page-1 render fetches only page-1 objects; no whole-file reads |
 | `DocStore` delta semantics | Override/delete correctness | **Property tests**: `delta → base` laws; delete cascades; cache invalidation on edit |
 | Robustness (corrupt input) | Never panic, graceful degrade | **Fuzz** the parser/lexer with `cargo-fuzz`; curate the corrupt-PDF subset |
@@ -242,5 +245,52 @@ Each step ends with `cargo test --features rendering` passing and `render_page_t
 
 - Editor commands (annotation/page/form) — Phase 2+, once `DocStore` resolution is real.
 - Collaboration / merge — Phase 5.
-- New color spaces (Lab/ICC/Indexed), Pattern/Shading fills — rendering completeness, post-Phase-0.
+- New color spaces (Lab/ICC/Indexed), Pattern/Shading fills — rendering completeness, post-Phase-0
+  *(note: several of these have since landed on the viewer path as structural dual-lag work;
+  they remain out of Phase-0's *architectural* acceptance criteria)*.
 - True text reflow — not on the roadmap.
+
+## 7. Viewer-green structural fixes (post Step 5, still Phase-0 hygiene)
+
+These keep `cargo test --features rendering` and the hayro custom visual corpus green. They
+are not architecture migrations, but they are load-bearing for the dual-lag chase and must not
+be regressed:
+
+| Fix | Where | Acceptance signal |
+|---|---|---|
+| Viewport scale in `interpret_with_scale` | `rendering/mod.rs`, tinyskia `render_resolved_page` | scale=2/4 content fills canvas, not corner |
+| XObject / inline **LZWDecode** | `rendering/context.rs` + `decode::decode_lzw` | `pdftc_900k_0974` dual lag ≈ 0; photo mean ≠ 255 |
+| Lazy xref recovery on missing entry | `PDFError::ObjectNotInXRef` → `XRef::fetch` → `recover_by_scan` | `issue53.pdf` opens and paints (mutool blank; ours≈hayro) |
+| Tolerant Flate fallback | `core/flate_fallback.rs` ← hayro/pdf.js | corrupt content streams recover non-empty bytes |
+| Encryption end-to-end | empty-pw auto-auth; `open_with_password`; `rendering` ⇒ `crypto` | AES-256 empty-pw + password fixtures resolve without panic |
+| Decryptor install clears object cache | `XRef::set_decryptor` | auth-after-open does not reuse ciphertext snapshots |
+| ASCII85Decode correctness | `decode_ascii85`: `>` is a digit; EOD only on `~`; partial groups pad with `'u'` (84) — hayro/pdf.js | `password_2.pdf` body text present; stream 1788 B not 233 |
+| FontFile filter chain | `Font::extract_font_stream` uses `apply_filters` (not Flate-only `decode_stream`) | ASCIIHex/A85 Type1 FontFile no longer "Unsupported filter" |
+| Multi `/Contents` extract+render | `Page::extract_text` and `Page::render` concatenate decoded streams before parse (like `ResolvedPage` / pdf.js) | `font_truetype_slow_post_lookup` extract/render survive mid-op splits |
+| ObjStm/XRef filter arrays | `fetch_compressed` / XRef stream use `apply_filters` (not Name-only `decode_stream`) | Antenna House books under `~/Books` (Creating Web Animations, Wilke) open |
+| Stray `]` / bad numbers | `get_object` recovers Null; invalid number after sign → 0 (Adobe-like) | Foxit-edited arrays no longer abort page_count |
+
+**Visual harness**: `python3 scripts/visual_diff.py [--oracle mutool\|hayro] [pdf…]`  
+Oracle default mutool; `EXPECTED_DIVERGENCES` holds documented mutool policy/AA gaps (±0.05).  
+Strategy: prefer structural bugs (dark-count collapse, crash, missing filter) over 72 DPI AA.
+
+**Corpus smoke (custom)** (2026-07-10):
+- render crash: **265/265** (password fixtures need known user passwords)
+- extract / concatenated content-stream parse: **265/265** hard errors
+- dark-collapse (ours≪mutool, not policy): none remaining after LZW/ASCII85/multi-Contents
+
+### XFAIL triage (custom, 72 DPI, mutool oracle)
+
+Remaining `EXPECTED_DIVERGENCES` entries fall into classes that are **not** missing
+draw/decode bugs under the dual-lag criteria (solid-interior match, scale↑→0 lag,
+ours−hay high, ink neighborhood r≤1):
+
+| Class | Examples | Signal |
+|---|---|---|
+| Color-management / Separation policy | `image_lab*`, `image_cmyk_*`, `color_space_separation_*`, `mask_bc`, `path_rendering_10` | ours−hay ≈ 100%; mutool no-ICC or different Lab/CMYK |
+| 72 DPI AA / downsample | `pdftc_900k_0319`, `0584`, `image_inline_2`, `color_space_icc_srgb`, `image_mask` | solid interior 100% or only_oracle ink at r≤2; 2× lag shrinks |
+| Three-engine disagreement | `font_type3_widths_with_matrix`, tiling step fixtures | dual lag often **negative** (we closer to mutool than hayro) |
+| Documented mutool blanks / oddities | `issue53` (mutool blank), `separation_none` | policy, not missing paint |
+
+Do **not** chase these for dual-lag points without new structural evidence
+(dark_ours≈0 while oracle has ink; extract/parse hard fail; wrong glyph topology).

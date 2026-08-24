@@ -15,7 +15,9 @@ fn test_render_rgb_image() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
     // Set a clean transform (no Y-flip) for easier testing
     device.set_matrix(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
@@ -35,8 +37,9 @@ fn test_render_rgb_image() {
         has_alpha: false,
         bits_per_component: 8,
         is_mask: false,
+        mask_paint_one: true,
         mask_color: [0, 0, 0],
-        is_mask: false,
+        interpolate: false,
     };
 
     // Draw at (10, 10) with 1x scale (no scaling, just translation)
@@ -89,7 +92,9 @@ fn test_render_cmyk_image() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_2 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_2);
 
     // Set a clean transform (no Y-flip) for easier testing
     device.set_matrix(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
@@ -113,8 +118,9 @@ fn test_render_cmyk_image() {
         has_alpha: false,
         bits_per_component: 8,
         is_mask: false,
+        mask_paint_one: true,
         mask_color: [0, 0, 0],
-        is_mask: false,
+        interpolate: false,
     };
 
     // Draw at (10, 10) with 1x scale (no scaling, just translation)
@@ -149,7 +155,9 @@ fn test_render_grayscale_image() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_3 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_3);
 
     // Set a clean transform (no Y-flip) for easier testing
     device.set_matrix(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
@@ -169,8 +177,9 @@ fn test_render_grayscale_image() {
         has_alpha: false,
         bits_per_component: 8,
         is_mask: false,
+        mask_paint_one: true,
         mask_color: [0, 0, 0],
-        is_mask: false,
+        interpolate: false,
     };
 
     // Draw at (10, 10) with 1x scale (no scaling, just translation)
@@ -320,7 +329,9 @@ fn test_image_with_identity_transform() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_4 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_4);
 
     // Set a clean transform (no Y-flip) for easier testing
     device.set_matrix(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
@@ -339,8 +350,9 @@ fn test_image_with_identity_transform() {
         has_alpha: false,
         bits_per_component: 8,
         is_mask: false,
+        mask_paint_one: true,
         mask_color: [0, 0, 0],
-        is_mask: false,
+        interpolate: false,
     };
 
     // Draw at (50, 50) with identity transform
@@ -361,7 +373,9 @@ fn test_rgba_image_passthrough() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_5 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_5);
 
     // Set a clean transform (no Y-flip) for easier testing
     device.set_matrix(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
@@ -381,8 +395,9 @@ fn test_rgba_image_passthrough() {
         has_alpha: true,
         bits_per_component: 8,
         is_mask: false,
+        mask_paint_one: true,
         mask_color: [0, 0, 0],
-        is_mask: false,
+        interpolate: false,
     };
 
     // Draw at (10, 10) with 1x scale (no scaling, just translation)
