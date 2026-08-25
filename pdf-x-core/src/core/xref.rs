@@ -3,7 +3,7 @@ use super::byte_source::Loadable;
 use super::decode;
 use super::error::{PDFError, PDFResult};
 use super::lexer::Lexer;
-use super::parser::{PDFObject, Parser};
+use super::parser::{PDFObject, Parser, Ref};
 use super::stream::Stream;
 use lru::LruCache;
 use std::cell::RefCell;
@@ -53,7 +53,7 @@ pub struct XRef {
     /// The entries in the xref table, indexed by object number
     entries: Vec<Option<XRefEntry>>,
 
-    /// Cache of parsed objects (object number -> PDFObject)
+    /// Cache of parsed objects (full indirect reference -> PDFObject)
     /// Uses Arc to avoid expensive cloning of large objects
     /// Uses LRU cache with FxHashMap for bounded memory and fast access
     /// Default capacity: 1000 objects (~10MB for typical PDFs)
@@ -61,7 +61,7 @@ pub struct XRef {
     /// needed for a probe). Cache mutations through `RefCell` are never re-entrant, so
     /// runtime panics from overlapping borrows do not occur.
     cache:
-        RefCell<LruCache<u32, Arc<PDFObject>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>>,
+        RefCell<LruCache<Ref, Arc<PDFObject>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>>,
 
     /// The trailer dictionary
     trailer: Option<PDFObject>,
@@ -1242,11 +1242,11 @@ impl XRef {
                 // Parse the object (no "obj"/"endobj" wrappers in ObjStm)
                 let object = Arc::new(obj_parser.get_object()?);
 
-                // Cache it with the actual object number
+                // Objects stored in an object stream always have generation 0.
                 let actual_obj_num = obj_nums[index as usize];
                 self.cache
                     .borrow_mut()
-                    .put(actual_obj_num, Arc::clone(&object));
+                    .put(Ref::new(actual_obj_num, 0), Arc::clone(&object));
 
                 Ok(object)
             }
@@ -1311,8 +1311,10 @@ impl XRef {
     }
 
     fn fetch_inner(&mut self, obj_num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
+        let cache_key = Ref::new(obj_num, generation);
+
         // Check cache first - Arc::clone is cheap (just increments refcount)
-        if let Some(cached) = self.cache.borrow_mut().get(&obj_num) {
+        if let Some(cached) = self.cache.borrow_mut().get(&cache_key) {
             return Ok(Arc::clone(cached));
         }
 
@@ -1429,7 +1431,7 @@ impl XRef {
                 // Cache the Arc - cheap clone
                 self.cache
                     .borrow_mut()
-                    .put(obj_num, Arc::clone(&object_arc));
+                    .put(cache_key, Arc::clone(&object_arc));
 
                 Ok(object_arc)
             }
@@ -1438,6 +1440,13 @@ impl XRef {
                 obj_stream_num,
                 index,
             } => {
+                if generation != 0 {
+                    return Err(PDFError::Generic(format!(
+                        "Generation mismatch for compressed object {}: expected 0, got {}",
+                        obj_num, generation
+                    )));
+                }
+
                 // Fetch from compressed object stream
                 self.fetch_compressed(*obj_stream_num, *index)
             }
@@ -1452,8 +1461,11 @@ impl XRef {
     /// that only need to check whether an object is already resolved (e.g. the
     /// parser's /Length-resolver closure) use this instead of `fetch`, avoiding
     /// the need for `&mut self`.
-    pub fn fetch_cached(&self, obj_num: u32) -> Option<Arc<PDFObject>> {
-        self.cache.borrow_mut().get(&obj_num).map(Arc::clone)
+    pub fn fetch_cached(&self, obj_num: u32, generation: u32) -> Option<Arc<PDFObject>> {
+        self.cache
+            .borrow_mut()
+            .get(&Ref::new(obj_num, generation))
+            .map(Arc::clone)
     }
 
     /// Fetches an object if it's a reference, otherwise returns the object as-is.
@@ -1687,6 +1699,31 @@ mod tests {
             generation: 5,
         };
         assert_eq!(entry.generation(), 5);
+    }
+
+    #[test]
+    fn fetch_cache_is_scoped_by_generation() {
+        let data = b"1 0 obj\n42\nendobj\n";
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let mut xref = XRef::new(stream);
+        xref.entries.push(None);
+        xref.entries.push(Some(XRefEntry::Uncompressed {
+            offset: 0,
+            generation: 0,
+        }));
+
+        let object = xref.fetch(1, 0).expect("generation 0 object should parse");
+        assert_eq!(object.as_ref(), &PDFObject::Number(42.0));
+        assert!(xref.fetch_cached(1, 0).is_some());
+        assert!(xref.fetch_cached(1, 1).is_none());
+
+        let error = xref
+            .fetch(1, 1)
+            .expect_err("a cached generation 0 object must not satisfy generation 1");
+        assert!(
+            error.to_string().contains("Generation mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
