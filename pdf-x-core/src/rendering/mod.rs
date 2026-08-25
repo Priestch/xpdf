@@ -70,6 +70,50 @@ pub fn interpret_with_scale<D: Device>(
     use crate::rendering::context::RenderingContext;
     use crate::rendering::graphics_state::FillRule;
 
+    // Validate scale parameter (C.3: render budgets and input validation)
+    if !scale.is_finite() {
+        return Err(crate::core::error::PDFError::Generic(format!(
+            "Scale must be finite, got {}",
+            scale
+        )));
+    }
+    if scale <= 0.0 {
+        return Err(crate::core::error::PDFError::Generic(format!(
+            "Scale must be positive, got {}",
+            scale
+        )));
+    }
+
+    // Calculate and validate output dimensions
+    let [x0, y0, x1, y1] = page.view_box();
+    let page_width = x1 - x0;
+    let page_height = y1 - y0;
+
+    // Apply reasonable limits to prevent extreme memory/rendering costs
+    const MAX_OUTPUT_DIMENSION: f64 = 65536.0; // 64K pixels
+    const MAX_OUTPUT_AREA: f64 = 512.0 * 1024.0 * 1024.0; // 512 megapixels
+
+    let output_width = page_width * scale as f64;
+    let output_height = page_height * scale as f64;
+    let output_area = output_width * output_height;
+
+    if output_width > MAX_OUTPUT_DIMENSION || output_height > MAX_OUTPUT_DIMENSION {
+        return Err(crate::core::error::PDFError::Generic(format!(
+            "Output dimension too large: {}x{} exceeds maximum {} pixels",
+            output_width,
+            output_height,
+            MAX_OUTPUT_DIMENSION
+        )));
+    }
+
+    if output_area > MAX_OUTPUT_AREA {
+        return Err(crate::core::error::PDFError::Generic(format!(
+            "Output area too large: {:.1} megapixels exceeds maximum {} megapixels",
+            output_area / (1024.0 * 1024.0),
+            MAX_OUTPUT_AREA / (1024.0 * 1024.0)
+        )));
+    }
+
     // Set initial CTM and clip to the view box (matches Page::render's pre-amble).
     // Scale all six matrix components so both linear and translation terms map
     // user space → device pixels (equivalent to pdf.js PageViewport scale).
