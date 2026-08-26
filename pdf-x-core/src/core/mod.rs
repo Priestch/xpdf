@@ -1,7 +1,6 @@
 pub mod annotation;
 pub mod base_stream;
 pub mod byte_source;
-pub mod chunk_manager;
 pub mod cmap;
 pub mod content_stream;
 pub mod crypto;
@@ -13,7 +12,6 @@ pub mod document_loader;
 pub mod encoding;
 pub mod encryption;
 pub mod error;
-pub mod file_chunked_stream;
 pub(crate) mod flate_fallback;
 pub mod font;
 pub mod glyphlist;
@@ -41,7 +39,6 @@ pub use base_stream::BaseStream;
 pub use byte_source::{
     BaseStreamSource, ByteSource, Loadable, MemoryByteSource, Need, StepErr, drive,
 };
-pub use chunk_manager::{ChunkLoader, ChunkManager};
 pub use cmap::CMap;
 pub use content_stream::{ContentStreamEvaluator, OpCode, Operation, TextItem};
 pub use crypto::{
@@ -56,7 +53,6 @@ pub use document::{LinearizedInfo, PDFDocument};
 pub use encoding::Encoding;
 pub use encryption::{EncryptDict, EncryptionAlgorithm, EncryptionVersion, PDFPermissions};
 pub use error::{PDFError, PDFResult};
-pub use file_chunked_stream::FileChunkedStream;
 pub use font::{Font, FontDict, FontType};
 pub use image::{
     DecodedImage, ImageColorSpace, ImageDecoder, ImageExtraction, ImageFormat, ImageMetadata,

@@ -1,11 +1,8 @@
-use super::base_stream::BaseStream;
-use super::chunk_manager::ChunkLoader;
 use super::delta::{AddHighlightCommand, CommandHistory, DeltaLayer};
 use super::doc_store::DocStore;
 use super::document_loader::{DocumentLoader, OpenProgress};
 use super::encryption::{EncryptDict, EncryptionVersion};
 use super::error::{PDFError, PDFResult};
-use super::file_chunked_stream::FileChunkedStream;
 use super::page::{Page, PageTreeCache};
 use super::parser::{PDFObject, Ref};
 use super::pdf_writer::PDFWriter;
@@ -15,7 +12,6 @@ use lru::LruCache;
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Information about a linearized PDF.
@@ -127,7 +123,7 @@ impl PDFDocument {
     /// Shared open back half: wire decryption, load the catalog, detect
     /// linearization, and assemble the document over a parsed `XRef`.
     ///
-    /// Both [`open`](Self::open) and [`open_file`](Self::open_file) — and the
+    /// Both [`open`](Self::open) and shell-driven loader opens — and the
     /// progressive [`DocumentLoader`](super::document_loader::DocumentLoader) —
     /// converge here after their (source-specific) xref-parse phases.
     pub(crate) fn from_xref(mut xref: XRef) -> PDFResult<Self> {
@@ -170,7 +166,7 @@ impl PDFDocument {
         // satisfied synchronously and no `Need` can surface (equivalence-tested in
         // `loader_opens_memory_stream_identically`). The tail scan, parse, and
         // ±1KB `xref`-keyword → full-file-scan recovery ladder all live in the loader —
-        // one implementation shared with `open_file` and shell-driven progressive opens.
+        // one implementation shared across shell-driven progressive opens.
         let mut loader = DocumentLoader::new(Stream::from_bytes(data));
         match loader.step()? {
             OpenProgress::Ready(doc) => Ok(*doc),
@@ -208,92 +204,17 @@ impl PDFDocument {
         Ok(doc)
     }
 
-    /// Opens a PDF document from a file using progressive/chunked loading.
+    /// Open from the filesystem with progressive/chunked loading.
     ///
-    /// This loads the PDF in chunks (default 64KB) rather than reading the entire
-    /// file into memory at once, enabling:
-    /// - Low memory usage for large PDFs
-    /// - Fast first-page display (especially for linearized PDFs)
-    /// - Efficient handling of network-served PDFs
-    ///
-    /// This is the **recommended** way to open PDFs, following PDF.js's progressive
-    /// loading architecture.
-    ///
-    /// # Arguments
-    /// * `path` - Path to the PDF file
-    /// * `chunk_size` - Optional chunk size in bytes (default: 65536 = 64KB)
-    /// * `max_cached_chunks` - Optional maximum chunks to keep in memory (default: 10)
-    ///
-    /// # Example
-    /// ```no_run
-    /// use pdf_x::core::PDFDocument;
-    ///
-    /// // Use default chunk size and cache
-    /// let doc = PDFDocument::open_file("document.pdf", None, None).unwrap();
-    ///
-    /// // Custom chunk size (128KB) and cache (20 chunks)
-    /// let doc = PDFDocument::open_file("large.pdf", Some(131072), Some(20)).unwrap();
-    /// ```
-    pub fn open_file<P: AsRef<Path>>(
-        path: P,
-        chunk_size: Option<usize>,
-        max_cached_chunks: Option<usize>,
-    ) -> PDFResult<Self> {
-        let mut stream = FileChunkedStream::open(path, chunk_size, max_cached_chunks)?;
-
-        // To find startxref, we need the last 1024 bytes of the file
-        // Preload the last chunk(s) to ensure we have that data
-        let file_length = stream.length();
-        let startxref_search_start = if file_length > 1024 {
-            file_length - 1024
-        } else {
-            0
-        };
-
-        // Preload the range containing startxref
-        stream.preload_range(startxref_search_start, file_length)?;
-
-        // Get the last 1024 bytes to find startxref
-        let search_data = stream.get_byte_range(startxref_search_start, file_length)?;
-
-        // Find startxref in the tail of the file (tolerate missing → recovery scan below).
-        let startxref_opt =
-            Self::find_startxref_in_bytes(&search_data, startxref_search_start).ok();
-
-        // Create xref with the chunked stream
-        // Fully qualified: importing `DocumentSource` here would make every
-        // `stream.length()` below ambiguous with the blanket impl.
-        let boxed_stream = Box::new(stream) as Box<dyn super::base_stream::DocumentSource>;
-        let mut xref = XRef::new(boxed_stream);
-
-        let mut parse_ok = false;
-        if let Some(startxref) = startxref_opt {
-            // Position at xref table and parse with the shell-owned progressive-loading loop.
-            //
-            // `drive` retries on `Need` (adapted from `DataMissing` at the boundary).
-            // `XRef::parse(startxref)` takes its start as an argument (D.3: no cursor state
-            // in the source), so each retry re-parses from `startxref` by construction and
-            // progresses as chunks load (xref entries use set-if-None guards, so re-parsing
-            // is idempotent). `XRef: Loadable` provides `ensure_range` for the drive loop;
-            // it pulls the xref region on demand.
-            parse_ok = crate::core::byte_source::drive(&mut xref, |x| {
-                crate::core::byte_source::StepErr::adapt(x.parse(startxref))
-            })
-            .is_ok();
-        }
-
-        if !parse_ok {
-            // Last resort: rebuild the xref table by scanning the whole file (pdf.js
-            // `indexObjects`). Forces a full load — acceptable only as recovery.
-            xref.recover_by_scan()?;
-        }
-
-        Self::from_xref(xref)
-    }
+    /// Moved to the shell-side adapter crate in Phase D step 4 (core performs
+    /// no I/O): use [`pdf_x_source_file::open_file`] —
+    /// `pdf_x_source_file::open_file(path, None, None)` — which drives the same
+    /// [`DocumentLoader`](super::document_loader::DocumentLoader) open with the
+    /// same recovery ladder and chunked file source.
 
     /// Helper method to find startxref with a known offset adjustment.
     ///
-    /// This is used by `open_file()` when we've read a slice from the end of the file.
+    /// This is used when a tail slice has been read from the end of the file.
     pub(crate) fn find_startxref_in_bytes(data: &[u8], _base_offset: usize) -> PDFResult<usize> {
         // Find "startxref"
         let keyword = b"startxref";

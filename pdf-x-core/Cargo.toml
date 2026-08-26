@@ -68,6 +68,9 @@ rendering = ["dep:moxcms", "advanced-image-formats", "crypto"]
 debug-logging = []  # Enable verbose debug logging for rendering operations
 
 [dev-dependencies]
+# File-source adapter (tests/examples exercise the shell-side open path).
+# dev-dep cycles are legal: pdf-x-source-file depends on pdf-x-core proper.
+pdf-x-source-file = { path = "../pdf-x-source-file" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3.14"
 criterion = { version = "0.5", features = ["html_reports"] }

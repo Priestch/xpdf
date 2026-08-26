@@ -221,34 +221,4 @@ mod tests {
             "page inherited/fetched a MediaBox"
         );
     }
-
-    #[test]
-    fn open_file_drives_progressive_load() {
-        // Step 3b acceptance: the chunked open_file path drives xref.parse() through
-        // `drive` (was retry_on_data_missing!). Uses the default 64 KB chunk size, which
-        // is how open_file is used in practice: the file fits in one chunk, open_file
-        // preloads the xref region, and parse completes in a single driven step.
-        //
-        // NOTE: a tiny chunk size (e.g. 64) forces parse into the missing-data path and
-        // exposes a SEPARATE pre-existing bug — parse/lexer loops instead of returning
-        // DataMissing on a partially-loaded stream. That bug is out of scope for the
-        // drive migration (it affects the legacy macro equally) and doesn't manifest in
-        // normal use because open_file preloads the xref region before parsing.
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let data = minimal_pdf();
-        let tmp = NamedTempFile::new().expect("temp file should be created");
-        tmp.as_file()
-            .write_all(&data)
-            .expect("temp file should be writable");
-        tmp.as_file().sync_all().ok();
-
-        let mut doc = PDFDocument::open_file(tmp.path(), None, None)
-            .expect("open_file should drive the progressive load to completion");
-        let page = doc
-            .get_page(0)
-            .expect("page 0 should resolve after the driven load");
-        assert_eq!(page.index(), 0);
-    }
 }

@@ -654,7 +654,7 @@ impl Page {
     /// ```no_run
     /// use pdf_x_core::core::PDFDocument;
     ///
-    /// let mut doc = PDFDocument::open_file("document.pdf", None, None).unwrap();
+    /// let mut doc = pdf_x_source_file::open_file("document.pdf", None, None).unwrap();
     /// let page = doc.get_page(0).unwrap();
     ///
     /// let text = page.extract_text_as_string(doc.doc_store_mut()).unwrap();

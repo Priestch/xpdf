@@ -49,10 +49,11 @@
 //! PDF-X supports progressive loading that mirrors PDF.js's architecture:
 //!
 //! //! ```ignore
-//! use pdf_x_core::core::{PDFDocument, FileChunkedStream};
+//! use pdf_x_core::PDFDocument;
+//! use pdf_x_source_file::open_file;
 //!
-//! // Open with chunked loading for large files
-//! let mut doc = PDFDocument::open_file("large.pdf", None, None)?;
+//! // Open with chunked loading for large files (native file source adapter)
+//! let mut doc = open_file("large.pdf", None, None)?;
 //!
 //! // Pages are loaded on-demand, not all at once
 //! let page = doc.get_page(0)?; // This will trigger progressive loading
@@ -108,11 +109,11 @@ pub mod rendering;
 pub use core::{
     AddHighlightCommand, Annotation, AnnotationBorder, AnnotationColor, AnnotationData,
     AnnotationFlags, AnnotationRect, AnnotationType, BaseStream, ByteSource, DeltaLayer,
-    DestinationType, DocStore, FileAttachmentAnnotation, FileChunkedStream, FormFieldType,
-    ImageDecoder, ImageFormat, Lexer, LinearizedInfo, LinkAction, LinkAnnotation, MemoryByteSource,
-    Need, OutlineDestination, OutlineItem, PDFDocument, PDFError, PDFObject, PDFResult, Page,
-    PageResolver, Parser, PopupAnnotation, ResolvedPage, Stream, TextAnnotation, TextItem, Token,
-    WidgetAnnotation, XRef, XRefEntry,
+    DestinationType, DocStore, FileAttachmentAnnotation, FormFieldType, ImageDecoder, ImageFormat,
+    Lexer, LinearizedInfo, LinkAction, LinkAnnotation, MemoryByteSource, Need, OutlineDestination,
+    OutlineItem, PDFDocument, PDFError, PDFObject, PDFResult, Page, PageResolver, Parser,
+    PopupAnnotation, ResolvedPage, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef,
+    XRefEntry,
 };
 
 // Re-export rendering types. The `Device` trait + `RenderingContext` + `interpret`

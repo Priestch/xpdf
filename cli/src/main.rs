@@ -69,7 +69,7 @@ fn main() {
 
     // Open PDF document using progressive/chunked loading
     // This loads the PDF in 64KB chunks rather than reading the entire file into memory
-    let mut doc = match PDFDocument::open_file(pdf_path, None, None) {
+    let mut doc = match pdf_x_source_file::open_file(pdf_path, None, None) {
         Ok(doc) => doc,
         Err(e) => {
             eprintln!("Error parsing PDF: {:?}", e);

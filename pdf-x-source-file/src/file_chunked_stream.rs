@@ -1,6 +1,6 @@
-use super::base_stream::BaseStream;
-use super::chunk_manager::{ChunkLoader, ChunkManager};
-use super::error::{PDFError, PDFResult};
+use crate::chunk_manager::{ChunkLoader, ChunkManager};
+use pdf_x_core::core::base_stream::BaseStream;
+use pdf_x_core::core::error::{PDFError, PDFResult};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -434,7 +434,8 @@ impl BaseStream for FileChunkedStream {
         );
 
         // Wrap in SubStream to provide the restricted view
-        let sub = super::sub_stream::SubStream::new(Box::new(new_stream), start, length)?;
+        let sub =
+            pdf_x_core::core::sub_stream::SubStream::new(Box::new(new_stream), start, length)?;
         Ok(Box::new(sub))
     }
 }

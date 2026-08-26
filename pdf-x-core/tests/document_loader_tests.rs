@@ -10,8 +10,8 @@
 
 use pdf_x_core::PDFDocument;
 use pdf_x_core::core::document_loader::{DocumentLoader, OpenProgress};
-use pdf_x_core::core::file_chunked_stream::FileChunkedStream;
 use pdf_x_core::core::stream::Stream;
+use pdf_x_source_file::FileChunkedStream;
 
 fn fixtures_pdfs() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -1,4 +1,4 @@
-use super::error::{PDFError, PDFResult};
+use pdf_x_core::core::error::{PDFError, PDFResult};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Default chunk size: 64KB (same as PDF.js)

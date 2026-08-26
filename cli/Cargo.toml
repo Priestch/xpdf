@@ -11,6 +11,7 @@ name = "pdf-inspect"
 path = "src/main.rs"
 
 [dependencies]
+pdf-x-source-file = { path = "../pdf-x-source-file" }
 pdf-x-core = { path = "../pdf-x-core", features = ["jpeg-decoding"] }
 
 [features]
