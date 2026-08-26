@@ -156,7 +156,17 @@ where
                 ok = xref.parse().is_ok();
             }
             if !ok {
-                xref.recover_by_scan()?;
+                // Same terminal error the buffered path reported, so converging
+                // `PDFDocument::open` onto this loader (D step 2) changes no
+                // observable failure text.
+                xref.recover_by_scan().map_err(|_| {
+                    PDFError::Generic(format!(
+                        "Failed to parse xref{} and full-file recovery scan failed",
+                        self.startxref
+                            .map(|s| format!(" at startxref offset {s}"))
+                            .unwrap_or_default()
+                    ))
+                })?;
             }
         }
 

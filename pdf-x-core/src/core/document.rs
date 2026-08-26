@@ -2,6 +2,7 @@ use super::base_stream::BaseStream;
 use super::chunk_manager::ChunkLoader;
 use super::delta::{AddHighlightCommand, CommandHistory, DeltaLayer};
 use super::doc_store::DocStore;
+use super::document_loader::{DocumentLoader, OpenProgress};
 use super::encryption::{EncryptDict, EncryptionVersion};
 use super::error::{PDFError, PDFResult};
 use super::file_chunked_stream::FileChunkedStream;
@@ -164,74 +165,19 @@ impl PDFDocument {
     }
 
     pub fn open(data: Vec<u8>) -> PDFResult<Self> {
-        // Find the startxref offset. If it's missing (truncated/corrupt file), go straight
-        // to full-file recovery scan below.
-        let startxref = Self::find_startxref(&data);
-
-        // Capture a small region around `startxref` for offset-recovery before `data`
-        // moves into the stream. Some real-world PDFs carry a `startxref` value that
-        // points slightly past the `xref` keyword (regenerated/edited files); if the
-        // recorded offset fails to parse, we scan this region backwards for `xref`.
-        let (recovery_start, recovery_region) = match &startxref {
-            Ok(sx) => {
-                let recovery_start = sx.saturating_sub(1024).min(data.len());
-                let recovery_end = data.len().min(sx.saturating_add(1024));
-                let region = if recovery_start < recovery_end {
-                    data[recovery_start..recovery_end].to_vec()
-                } else {
-                    Vec::new()
-                };
-                (recovery_start, region)
-            }
-            Err(_) => (0, Vec::new()),
-        };
-
-        // Create stream and xref
-        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
-        let mut xref = XRef::new(stream);
-
-        // Position at xref table and parse. On failure, try the cheap `xref`-keyword
-        // recovery first (common "startxref slightly off" case), then fall back to a
-        // full-file scan (pdf.js `indexObjects`) for truncated/corrupt files.
-        let parse_ok = match &startxref {
-            Ok(sx) => {
-                xref.set_stream_pos(*sx)?;
-                if xref.parse().is_ok() {
-                    true
-                } else {
-                    // ±1KB `xref` keyword recovery.
-                    let recovered = recovery_region
-                        .windows(b"\nxref".len())
-                        .rposition(|w| w == b"\nxref")
-                        .map(|rel| recovery_start + rel + 1); // +1: skip '\n', point at 'xref'
-                    match recovered {
-                        Some(offset) => {
-                            xref.set_stream_pos(offset)?;
-                            xref.parse().is_ok()
-                        }
-                        None => false,
-                    }
-                }
-            }
-            Err(_) => false,
-        };
-
-        if !parse_ok {
-            // Last resort: rebuild the xref table by scanning the whole file for objects.
-            // (Mirrors pdf.js's `XRef.indexObjects()` recovery; reads the whole file — the
-            // documented exception to progressive loading for corrupt input.)
-            xref.recover_by_scan().map_err(|_| {
-                PDFError::Generic(format!(
-                    "Failed to parse xref{} and full-file recovery scan failed",
-                    startxref
-                        .as_ref()
-                        .map(|s| format!(" at startxref offset {s}"))
-                        .unwrap_or_default()
-                ))
-            })?;
+        // Converged on the shell-steppable loader (Phase D step 2). A memory source is
+        // fully loaded, so the open completes in one step: every range request is
+        // satisfied synchronously and no `Need` can surface (equivalence-tested in
+        // `loader_opens_memory_stream_identically`). The tail scan, parse, and
+        // ±1KB `xref`-keyword → full-file-scan recovery ladder all live in the loader —
+        // one implementation shared with `open_file` and shell-driven progressive opens.
+        let mut loader = DocumentLoader::new(Stream::from_bytes(data));
+        match loader.step()? {
+            OpenProgress::Ready(doc) => Ok(*doc),
+            OpenProgress::Need(need) => Err(PDFError::Generic(format!(
+                "memory source must not surface a range request ({need:?})"
+            ))),
         }
-
-        Self::from_xref(xref)
     }
 
     /// Open a PDF and authenticate with `password` when the document is encrypted.
