@@ -100,9 +100,7 @@ pub fn interpret_with_scale<D: Device>(
     if output_width > MAX_OUTPUT_DIMENSION || output_height > MAX_OUTPUT_DIMENSION {
         return Err(crate::core::error::PDFError::Generic(format!(
             "Output dimension too large: {}x{} exceeds maximum {} pixels",
-            output_width,
-            output_height,
-            MAX_OUTPUT_DIMENSION
+            output_width, output_height, MAX_OUTPUT_DIMENSION
         )));
     }
 

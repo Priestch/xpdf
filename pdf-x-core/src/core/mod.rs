@@ -9,6 +9,7 @@ pub mod decode;
 pub mod delta;
 pub mod doc_store;
 pub mod document;
+pub mod document_loader;
 pub mod encoding;
 pub mod encryption;
 pub mod error;

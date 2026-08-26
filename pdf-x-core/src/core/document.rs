@@ -123,6 +123,46 @@ impl PDFDocument {
     /// let pdf_data = std::fs::read("document.pdf").unwrap();
     /// let doc = PDFDocument::open(pdf_data).unwrap();
     /// ```
+    /// Shared open back half: wire decryption, load the catalog, detect
+    /// linearization, and assemble the document over a parsed `XRef`.
+    ///
+    /// Both [`open`](Self::open) and [`open_file`](Self::open_file) — and the
+    /// progressive [`DocumentLoader`](super::document_loader::DocumentLoader) —
+    /// converge here after their (source-specific) xref-parse phases.
+    pub(crate) fn from_xref(mut xref: XRef) -> PDFResult<Self> {
+        // Wire end-to-end decryption BEFORE any object fetch: read /Encrypt, auto-auth the
+        // empty password, install the decryptor. (The /Encrypt dict itself and the
+        // cross-reference stream are fetched/created during parse, before this point, and
+        // are exempt from decryption anyway; all later fetches — catalog, pages, content —
+        // must see the installed decryptor so an encrypted catalog-in-ObjStm decrypts.)
+        let encrypt_dict = Self::setup_encryption(&mut xref)?;
+
+        // Load the catalog
+        let catalog = Some(xref.catalog()?);
+
+        // Check if this is a linearized PDF
+        let linearized = Self::check_linearized(&mut xref)?;
+
+        // Delta layer over the base. Sized by the base object count so new objects
+        // (Phase 2+) get fresh object numbers above the base range.
+        let delta = DeltaLayer::new(xref.len() as u32);
+        let doc_store = DocStore::new(xref, delta);
+
+        Ok(PDFDocument {
+            doc_store,
+            command_history: CommandHistory::new(),
+            catalog,
+            page_cache: PageTreeCache::new(),
+            linearized,
+            encrypt_dict,
+            page_ref_cache: FxHashMap::default(),
+            page_ref_cache_built: false,
+            page_cache_revision: 0,
+            page_resolved_cache: LruCache::new(NonZeroUsize::new(10).unwrap()),
+            font_cache: None,
+        })
+    }
+
     pub fn open(data: Vec<u8>) -> PDFResult<Self> {
         // Find the startxref offset. If it's missing (truncated/corrupt file), go straight
         // to full-file recovery scan below.
@@ -191,37 +231,7 @@ impl PDFDocument {
             })?;
         }
 
-        // Wire end-to-end decryption BEFORE any object fetch: read /Encrypt, auto-auth the
-        // empty password, install the decryptor. (The /Encrypt dict itself and the
-        // cross-reference stream are fetched/created during parse, before this point, and
-        // are exempt from decryption anyway; all later fetches — catalog, pages, content —
-        // must see the installed decryptor so an encrypted catalog-in-ObjStm decrypts.)
-        let encrypt_dict = Self::setup_encryption(&mut xref)?;
-
-        // Load the catalog
-        let catalog = Some(xref.catalog()?);
-
-        // Check if this is a linearized PDF
-        let linearized = Self::check_linearized(&mut xref)?;
-
-        // Delta layer over the base. Sized by the base object count so new objects
-        // (Phase 2+) get fresh object numbers above the base range.
-        let delta = DeltaLayer::new(xref.len() as u32);
-        let doc_store = DocStore::new(xref, delta);
-
-        Ok(PDFDocument {
-            doc_store,
-            command_history: CommandHistory::new(),
-            catalog,
-            page_cache: PageTreeCache::new(),
-            linearized,
-            encrypt_dict,
-            page_ref_cache: FxHashMap::default(),
-            page_ref_cache_built: false,
-            page_cache_revision: 0,
-            page_resolved_cache: LruCache::new(NonZeroUsize::new(10).unwrap()),
-            font_cache: None,
-        })
+        Self::from_xref(xref)
     }
 
     /// Open a PDF and authenticate with `password` when the document is encrypted.
@@ -332,43 +342,13 @@ impl PDFDocument {
             xref.recover_by_scan()?;
         }
 
-        // Wire end-to-end decryption BEFORE any object fetch: read /Encrypt, auto-auth the
-        // empty password, install the decryptor. (The /Encrypt dict itself and the
-        // cross-reference stream are fetched/created during parse, before this point, and
-        // are exempt from decryption anyway; all later fetches — catalog, pages, content —
-        // must see the installed decryptor so an encrypted catalog-in-ObjStm decrypts.)
-        let encrypt_dict = Self::setup_encryption(&mut xref)?;
-
-        // Load the catalog
-        let catalog = Some(xref.catalog()?);
-
-        // Check if this is a linearized PDF
-        let linearized = Self::check_linearized(&mut xref)?;
-
-        // Delta layer over the base. Sized by the base object count so new objects
-        // (Phase 2+) get fresh object numbers above the base range.
-        let delta = DeltaLayer::new(xref.len() as u32);
-        let doc_store = DocStore::new(xref, delta);
-
-        Ok(PDFDocument {
-            doc_store,
-            command_history: CommandHistory::new(),
-            catalog,
-            page_cache: PageTreeCache::new(),
-            linearized,
-            encrypt_dict,
-            page_ref_cache: FxHashMap::default(),
-            page_ref_cache_built: false,
-            page_cache_revision: 0,
-            page_resolved_cache: LruCache::new(NonZeroUsize::new(10).unwrap()),
-            font_cache: None,
-        })
+        Self::from_xref(xref)
     }
 
     /// Helper method to find startxref with a known offset adjustment.
     ///
     /// This is used by `open_file()` when we've read a slice from the end of the file.
-    fn find_startxref_in_bytes(data: &[u8], _base_offset: usize) -> PDFResult<usize> {
+    pub(crate) fn find_startxref_in_bytes(data: &[u8], _base_offset: usize) -> PDFResult<usize> {
         // Find "startxref"
         let keyword = b"startxref";
         let pos = data

@@ -1741,7 +1741,8 @@ mod tests {
             generation: 0,
         }));
 
-        xref.fetch(1, 0).expect("object should parse while unencrypted");
+        xref.fetch(1, 0)
+            .expect("object should parse while unencrypted");
         assert!(
             xref.fetch_cached(1, 0).is_some(),
             "fetch must populate the cache"
@@ -1755,7 +1756,9 @@ mod tests {
             "set_decryptor must drop cached pre-auth objects"
         );
 
-        let refetched = xref.fetch(1, 0).expect("object should re-fetch after cache drop");
+        let refetched = xref
+            .fetch(1, 0)
+            .expect("object should re-fetch after cache drop");
         assert_eq!(refetched.as_ref(), &PDFObject::Number(42.0));
     }
 
