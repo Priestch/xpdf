@@ -340,6 +340,9 @@ impl BaseStream for FileChunkedStream {
             return Err(PDFError::InvalidByteRange { begin, end });
         }
 
+        // Cache `total_length` for the locked section below: `self.length()`
+        // re-locks the manager, and std::sync::Mutex is not reentrant —
+        // calling it while `manager` is held deadlocks on any DataMissing path.
         let manager = lock_manager(&self.manager)?;
 
         let begin_chunk = manager.get_chunk_number(begin);
@@ -352,7 +355,7 @@ impl BaseStream for FileChunkedStream {
                 // Calculate the byte range for this missing chunk
                 let chunk_size = manager.chunk_size();
                 let chunk_start = chunk * chunk_size;
-                let chunk_end = std::cmp::min(chunk_start + chunk_size, self.length());
+                let chunk_end = std::cmp::min(chunk_start + chunk_size, total_length);
 
                 // For progressive loading, return the exact byte range needed
                 return Err(PDFError::DataMissing {
@@ -371,7 +374,7 @@ impl BaseStream for FileChunkedStream {
                 // This shouldn't happen after the check above, but handle it
                 let chunk_size = manager.chunk_size();
                 let chunk_start = chunk_num * chunk_size;
-                let chunk_end = std::cmp::min(chunk_start + chunk_size, self.length());
+                let chunk_end = std::cmp::min(chunk_start + chunk_size, total_length);
                 PDFError::DataMissing {
                     position: chunk_start,
                     length: chunk_end - chunk_start,
@@ -459,6 +462,22 @@ mod tests {
         assert_eq!(stream.pos(), 0);
         assert!(!stream.is_empty());
         assert_eq!(stream.num_chunks(), 1); // 1024 bytes / 64KB = 1 chunk
+    }
+
+    #[test]
+    fn get_byte_range_on_unloaded_chunk_returns_data_missing() {
+        // Regression: this path used to deadlock. get_byte_range held the
+        // manager lock across its DataMissing branch, and the branch called
+        // self.length(), which locks the same non-reentrant mutex again — any
+        // caller probing an unloaded range hung forever.
+        let temp_file = create_test_file(200_000);
+        let stream = FileChunkedStream::open(temp_file.path(), None, None).unwrap();
+        assert_eq!(stream.num_chunks_loaded(), 0);
+
+        match stream.get_byte_range(70_000, 90_000) {
+            Err(PDFError::DataMissing { .. }) => {}
+            other => panic!("expected DataMissing for an unloaded chunk, got {other:?}"),
+        }
     }
 
     #[test]
