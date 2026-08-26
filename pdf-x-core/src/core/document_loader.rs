@@ -117,7 +117,9 @@ where
                 .source
                 .take()
                 .expect("source is retained until the XRef takes it");
-            self.xref = Some(XRef::new(Box::new(source) as Box<dyn BaseStream>));
+            self.xref = Some(XRef::new(
+                Box::new(source) as Box<dyn super::base_stream::DocumentSource>
+            ));
         }
 
         let xref = self.xref.as_mut().expect("XRef constructed above");

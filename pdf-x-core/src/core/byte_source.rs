@@ -607,7 +607,8 @@ mod tests {
         use crate::core::stream::Stream;
         use crate::core::xref::XRef;
         let data = classic_pdf();
-        let stream = Box::new(Stream::from_bytes(data.clone())) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data.clone()))
+            as Box<dyn crate::core::base_stream::DocumentSource>;
         let mut xref = XRef::new(stream);
 
         // Loadable::len is the backing stream length (NOT the inherent XRef::len, which

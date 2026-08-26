@@ -177,3 +177,50 @@ pub trait BaseStream: Send {
         None
     }
 }
+
+/// The cursor-free half of [`BaseStream`]: everything a document's *backing data*
+/// must provide, with no parse-position semantics (D.3 split).
+///
+/// [`XRef`] holds its byte data as `Box<dyn DocumentSource>` and never moves a
+/// cursor on it — parse cursors live in parser-local sub-stream Lexers and in
+/// explicit arguments. This is the contract a shell-side source implements to
+/// feed the core (D.4: the native file source moves out of core behind this
+/// trait): four methods instead of `BaseStream`'s positional surface.
+///
+/// Every [`BaseStream`] is a `DocumentSource` via the blanket impl below, so
+/// existing sources (memory, chunked file, sub-streams) need no new code.
+pub trait DocumentSource: Send {
+    /// Total length of the data, in bytes.
+    fn length(&self) -> usize;
+
+    /// Return `[begin, end)` if the range is available locally; otherwise
+    /// `DataMissing` (progressive sources) or a bounds error. Does not mutate
+    /// any state.
+    fn get_byte_range(&self, begin: usize, end: usize) -> PDFResult<Vec<u8>>;
+
+    /// Make `[start, start+length)` available locally. No-op for fully-loaded
+    /// sources; performs (or requests) I/O for progressive ones.
+    fn ensure_range(&mut self, start: usize, length: usize) -> PDFResult<()>;
+
+    /// A parser-local positional view of `[start, start+length)`. The returned
+    /// sub-stream owns its own cursor; the source's state is unchanged.
+    fn make_sub_stream(&self, start: usize, length: usize) -> PDFResult<Box<dyn BaseStream>>;
+}
+
+impl<T: BaseStream> DocumentSource for T {
+    fn length(&self) -> usize {
+        BaseStream::length(self)
+    }
+
+    fn get_byte_range(&self, begin: usize, end: usize) -> PDFResult<Vec<u8>> {
+        BaseStream::get_byte_range(self, begin, end)
+    }
+
+    fn ensure_range(&mut self, start: usize, length: usize) -> PDFResult<()> {
+        BaseStream::ensure_range(self, start, length)
+    }
+
+    fn make_sub_stream(&self, start: usize, length: usize) -> PDFResult<Box<dyn BaseStream>> {
+        BaseStream::make_sub_stream(self, start, length)
+    }
+}

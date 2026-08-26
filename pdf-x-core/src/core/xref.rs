@@ -1,4 +1,4 @@
-use super::base_stream::BaseStream;
+use super::base_stream::{BaseStream, DocumentSource};
 use super::byte_source::Loadable;
 use super::decode;
 use super::error::{PDFError, PDFResult};
@@ -67,14 +67,13 @@ pub struct XRef {
     trailer: Option<PDFObject>,
 
     /// Byte data backing this document — the *source* half of the D.3 split
-    /// (parse state separated from the source).
+    /// (parse state separated from the source), held as the cursor-free
+    /// [`DocumentSource`] contract rather than a positional `BaseStream`.
     ///
-    /// Invariant: accessed ONLY through cursor-free operations
-    /// (`length` / `get_byte_range` / `ensure_range` / `make_sub_stream`). Parse
-    /// cursors live in parser-local sub-stream Lexers and in explicit arguments
-    /// (`parse(start_pos)`), never in this field — that is what makes `drive`
-    /// retries restartable by construction.
-    source: Box<dyn BaseStream>,
+    /// Parse cursors live in parser-local sub-stream Lexers and in explicit
+    /// arguments (`parse(start_pos)`), never in this field — that is what makes
+    /// `drive` retries restartable by construction.
+    source: Box<dyn DocumentSource>,
 
     /// Whether the xref table has already been rebuilt by the full-file recovery scan.
     /// Guards lazy fetch-time recovery (hayro's `repair()` model): the first `fetch` that
@@ -129,8 +128,11 @@ impl Loadable for XRef {
 }
 
 impl XRef {
-    /// Creates a new XRef table.
-    pub fn new(stream: Box<dyn BaseStream>) -> Self {
+    /// Creates a new XRef table over a cursor-free byte source.
+    ///
+    /// Any [`BaseStream`] coerces (blanket [`DocumentSource`] impl), so
+    /// `XRef::new(Box::new(stream))` keeps working for memory/chunked sources.
+    pub fn new(source: Box<dyn DocumentSource>) -> Self {
         // Default cache capacity: 1000 objects
         // This is enough for most PDFs while keeping memory bounded
         let capacity = NonZeroUsize::new(1000).unwrap();
@@ -143,7 +145,7 @@ impl XRef {
             entries: Vec::new(),
             cache: RefCell::new(cache),
             trailer: None,
-            source: stream,
+            source,
             recovered: false,
             decryptor: None,
             encrypt_obj_num: None,
@@ -1688,7 +1690,7 @@ mod tests {
     #[test]
     fn fetch_cache_is_scoped_by_generation() {
         let data = b"1 0 obj\n42\nendobj\n";
-        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
         xref.entries.push(None);
         xref.entries.push(Some(XRefEntry::Uncompressed {
@@ -1717,7 +1719,7 @@ mod tests {
         // the next fetch re-reads and decrypts. Mirrors pdf.js building a fresh
         // CipherTransform instead of reusing pre-auth snapshots.
         let data = b"1 0 obj\n42\nendobj\n";
-        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
         xref.entries.push(None);
         xref.entries.push(Some(XRefEntry::Uncompressed {
@@ -1754,7 +1756,7 @@ mod tests {
             trailer\n\
             << /Size 1 >>\n";
 
-        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
 
         xref.parse(0).unwrap();
@@ -1778,7 +1780,7 @@ mod tests {
             trailer\n\
             << /Size 3 >>\n";
 
-        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
 
         xref.parse(0).unwrap();
@@ -1822,7 +1824,7 @@ mod tests {
             trailer\n\
             << /Size 2 >>\n";
 
-        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
 
         // Parse xref starting from "xref" position
@@ -1849,7 +1851,7 @@ mod tests {
             trailer\n\
             << /Size 2 >>\n";
 
-        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
 
         let xref_pos = data
@@ -1911,7 +1913,7 @@ mod tests {
         data.extend_from_slice(&xref_data);
         data.extend_from_slice(b"endstream\nendobj\n");
 
-        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
 
         xref.parse(0).unwrap();
@@ -1991,7 +1993,7 @@ mod tests {
         data.extend_from_slice(&xref_data);
         data.extend_from_slice(b"endstream\nendobj\n");
 
-        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
 
         xref.parse(0).unwrap();
@@ -2052,7 +2054,7 @@ mod tests {
         data.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\n");
         data.extend_from_slice(format!("startxref\n{xref_off}\n%%EOF\n").as_bytes());
 
-        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
         // Install the partial table only (skip parse of startxref path).
         xref.entries.clear();
@@ -2101,7 +2103,7 @@ mod tests {
         data.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\n");
         // Intentionally NO xref table and NO startxref/%%EOF.
 
-        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data)) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
 
         xref.recover_by_scan()
@@ -2132,7 +2134,7 @@ mod tests {
         // Two dicts that reference each other via indirect /Length: fetch(1) resolves its
         // /Length 2 0 R via fetch(2), whose /Length 1 0 R re-enters fetch(1) → cycle.
         let data = b"1 0 obj\n<< /Length 2 0 R >>\nendobj\n2 0 obj\n<< /Length 1 0 R >>\nendobj\n";
-        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn DocumentSource>;
         let mut xref = XRef::new(stream);
         // Place entries directly at the real offsets (bypass full recovery, which needs a
         // trailer — the cycle behavior doesn't depend on the trailer).

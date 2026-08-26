@@ -261,7 +261,9 @@ impl PDFDocument {
             Self::find_startxref_in_bytes(&search_data, startxref_search_start).ok();
 
         // Create xref with the chunked stream
-        let boxed_stream = Box::new(stream) as Box<dyn BaseStream>;
+        // Fully qualified: importing `DocumentSource` here would make every
+        // `stream.length()` below ambiguous with the blanket impl.
+        let boxed_stream = Box::new(stream) as Box<dyn super::base_stream::DocumentSource>;
         let mut xref = XRef::new(boxed_stream);
 
         let mut parse_ok = false;
