@@ -503,3 +503,76 @@ const FIXED_DIST_CODE_TAB: [u32; 32] = [
     0x50005, 0x50015, 0x5000d, 0x5001d, 0x50003, 0x50013, 0x5000b, 0x5001b, 0x50007, 0x50017,
     0x5000f, 0x00000,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn valid_zlib_stream_decodes() {
+        let original = b"the quick brown fox jumps over the lazy dog".repeat(4);
+        let compressed = zlib_compress(&original);
+        let decoded = decode_flate_fallback(&compressed, usize::MAX)
+            .expect("valid zlib stream should decode via fallback");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn truncated_stream_recovers_partial_output() {
+        // A stream flate2 cannot fully decode (truncated mid-block) must still
+        // yield the intact prefix — this tolerance is the whole point of the
+        // fallback (pdf.js FlateStream, hayro issue53.pdf).
+        let original: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let compressed = zlib_compress(&original);
+        // Cut deep into the deflate data (half the stream) so zlib itself is
+        // left mid-block; a shallow tail cut only drops the adler32 checksum.
+        let truncated = &compressed[..compressed.len() / 2];
+
+        let mut flate2_out = Vec::new();
+        let _ = std::io::Read::read_to_end(
+            &mut flate2::read::ZlibDecoder::new(truncated),
+            &mut flate2_out,
+        );
+        assert_ne!(
+            flate2_out, original,
+            "fixture must not be fully recoverable by flate2, else the test proves nothing"
+        );
+
+        let recovered = decode_flate_fallback(truncated, usize::MAX)
+            .expect("truncated stream should recover partial output");
+        assert!(
+            !recovered.is_empty(),
+            "truncated stream should recover a non-empty prefix"
+        );
+        assert!(
+            original.starts_with(&recovered),
+            "recovered prefix must match the original data"
+        );
+    }
+
+    #[test]
+    fn max_output_caps_recovered_bytes() {
+        let original = b"0123456789abcdef".repeat(64);
+        let compressed = zlib_compress(&original);
+        let decoded =
+            decode_flate_fallback(&compressed, 100).expect("bounded decode should succeed");
+        assert_eq!(decoded.len(), 100, "output must be capped at max_output");
+        assert_eq!(&decoded[..], &original[..100]);
+    }
+
+    #[test]
+    fn garbage_input_does_not_panic() {
+        // Empty and non-deflate garbage must return rather than panic; PDFs in
+        // the wild hand this decoder arbitrary bytes after flate2 fails.
+        assert!(decode_flate_fallback(&[], 1024).is_some());
+        let junk = [0xffu8; 64];
+        assert!(decode_flate_fallback(&junk, 1024).is_some());
+    }
+}

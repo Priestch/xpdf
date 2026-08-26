@@ -1979,6 +1979,12 @@ fn decode_halftone_region(
 
 // Segment header reading - ported from readSegmentHeader function
 fn read_segment_header(data: &[u8], start: usize) -> Result<SegmentHeader, Jbig2Error> {
+    // Header prefix: segment number (4) + flags (1) + referred-to flags (1).
+    // pdf.js reads these through a bounds-checked stream and errors on EOF;
+    // the direct indexing below must not panic on truncated input.
+    if start + 6 > data.len() {
+        return Err(Jbig2Error::new("insufficient data for segment header"));
+    }
     let number = read_uint32(data, start);
     let flags = data[start + 4];
     let segment_type = flags & 0x3f;
@@ -2004,6 +2010,11 @@ fn read_segment_header(data: &[u8], start: usize) -> Result<SegmentHeader, Jbig2
         referred_to_count = (read_uint32(data, position - 1) & 0x1fffffff) as usize;
         position += 3;
         let mut bytes = (referred_to_count + 7) >> 3;
+        if position >= data.len() {
+            return Err(Jbig2Error::new(
+                "insufficient data for long-form referred-to count",
+            ));
+        }
         retain_bits[0] = data[position];
         position += 1;
         bytes -= 1;
@@ -2068,6 +2079,11 @@ fn read_segment_header(data: &[u8], start: usize) -> Result<SegmentHeader, Jbig2
             // ImmediateGenericRegion
             let generic_region_info = read_region_segment_information(data, position)?;
             let region_segment_information_field_length = 17;
+            if position + region_segment_information_field_length >= data.len() {
+                return Err(Jbig2Error::new(
+                    "insufficient data for generic region segment flags",
+                ));
+            }
             let generic_region_segment_flags =
                 data[position + region_segment_information_field_length];
             let generic_region_mmr = (generic_region_segment_flags & 1) != 0;
@@ -2087,7 +2103,10 @@ fn read_segment_header(data: &[u8], start: usize) -> Result<SegmentHeader, Jbig2
             let mut found_length = None;
             for i in position..data.len() {
                 let mut j = 0;
-                while j < search_pattern_length && search_pattern[j] == data[i + j] {
+                while j < search_pattern_length
+                    && i + j < data.len()
+                    && search_pattern[j] == data[i + j]
+                {
                     j += 1;
                 }
                 if j == search_pattern_length {
@@ -4063,5 +4082,32 @@ fn print_bitmap(entries: &Vec<Vec<u8>>) {
             print!("{b}");
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_inputs_return_without_panicking() {
+        // PDFs in the wild hand this decoder empty /JBIG2Globals and empty
+        // image streams; both must return cleanly (None for undecodable input)
+        // rather than panic or index out of bounds.
+        assert!(decode_with_globals(&[], None).is_none());
+        assert!(decode_with_globals(&[], Some(&[])).is_none());
+    }
+
+    #[test]
+    fn garbage_segments_fail_cleanly() {
+        // Random bytes with a plausible-looking segment header must not panic;
+        // the decoder rejects malformed segments through Jbig2Error instead.
+        let junk = [0x00u8, 0x00, 0x00, 0x01, 0xff, 0xfe, 0xfd, 0xfc];
+        let result = decode_with_globals(&junk, None);
+        // Either cleanly rejected (None) or decoded without panicking — both
+        // are safe; panicking here would take down the whole render.
+        let _ = result;
+        let result_with_globals = decode_with_globals(&junk, Some(&junk[..4]));
+        let _ = result_with_globals;
     }
 }

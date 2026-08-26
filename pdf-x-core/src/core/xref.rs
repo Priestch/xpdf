@@ -1727,6 +1727,39 @@ mod tests {
     }
 
     #[test]
+    fn set_decryptor_drops_cached_objects() {
+        // Objects fetched while locked (or under a previous key) may sit in the
+        // cache as ciphertext/garbage; installing a decryptor must drop them so
+        // the next fetch re-reads and decrypts. Mirrors pdf.js building a fresh
+        // CipherTransform instead of reusing pre-auth snapshots.
+        let data = b"1 0 obj\n42\nendobj\n";
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
+        let mut xref = XRef::new(stream);
+        xref.entries.push(None);
+        xref.entries.push(Some(XRefEntry::Uncompressed {
+            offset: 0,
+            generation: 0,
+        }));
+
+        xref.fetch(1, 0).expect("object should parse while unencrypted");
+        assert!(
+            xref.fetch_cached(1, 0).is_some(),
+            "fetch must populate the cache"
+        );
+
+        // Authenticate: installing a decryptor (even absent) must invalidate
+        // pre-auth cache entries.
+        xref.set_decryptor(None, None);
+        assert!(
+            xref.fetch_cached(1, 0).is_none(),
+            "set_decryptor must drop cached pre-auth objects"
+        );
+
+        let refetched = xref.fetch(1, 0).expect("object should re-fetch after cache drop");
+        assert_eq!(refetched.as_ref(), &PDFObject::Number(42.0));
+    }
+
+    #[test]
     fn test_parse_simple_xref() {
         let data = b"xref\n\
             0 1\n\
