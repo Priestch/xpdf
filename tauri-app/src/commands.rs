@@ -1,9 +1,15 @@
 use crate::state::AppState;
 use crate::types::*;
 use base64::{Engine as _, engine::general_purpose};
+use pdf_x_core::core::document_loader::{DocumentLoader, OpenProgress};
 use std::fs;
 use std::path::PathBuf;
 use tauri::State;
+
+/// Rounds the shell drives the open loop before declaring no progress — the
+/// command-level counterpart of `drive`'s step cap, sized for the few rounds
+/// a local file source needs.
+const MAX_OPEN_ROUNDS: usize = 64;
 
 /// Open a PDF file, cache the document, and return its metadata.
 #[tauri::command]
@@ -17,10 +23,32 @@ pub fn open_pdf_file(
     }
 
     let file_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
-    // Full-buffer open: viewer needs random page access; progressive open_file is for
-    // network shells. Reuses the same path as render_page_png / render_page_to_image.
-    let pdf_data = fs::read(&path).map_err(|e| e.to_string())?;
-    let mut doc = pdf_x_core::PDFDocument::open(pdf_data).map_err(|e| e.to_string())?;
+    // Progressive, shell-owned open (Phase D step 5): the command drives the
+    // core loader over a chunked file source instead of buffering the whole
+    // file — the open reads only the tail + xref ranges (64 KiB chunks,
+    // LRU-capped), and later page access pulls further chunks on demand.
+    let stream =
+        pdf_x_source_file::FileChunkedStream::open(&path, None, None).map_err(|e| e.to_string())?;
+    let mut loader = DocumentLoader::new(stream);
+    let mut doc = None;
+    // Drive the open round by round (the pull protocol of `drive`, split so
+    // the shell owns it): each `step` runs as far as locally-available bytes
+    // allow, and the chunked file source loads missing ranges synchronously
+    // inside `step` — blocking reads live in the shell-side pdf-x-source-file
+    // crate, never in core. Bounded rounds: a source that keeps surfacing the
+    // same Need without satisfying it is a truncated/changed file, not a
+    // reason to spin.
+    for _ in 0..MAX_OPEN_ROUNDS {
+        match loader.step().map_err(|e| e.to_string())? {
+            OpenProgress::Ready(ready) => {
+                doc = Some(*ready);
+                break;
+            }
+            OpenProgress::Need(_) => continue, // retry: step restarts its phase
+        }
+    }
+    let mut doc =
+        doc.ok_or_else(|| format!("open made no progress after {MAX_OPEN_ROUNDS} rounds"))?;
 
     let page_count = doc.page_count().map_err(|e| e.to_string())?;
     let pdf_version = doc.pdf_version().unwrap_or_else(|_| "Unknown".to_string());
