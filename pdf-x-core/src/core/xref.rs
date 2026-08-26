@@ -66,8 +66,15 @@ pub struct XRef {
     /// The trailer dictionary
     trailer: Option<PDFObject>,
 
-    /// Stream to read PDF data from
-    stream: Box<dyn BaseStream>,
+    /// Byte data backing this document — the *source* half of the D.3 split
+    /// (parse state separated from the source).
+    ///
+    /// Invariant: accessed ONLY through cursor-free operations
+    /// (`length` / `get_byte_range` / `ensure_range` / `make_sub_stream`). Parse
+    /// cursors live in parser-local sub-stream Lexers and in explicit arguments
+    /// (`parse(start_pos)`), never in this field — that is what makes `drive`
+    /// retries restartable by construction.
+    source: Box<dyn BaseStream>,
 
     /// Whether the xref table has already been rebuilt by the full-file recovery scan.
     /// Guards lazy fetch-time recovery (hayro's `repair()` model): the first `fetch` that
@@ -102,7 +109,7 @@ impl Loadable for XRef {
         let pos = usize::try_from(pos).map_err(|_| {
             PDFError::Generic(format!("ensure_range position {pos} overflows usize"))
         })?;
-        self.stream.ensure_range(pos, len)
+        self.source.ensure_range(pos, len)
     }
 
     /// Stream length in bytes.
@@ -113,7 +120,7 @@ impl Loadable for XRef {
     /// trait explicitly. `drive` does not call `len`, so the dual naming is harmless for
     /// the protocol.
     fn len(&self) -> u64 {
-        self.stream.length() as u64
+        self.source.length() as u64
     }
 
     fn is_empty(&self) -> bool {
@@ -136,7 +143,7 @@ impl XRef {
             entries: Vec::new(),
             cache: RefCell::new(cache),
             trailer: None,
-            stream,
+            source: stream,
             recovered: false,
             decryptor: None,
             encrypt_obj_num: None,
@@ -144,21 +151,9 @@ impl XRef {
         }
     }
 
-    /// Sets the stream position for parsing.
-    pub fn set_stream_pos(&mut self, pos: usize) -> PDFResult<()> {
-        self.stream.set_pos(pos)
-    }
-
-    /// Get mutable access to the underlying stream for progressive loading.
-    ///
-    /// This is used with the retry_on_data_missing! macro to implement
-    /// exception-driven progressive loading where missing data is loaded
-    /// on-demand and operations are retried.
-    pub(crate) fn stream_mut(&mut self) -> &mut Box<dyn BaseStream> {
-        &mut self.stream
-    }
-
-    /// Parses the cross-reference table starting at the current stream position.
+    /// Parses the cross-reference table at `start_pos` (D.3: parse state lives in
+    /// arguments, not in the source cursor — the op is restartable by construction,
+    /// which the `drive`/loader retry loops rely on).
     ///
     /// This reads either a traditional xref table or an XRef stream (PDF 1.5+).
     /// It also follows /Prev entries to handle incremental updates.
@@ -183,9 +178,7 @@ impl XRef {
     /// endstream
     /// endobj
     /// ```
-    pub fn parse(&mut self) -> PDFResult<()> {
-        let start_pos = self.stream.pos();
-
+    pub fn parse(&mut self, start_pos: usize) -> PDFResult<()> {
         // Queue of xref positions to process (handles /Prev chain)
         let mut xref_queue = vec![start_pos];
 
@@ -285,8 +278,8 @@ impl XRef {
     /// (`stream.get_byte_range(0, length)`) — the documented last-resort recovery path,
     /// exactly as pdf.js does (`stream.getBytes()`). The normal path never calls this.
     pub(crate) fn recover_by_scan(&mut self) -> PDFResult<()> {
-        let length = self.stream.length();
-        let buf = self.stream.get_byte_range(0, length)?;
+        let length = self.source.length();
+        let buf = self.source.get_byte_range(0, length)?;
         let buf = buf.as_slice();
         let length = buf.len();
 
@@ -416,9 +409,9 @@ impl XRef {
     /// Read the `trailer` keyword + dictionary at `offset`. Returns the dict, or `None`
     /// if it doesn't parse as `trailer << ... >>`.
     fn parse_trailer_dict_at(&mut self, offset: usize) -> Option<PDFObject> {
-        let length = self.stream.length();
+        let length = self.source.length();
         let sub = self
-            .stream
+            .source
             .make_sub_stream(offset, length.saturating_sub(offset))
             .ok()?;
         let lexer = Lexer::new(sub).ok()?;
@@ -624,12 +617,14 @@ impl XRef {
     /// Returns the section's trailer dictionary on success. Extracted from `parse()` so the
     /// caller can tolerate failures on `/Prev`-chained sections.
     fn parse_one_xref_section(&mut self, pos: usize) -> PDFResult<PDFObject> {
-        self.stream.set_pos(pos)?;
-
-        let lexer = Lexer::new(
-            self.stream
-                .make_sub_stream(pos, self.stream.length() - pos)?,
-        )?;
+        // Out-of-range section offsets (e.g. a startxref past EOF) must fail cleanly,
+        // not underflow. The old cursor-set here rejected them via InvalidPosition;
+        // keep that exact terminal so recovery ladders behave identically.
+        let total = self.source.length();
+        if pos >= total {
+            return Err(PDFError::InvalidPosition { pos, length: total });
+        }
+        let lexer = Lexer::new(self.source.make_sub_stream(pos, total - pos)?)?;
         let mut parser = Parser::new(lexer)?;
 
         let obj = parser.get_object()?;
@@ -1343,7 +1338,7 @@ impl XRef {
 
                 // Clone the offset to avoid borrow checker issues
                 let offset_value = *offset;
-                let stream_length = self.stream.length();
+                let stream_length = self.source.length();
 
                 // Validate offset is within stream bounds
                 if offset_value as usize >= stream_length {
@@ -1355,7 +1350,7 @@ impl XRef {
 
                 // Create a sub-stream starting at the object's position
                 // No need to manipulate parent stream position - sub-stream is independent
-                let sub_stream = self.stream.make_sub_stream(
+                let sub_stream = self.source.make_sub_stream(
                     offset_value as usize,
                     stream_length - offset_value as usize,
                 )?;
@@ -1488,7 +1483,7 @@ impl XRef {
     ///
     /// This is useful for determining the original PDF file size.
     pub fn stream_length(&self) -> usize {
-        self.stream.length()
+        self.source.length()
     }
 
     /// Returns the catalog (root) dictionary.
@@ -1634,29 +1629,18 @@ impl XRef {
         self.entries.is_empty()
     }
 
-    /// Gets the current stream position.
-    pub fn stream_pos(&self) -> usize {
-        self.stream.pos()
-    }
-
-    /// Gets bytes from the stream at a specific position without changing current position.
+    /// Gets bytes from the stream at a specific position without changing any state
+    /// (cursor-free range read; D.3 — parse state never lives in the source).
     pub(crate) fn get_bytes(&mut self, pos: usize, length: usize) -> PDFResult<Vec<u8>> {
-        // Save current position
-        let current_pos = self.stream.pos();
-
-        // Move to requested position
-        self.stream.set_pos(pos)?;
-
-        // Read bytes
-        let mut bytes = vec![0u8; length];
-        for i in 0..length {
-            bytes[i] = self.stream.get_byte()?;
+        let total = self.source.length();
+        let end = pos.checked_add(length).ok_or(PDFError::InvalidByteRange {
+            begin: pos,
+            end: usize::MAX,
+        })?;
+        if end > total {
+            return Err(PDFError::InvalidByteRange { begin: pos, end });
         }
-
-        // Restore position
-        self.stream.set_pos(current_pos)?;
-
-        Ok(bytes)
+        self.source.get_byte_range(pos, end)
     }
 }
 
@@ -1773,7 +1757,7 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
         let mut xref = XRef::new(stream);
 
-        xref.parse().unwrap();
+        xref.parse(0).unwrap();
 
         // Check that entry 0 is free
         let entry = xref.get_entry(0).unwrap();
@@ -1797,7 +1781,7 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn BaseStream>;
         let mut xref = XRef::new(stream);
 
-        xref.parse().unwrap();
+        xref.parse(0).unwrap();
 
         assert_eq!(xref.len(), 3);
 
@@ -1842,13 +1826,11 @@ mod tests {
         let mut xref = XRef::new(stream);
 
         // Parse xref starting from "xref" position
-        // First, we need to position the stream at the xref
         let xref_pos = data
             .windows(4)
             .position(|w| w == b"xref")
             .expect("xref not found");
-        xref.stream.set_pos(xref_pos).unwrap();
-        xref.parse().unwrap();
+        xref.parse(xref_pos).unwrap();
 
         // Fetch object 1
         let obj = xref.fetch(1, 0).unwrap();
@@ -1874,8 +1856,7 @@ mod tests {
             .windows(4)
             .position(|w| w == b"xref")
             .expect("xref not found");
-        xref.stream.set_pos(xref_pos).unwrap();
-        xref.parse().unwrap();
+        xref.parse(xref_pos).unwrap();
 
         // Test with a reference
         let ref_obj = PDFObject::Ref(Ref::new(1, 0));
@@ -1933,7 +1914,7 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut xref = XRef::new(stream);
 
-        xref.parse().unwrap();
+        xref.parse(0).unwrap();
 
         // Verify we have 3 entries
         assert_eq!(xref.len(), 3);
@@ -2013,7 +1994,7 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut xref = XRef::new(stream);
 
-        xref.parse().unwrap();
+        xref.parse(0).unwrap();
 
         assert_eq!(xref.len(), 3);
 

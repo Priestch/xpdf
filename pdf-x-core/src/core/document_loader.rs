@@ -152,8 +152,7 @@ where
                 .map(|rel| self.recovery_start + rel + 1); // +1: skip '\n'
             let mut ok = false;
             if let Some(offset) = recovered {
-                xref.set_stream_pos(offset)?;
-                ok = xref.parse().is_ok();
+                ok = xref.parse(offset).is_ok();
             }
             if !ok {
                 // Same terminal error the buffered path reported, so converging
@@ -177,12 +176,12 @@ where
 
     /// One restartable xref-parse attempt from `startxref`.
     ///
-    /// Mirrors the `drive` op in `PDFDocument::open_file`: the position reset
-    /// on every entry is what makes retrying safe (xref entries use
-    /// set-if-None guards, so re-parsing is idempotent).
+    /// Mirrors the `drive` op in `PDFDocument::open_file`: `parse` takes its
+    /// start position as an argument (D.3 — no cursor state in the source), so
+    /// re-invoking it on retry restarts from `startxref` by construction (xref
+    /// entries use set-if-None guards, so re-parsing is idempotent).
     fn parse_attempt(xref: &mut XRef, startxref: usize) -> Result<(), StepErr> {
-        xref.set_stream_pos(startxref)?;
-        StepErr::adapt(xref.parse())
+        StepErr::adapt(xref.parse(startxref))
     }
 
     /// Read the file tail through the source's own loading path and locate

@@ -268,16 +268,14 @@ impl PDFDocument {
         if let Some(startxref) = startxref_opt {
             // Position at xref table and parse with the shell-owned progressive-loading loop.
             //
-            // `drive` retries on `Need` (adapted from `DataMissing` at the boundary). The op
-            // resets `stream_pos` to `startxref` on EVERY retry: `XRef::parse` reads from the
-            // current stream position, so without the reset a retry would resume mid-stream and
-            // loop forever. With the reset, each retry re-reads from `startxref` and progresses
-            // further as chunks load (xref entries use set-if-None guards, so re-parsing is
-            // idempotent). `XRef: Loadable` provides `ensure_range` for the drive loop; it pulls
-            // the xref region on demand (the explicit preload this replaced was only a hint).
+            // `drive` retries on `Need` (adapted from `DataMissing` at the boundary).
+            // `XRef::parse(startxref)` takes its start as an argument (D.3: no cursor state
+            // in the source), so each retry re-parses from `startxref` by construction and
+            // progresses as chunks load (xref entries use set-if-None guards, so re-parsing
+            // is idempotent). `XRef: Loadable` provides `ensure_range` for the drive loop;
+            // it pulls the xref region on demand.
             parse_ok = crate::core::byte_source::drive(&mut xref, |x| {
-                x.set_stream_pos(startxref)?;
-                crate::core::byte_source::StepErr::adapt(x.parse())
+                crate::core::byte_source::StepErr::adapt(x.parse(startxref))
             })
             .is_ok();
         }
@@ -1410,17 +1408,9 @@ impl PDFDocument {
     /// # Returns
     /// The PDF version as a string (e.g., "1.4", "1.7"), or an error if not found.
     pub fn pdf_version(&mut self) -> PDFResult<String> {
-        // Save current position
-        let current_pos = self.xref().stream_pos();
-
-        // Move to start of file
-        self.xref_mut().set_stream_pos(0)?;
-
+        // Cursor-free range read (D.3): no stream position to save/restore.
         // Read first 10 bytes to find header
         let header_bytes = self.xref_mut().get_bytes(0, 10)?;
-
-        // Restore position
-        self.xref_mut().set_stream_pos(current_pos)?;
 
         // Check for "%PDF-" header
         let header_str = String::from_utf8_lossy(&header_bytes);
