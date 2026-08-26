@@ -27,3 +27,7 @@ default = ["hayro-font"]
 hayro-font = []
 debug-logging = []
 native-freetype = ["dep:freetype-rs"]
+
+[dev-dependencies]
+# Tests render through core's interpret path — enable its rendering feature.
+pdf-x-core = { path = "../pdf-x-core", features = ["rendering"] }

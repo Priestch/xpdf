@@ -271,8 +271,17 @@ pub fn render_page(
     text_trace: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<RenderedPage, String> {
-    let mut guard = state.document.lock().unwrap();
-    let doc = guard.as_mut().ok_or("No document loaded")?;
+    // Phase E: the document lock is held only to resolve an immutable
+    // snapshot (an Arc clone on cache hit); interpretation, rasterization,
+    // and PNG encoding run outside it, so editor commands and other renders
+    // proceed concurrently. Byte-identical to the former doc-locked render —
+    // both paths funnel into the same snapshot renderer (parity-tested in
+    // pdf-x-device-tinyskia).
+    let resolved = {
+        let mut guard = state.document.lock().unwrap();
+        let doc = guard.as_mut().ok_or("No document loaded")?;
+        doc.resolve_page(page_index).map_err(|e| e.to_string())?
+    };
 
     let text_trace_enabled = text_trace.unwrap_or(false);
     let previous_trace_state = pdf_x_core::rendering::set_text_trace_enabled(text_trace_enabled);
@@ -284,10 +293,8 @@ pub fn render_page(
         );
     }
 
-    use pdf_x_device_tinyskia::RenderToImage;
-    let render_result = doc
-        .render_page_to_image(page_index, scale)
-        .map_err(|e| e.to_string());
+    let mut session = pdf_x_device_tinyskia::RenderSession::new();
+    let render_result = session.render(&resolved, scale).map_err(|e| e.to_string());
 
     pdf_x_core::rendering::set_text_trace_enabled(previous_trace_state);
 

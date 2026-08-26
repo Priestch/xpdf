@@ -133,6 +133,47 @@ impl RenderToImage for PDFDocument {
 /// happens once per font.
 pub type FontCache = std::collections::HashMap<String, skia_device::StoredFont>;
 
+/// A render decoupled from the live document (Phase E).
+///
+/// Owns a font cache and renders immutable [`ResolvedPage`] snapshots, so a
+/// shell can stop holding its document lock across renders: resolve under a
+/// short lock (an `Arc` clone on cache hit), drop it, then render here.
+/// Sessions render concurrently with each other and with document mutation;
+/// each session parses its fonts on first use — the same tradeoff
+/// [`RenderToImage::render_pages_to_images`] makes per thread. A
+/// long-lived worker session keeps its cache warm across its renders.
+///
+/// Byte-identical to the doc-locked [`RenderToImage::render_page_to_image`]
+/// path: both funnel into the same [`render_resolved_page`].
+pub struct RenderSession {
+    font_cache: FontCache,
+}
+
+impl RenderSession {
+    /// Begin a session with an empty font cache.
+    pub fn new() -> Self {
+        Self {
+            font_cache: FontCache::new(),
+        }
+    }
+
+    /// Interpret and rasterize one resolved snapshot to RGBA pixels — the
+    /// pure half of `render_page_to_image`.
+    pub fn render(
+        &mut self,
+        resolved: &ResolvedPage,
+        scale: Option<f32>,
+    ) -> PDFResult<(u32, u32, Vec<u8>)> {
+        render_resolved_page(resolved, scale, &mut self.font_cache)
+    }
+}
+
+impl Default for RenderSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Pure render: interpret a `ResolvedPage` through a `SkiaDevice` and rasterize
 /// to RGBA. The `font_cache` is borrowed from PDFDocument so parsed fonts
 /// persist across renders.
