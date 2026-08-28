@@ -520,8 +520,10 @@ impl Parser {
         }
 
         // Now we're positioned right after the newline following "stream"
-        // This is where the stream data starts
-        let _stream_start_pos = self.lexer.get_position();
+        // This is where the stream data starts. get_position() is where the
+        // NEXT byte will be read from, but current_char already holds the
+        // first data byte — so the data starts one byte behind.
+        let stream_start_pos = self.lexer.get_position().saturating_sub(1);
 
         // Get the Length from the dictionary
         // For progressive loading, we need to check for DataMissing errors separately
@@ -583,6 +585,29 @@ impl Parser {
                     }
                 }
             }
+            // The declared length was too LARGE: the endstream command (or a
+            // prefix of it) got swallowed into the data, so the lookahead can
+            // never see it. Fall back to scanning for the real command.
+            // Source: pdf.js src/core/parser.js makeStream — a bad length is
+            // always replaced by #findStreamLength, never silently trusted.
+            if !lookahead.ends_with(end_marker_bytes()) {
+                match self.find_stream_length(stream_start_pos) {
+                    Some(real_len) => {
+                        self.lexer.set_position(stream_start_pos)?;
+                        bytes.clear();
+                        for _ in 0..real_len {
+                            match self.lexer.get_stream_byte() {
+                                Ok(b) => bytes.push(b),
+                                Err(_) => break,
+                            }
+                        }
+                        self.lexer.set_position(stream_start_pos + real_len)?;
+                    }
+                    None => {
+                        return Err(PDFError::Generic("Missing endstream command".to_string()));
+                    }
+                }
+            }
             bytes
         } else {
             // No length or indirect length - scan for 'endstream'
@@ -612,7 +637,12 @@ impl Parser {
                                 break;
                             }
                         } else {
-                            match_pos = 0;
+                            // Partial-match restart: after a mismatch the
+                            // current byte may itself start a new match
+                            // ("eendstream" must still find the command).
+                            // "endstream" has no self-overlap, so checking the
+                            // first character is the exact KMP fallback.
+                            match_pos = usize::from(b == endstream_marker[0]);
                         }
                     }
                     Err(_) => {
@@ -638,6 +668,76 @@ impl Parser {
     pub fn has_more(&self) -> bool {
         !matches!(&self.buf1, Some(Token::EOF))
     }
+
+    /// Scan forward from `start_pos` for the endstream command and return the
+    /// stream length (bytes before the command).
+    ///
+    /// Tolerates corrupt PDFs where the command is misspelled or truncated:
+    /// besides the normal "endstream", "endsteam" and "endstea" are accepted
+    /// when followed by whitespace (to avoid false positives).
+    ///
+    /// Source: pdf.js src/core/parser.js, `Parser.#findStreamLength`.
+    fn find_stream_length(&self, start_pos: usize) -> Option<usize> {
+        const SCAN_BLOCK_LENGTH: usize = 2048;
+        const END_SIGNATURE: &[u8] = b"end";
+        const PARTIAL_SIGNATURES: [&[u8]; 3] = [b"stream", b"steam", b"strea"];
+        const SIGNATURE_LENGTH: usize = 9; // "endstream".len()
+        const NORMAL_LENGTH: usize = SIGNATURE_LENGTH - END_SIGNATURE.len();
+
+        let is_white_space = |b: u8| matches!(b, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20);
+
+        let mut block_start = start_pos;
+        let stream_end = self.lexer.stream_end_pos();
+        loop {
+            let block_end = (block_start + SCAN_BLOCK_LENGTH).min(stream_end);
+            let scan_bytes = self.lexer.get_byte_range(block_start, block_end).ok()?;
+            if scan_bytes.len() <= SIGNATURE_LENGTH {
+                return None;
+            }
+            let scan_length = scan_bytes.len() - SIGNATURE_LENGTH;
+            let mut pos = 0;
+            while pos < scan_length {
+                let mut j = 0;
+                while j < END_SIGNATURE.len() && scan_bytes[pos + j] == END_SIGNATURE[j] {
+                    j += 1;
+                }
+                if j >= END_SIGNATURE.len() {
+                    // "end" found — check whether the complete command follows
+                    for part in PARTIAL_SIGNATURES {
+                        let part_len = part.len();
+                        let mut k = 0;
+                        while pos + j + k < scan_bytes.len()
+                            && k < part_len
+                            && scan_bytes[pos + j + k] == part[k]
+                        {
+                            k += 1;
+                        }
+                        if k >= NORMAL_LENGTH {
+                            // Found "endstream" command.
+                            return Some(block_start + pos - start_pos);
+                        }
+                        if k >= part_len
+                            && scan_bytes
+                                .get(pos + j + k)
+                                .copied()
+                                .is_some_and(is_white_space)
+                        {
+                            // Found "endsteam"/"endstea" command.
+                            return Some(block_start + pos - start_pos);
+                        }
+                    }
+                }
+                pos += 1;
+            }
+            block_start += scan_length;
+        }
+    }
+}
+
+/// The endstream command bytes (shared by the known-length verification and
+/// the no-length scan path).
+fn end_marker_bytes() -> &'static [u8] {
+    b"endstream"
 }
 
 #[cfg(test)]

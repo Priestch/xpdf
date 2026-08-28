@@ -19,6 +19,18 @@ pub trait BaseStream: Send {
     /// Returns the total length of the stream in bytes.
     fn length(&self) -> usize;
 
+    /// Returns the last readable position in this stream's own coordinate
+    /// system (the exclusive end of readable data).
+    ///
+    /// Most streams position from 0, where this equals `length()`. A
+    /// windowed stream whose positions are absolute offsets into a parent
+    /// buffer (e.g. `Stream` with a nonzero `start`) overrides this to
+    /// `start + length`. Callers scanning with `get_byte_range`/`pos` must
+    /// bound themselves with this value, NOT `length()`.
+    fn end_pos(&self) -> usize {
+        self.length()
+    }
+
     /// Returns true if the stream contains no data.
     fn is_empty(&self) -> bool;
 

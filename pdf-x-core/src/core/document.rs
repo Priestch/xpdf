@@ -115,7 +115,7 @@ impl PDFDocument {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// let pdf_data = std::fs::read("document.pdf").unwrap();
     /// let doc = PDFDocument::open(pdf_data).unwrap();
@@ -842,7 +842,7 @@ impl PDFDocument {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// let pdf_data = std::fs::read("document.pdf").unwrap();
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
@@ -881,7 +881,7 @@ impl PDFDocument {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// # let pdf_data = vec![];
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
@@ -930,7 +930,7 @@ impl PDFDocument {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// # let pdf_data = vec![];  // Placeholder for example
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
@@ -999,7 +999,7 @@ impl PDFDocument {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// # let pdf_data = vec![];  // Placeholder for example
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
@@ -1016,7 +1016,7 @@ impl PDFDocument {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// # let pdf_data = vec![];  // Placeholder for example
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();

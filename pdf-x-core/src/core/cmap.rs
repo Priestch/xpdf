@@ -58,7 +58,7 @@ impl CMap {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::cmap::CMap;
+    /// use pdf_x_core::core::cmap::CMap;
     ///
     /// let cmap_data = b"1 beginbfchar\n<03> <0020>\nendbfchar\n";
     /// let cmap = CMap::parse(cmap_data).unwrap();
@@ -319,7 +319,7 @@ impl CMap {
     ///
     /// # Example
     /// ```no_run
-    /// # use pdf_x::core::cmap::CMap;
+    /// # use pdf_x_core::core::cmap::CMap;
     /// let cmap = CMap::parse(b"1 beginbfchar\n<03> <0020>\nendbfchar\n").unwrap();
     /// assert_eq!(cmap.to_unicode(3), Some(' '));
     /// assert_eq!(cmap.to_unicode(999), None);

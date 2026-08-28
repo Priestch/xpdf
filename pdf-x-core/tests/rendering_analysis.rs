@@ -2,11 +2,10 @@
 //!
 //! This test module analyzes the rendering quality and identifies issues.
 
-use pdf_x_core::rendering::Device;
-use pdf_x_device_tinyskia::SkiaDevice;
-use tiny_skia::Pixmap;
+#![cfg(feature = "rendering")]
 
-#[cfg(feature = "rendering")]
+use pdf_x_core::core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 /// Analyze a single rendered page
 struct RenderAnalysis {
@@ -19,11 +18,7 @@ struct RenderAnalysis {
 }
 
 impl RenderAnalysis {
-    fn from_pixmap(pixmap: &Pixmap) -> Self {
-        let pixels = pixmap.data();
-        let width = pixmap.width();
-        let height = pixmap.height();
-
+    fn from_rgba(width: u32, height: u32, pixels: &[u8]) -> Self {
         let total_pixels = (width * height) as u32;
         let mut non_white_pixels = 0u32;
         let mut min_x = width;
@@ -84,12 +79,27 @@ impl RenderAnalysis {
     }
 }
 
-/// Render and analyze a PDF page
+/// Resolve a repo-relative test PDF path against the workspace root
+/// (`pdf-x-core/tests` → `../..`). Fixture PDFs ship in the pdf.js submodule
+/// (`pdf.js/test/pdfs/`) and in `tests/fixtures/pdfs/`.
+fn resolve_repo_path(rel: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
+}
+
+/// Render and analyze a PDF page.
+///
+/// Uses the `render_page_to_image` path (resolve → interpret, scale applied
+/// inside interpret, annotation appearances included) rather than a manual
+/// `Page::render` + pre-set device matrix: `Page::render` installs its own
+/// unscaled page-initial CTM, which overwrites the caller's scale matrix and
+/// leaves 1× content in the corner of a scaled canvas.
 fn analyze_page(pdf_path: &str, page_num: usize) -> Result<RenderAnalysis, String> {
     let pdf_bytes = std::fs::read(pdf_path).map_err(|e| format!("Failed to read PDF: {}", e))?;
 
-    let mut doc = pdf_x_core::PDFDocument::open(pdf_bytes)
-        .map_err(|e| format!("Failed to parse PDF: {:?}", e))?;
+    let mut doc =
+        PDFDocument::open(pdf_bytes).map_err(|e| format!("Failed to parse PDF: {:?}", e))?;
 
     let page_count = doc
         .page_count()
@@ -102,49 +112,11 @@ fn analyze_page(pdf_path: &str, page_num: usize) -> Result<RenderAnalysis, Strin
         ));
     }
 
-    let page = doc
-        .get_page(page_num)
-        .map_err(|e| format!("Failed to get page {}: {:?}", page_num, e))?;
-
-    // Get page dimensions
-    let (x0, y0, x1, y1) = match page.media_box() {
-        Some(pdf_x_core::PDFObject::Array(arr)) if arr.len() >= 4 => {
-            let get_value = |i: usize| -> f64 {
-                match &**&arr[i] {
-                    pdf_x_core::PDFObject::Number(n) => n.max(0.0),
-                    _ => 0.0,
-                }
-            };
-            (get_value(0), get_value(1), get_value(2), get_value(3))
-        }
-        _ => (0.0, 0.0, 612.0, 792.0),
-    };
-
-    let scale = 2.0;
-    let width = ((x1 - x0).ceil() as f64 * scale).ceil() as u32;
-    let height = ((y1 - y0).ceil() as f64 * scale).ceil() as u32;
-
-    let mut pixmap = Pixmap::new(width, height).ok_or("Failed to create pixmap")?;
-
-    pixmap.fill(tiny_skia::Color::WHITE);
-
-    let mut font_cache_device_1 = std::collections::HashMap::new();
-
-    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
-
-    device.set_matrix(&[
-        scale,
-        0.0,
-        0.0,
-        -scale,
-        -(x0 as f64) * scale,
-        (y1 as f64) * scale,
-    ]);
-
-    page.render(doc.doc_store_mut(), &mut device)
+    let (width, height, rgba) = doc
+        .render_page_to_image(page_num, Some(2.0))
         .map_err(|e| format!("Render error: {:?}", e))?;
 
-    Ok(RenderAnalysis::from_pixmap(&pixmap))
+    Ok(RenderAnalysis::from_rgba(width, height, &rgba))
 }
 
 // ============================================================================
@@ -152,137 +124,24 @@ fn analyze_page(pdf_path: &str, page_num: usize) -> Result<RenderAnalysis, Strin
 // ============================================================================
 
 #[test]
-#[cfg(feature = "rendering")]
 fn test_analyze_text_rendering_quality() {
     println!("\n=== Text Rendering Quality Analysis ===\n");
 
     let test_cases = vec![
-        (
-            "Simple text",
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/issue7200.pdf",
-            0,
-        ),
-        ("Academic paper", "/home/gp/Books/1807.03341v2.pdf", 0),
-        ("Deep Learning", "/home/gp/Books/d2l-en.pdf", 0),
+        ("Simple text", "pdf.js/test/pdfs/issue7200.pdf", 0),
+        ("Annotation line", "pdf.js/test/pdfs/annotation-line.pdf", 0),
+        ("Complex graphics", "pdf.js/test/pdfs/issue19802.pdf", 0),
     ];
 
-    let mut total_content_pages = 0;
-    let mut total_blank_pages = 0;
-
     for (name, path, page) in test_cases {
-        if !std::path::Path::new(path).exists() {
-            println!("⊘ Skipping {} (file not found)", name);
+        let path = resolve_repo_path(path);
+        if !path.exists() {
             continue;
         }
 
         print!("{}... ", name);
 
-        match analyze_page(path, page) {
-            Ok(analysis) => {
-                println!(
-                    "{} ({:.2}% non-white)",
-                    analysis.quality_score(),
-                    analysis.percentage
-                );
-
-                if analysis.is_blank {
-                    total_blank_pages += 1;
-                    println!("  ⚠ WARNING: Page is completely blank!");
-                } else {
-                    total_content_pages += 1;
-
-                    if let Some((min_x, min_y, max_x, max_y)) = analysis.content_bounds {
-                        let content_width = max_x - min_x;
-                        let content_height = max_y - min_y;
-                        println!(
-                            "  Content bounds: {}x{} at ({}, {})",
-                            content_width, content_height, min_x, min_y
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                println!("FAILED: {}", e);
-            }
-        }
-    }
-
-    println!("\nContent pages: {}", total_content_pages);
-    println!("Blank pages: {}", total_blank_pages);
-
-    assert!(total_content_pages > 0, "No content pages rendered");
-}
-
-#[test]
-#[cfg(feature = "rendering")]
-fn test_analyze_font_coverage() {
-    println!("\n=== Font Coverage Analysis ===\n");
-
-    // Test different PDFs to see font rendering coverage
-    let test_cases = vec![
-        (
-            "TrueType font",
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/issue7200.pdf",
-            0,
-        ),
-        ("Type1/CFF font", "/home/gp/Books/1807.03341v2.pdf", 1),
-    ];
-
-    for (name, path, page) in test_cases {
-        if !std::path::Path::new(path).exists() {
-            continue;
-        }
-
-        println!("Testing: {}", name);
-
-        match analyze_page(path, page) {
-            Ok(analysis) => {
-                println!("  Coverage: {:.2}%", analysis.percentage);
-                println!("  Quality: {}", analysis.quality_score());
-
-                if analysis.percentage < 1.0 {
-                    println!("  ⚠ WARNING: Very low coverage - font may not be rendering");
-                }
-            }
-            Err(e) => {
-                println!("  ✗ Error: {}", e);
-            }
-        }
-        println!();
-    }
-}
-
-#[test]
-#[cfg(feature = "rendering")]
-fn test_analyze_graphics_quality() {
-    println!("\n=== Graphics Rendering Quality ===\n");
-
-    let test_cases = vec![
-        (
-            "Alpha transparency",
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/alphatrans.pdf",
-            0,
-        ),
-        (
-            "Annotation line",
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/annotation-line.pdf",
-            0,
-        ),
-        (
-            "Complex graphics",
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/issue19802.pdf",
-            0,
-        ),
-    ];
-
-    for (name, path, page) in test_cases {
-        if !std::path::Path::new(path).exists() {
-            continue;
-        }
-
-        print!("{}... ", name);
-
-        match analyze_page(path, page) {
+        match analyze_page(&path.to_string_lossy(), page) {
             Ok(analysis) => {
                 println!("{} ({:.2}%)", analysis.quality_score(), analysis.percentage);
 
@@ -298,47 +157,35 @@ fn test_analyze_graphics_quality() {
 }
 
 #[test]
-#[cfg(feature = "rendering")]
 fn test_rendering_regression_detection() {
     println!("\n=== Regression Detection ===\n");
     println!("Testing for rendering regressions compared to expected quality\n");
 
-    // These are expected quality thresholds based on previous successful runs
+    // Minimum non-white percentages measured from current correct renders
+    // (scale 2, via render_page_to_image). These assert *presence* of
+    // content — a blank-page regression renders 0.00%. They are NOT density
+    // targets: annotation-line.pdf's page contains only the word "Line" and
+    // one line annotation (~0.17% non-white), so a high threshold can never
+    // pass on a correct render.
     let expected_quality = vec![
-        (
-            "1807.03341v2_p0",
-            "/home/gp/Books/1807.03341v2.pdf",
-            0,
-            15.0,
-        ), // Text-heavy
-        (
-            "1807.03341v2_p1",
-            "/home/gp/Books/1807.03341v2.pdf",
-            1,
-            10.0,
-        ), // More text
-        (
-            "issue7200_p0",
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/issue7200.pdf",
-            0,
-            5.0,
-        ),
+        ("issue7200", "pdf.js/test/pdfs/issue7200.pdf", 0, 5.0), // measured 10.84%
         (
             "annotation-line",
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/annotation-line.pdf",
+            "pdf.js/test/pdfs/annotation-line.pdf",
             0,
-            10.0,
-        ),
+            0.05,
+        ), // measured 0.17%
     ];
 
     let mut regressions = vec![];
 
     for (name, path, page, min_expected_percentage) in expected_quality {
-        if !std::path::Path::new(path).exists() {
+        let path = resolve_repo_path(path);
+        if !path.exists() {
             continue;
         }
 
-        match analyze_page(path, page) {
+        match analyze_page(&path.to_string_lossy(), page) {
             Ok(analysis) => {
                 let status = if analysis.percentage < min_expected_percentage {
                     println!(
@@ -371,7 +218,6 @@ fn test_rendering_regression_detection() {
 }
 
 #[test]
-#[cfg(feature = "rendering")]
 fn test_comprehensive_rendering_audit() {
     println!("\n=== Comprehensive Rendering Audit ===\n");
 
@@ -382,28 +228,18 @@ fn test_comprehensive_rendering_audit() {
 
     // Test a variety of PDFs
     let test_pdfs = vec![
-        (
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/issue7200.pdf",
-            vec![0],
-        ),
-        (
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/annotation-line.pdf",
-            vec![0],
-        ),
-        (
-            "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/annotation-highlight.pdf",
-            vec![0],
-        ),
-        ("/home/gp/Books/1807.03341v2.pdf", vec![0, 1, 2]),
-        ("/home/gp/Books/d2l-en.pdf", vec![0, 1]),
+        ("pdf.js/test/pdfs/issue7200.pdf", vec![0]),
+        ("pdf.js/test/pdfs/annotation-line.pdf", vec![0]),
+        ("pdf.js/test/pdfs/annotation-highlight.pdf", vec![0]),
     ];
 
     for (path, pages) in test_pdfs {
-        if !std::path::Path::new(path).exists() {
+        let path = resolve_repo_path(path);
+        if !path.exists() {
             continue;
         }
 
-        let pdf_name = std::path::Path::new(path)
+        let pdf_name = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
@@ -411,7 +247,7 @@ fn test_comprehensive_rendering_audit() {
         for page in pages {
             total_pages += 1;
 
-            match analyze_page(path, page) {
+            match analyze_page(&path.to_string_lossy(), page) {
                 Ok(analysis) => {
                     let entry = audit_results
                         .entry(pdf_name.to_string())

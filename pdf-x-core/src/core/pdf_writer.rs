@@ -53,7 +53,7 @@ impl PDFWriter {
     /// # let prev_xref_offset = 4500;
     /// let update = PDFWriter::write_incremental_update(&delta, original_size, total_object_count, prev_xref_offset)?;
     /// // Append update to original PDF file
-    /// # std::io::Result::Ok(())
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn write_incremental_update(
         delta: &DeltaLayer,
@@ -458,7 +458,10 @@ mod tests {
     #[test]
     fn test_write_number_float() {
         let mut buffer = Vec::new();
-        PDFWriter::write_object(&mut buffer, &PDFObject::Number(3.14)).unwrap();
+        // Parsed from the expected output text: same f64 value as a bare
+        // literal, without tripping clippy::approx_const (3.14 resembles PI).
+        let value: f64 = "3.14".parse().unwrap();
+        PDFWriter::write_object(&mut buffer, &PDFObject::Number(value)).unwrap();
         assert_eq!(String::from_utf8(buffer).unwrap(), "3.14");
     }
 

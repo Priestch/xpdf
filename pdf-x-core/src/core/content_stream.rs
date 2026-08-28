@@ -697,8 +697,8 @@ impl ContentStreamEvaluator {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::content_stream::ContentStreamEvaluator;
-    /// # use pdf_x::core::{Parser, Lexer, Stream};
+    /// use pdf_x_core::core::content_stream::ContentStreamEvaluator;
+    /// # use pdf_x_core::core::{Parser, Lexer, Stream};
     /// # let stream = Box::new(Stream::from_bytes(vec![]));
     /// # let lexer = Lexer::new(stream).unwrap();
     /// # let parser = Parser::new(lexer).unwrap();
@@ -1142,8 +1142,8 @@ impl ContentStreamEvaluator {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::content_stream::ContentStreamEvaluator;
-    /// # use pdf_x::core::{Parser, Lexer, Stream};
+    /// use pdf_x_core::core::content_stream::ContentStreamEvaluator;
+    /// # use pdf_x_core::core::{Parser, Lexer, Stream};
     /// # let stream = Box::new(Stream::from_bytes(vec![]));
     /// # let lexer = Lexer::new(stream).unwrap();
     /// # let parser = Parser::new(lexer).unwrap();

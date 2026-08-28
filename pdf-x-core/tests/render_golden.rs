@@ -79,12 +79,14 @@ static CASES: &[Case] = &[
         page: 0,
         expect: Expect::Ok,
     },
-    // Open fail: malformed xref (offset 999999 beyond 427-byte stream) — this
-    // fixture is a parser-robustness probe, not a renderable page.
+    // Renders via full-file recovery scan: malformed xref (offset 999999
+    // beyond 427-byte stream); recovery rebuilds entries from real object
+    // offsets (pdf.js recovery mode), and the endstream-scan tolerance keeps
+    // the streams readable.
     Case {
         fixture: "bad-xref.pdf",
         page: 0,
-        expect: Expect::Skip,
+        expect: Expect::Ok,
     },
     Case {
         fixture: "basicapi.pdf",

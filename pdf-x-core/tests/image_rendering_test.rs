@@ -1,5 +1,15 @@
 //! Test image rendering with different color formats.
 //!
+//! Images follow PDF image-space semantics: the image always occupies the
+//! unit square and the CTM positions/scales it onto the canvas. The
+//! `transform` argument to `Device::draw_image` is identity — the content
+//! stream sets up the CTM, mirroring how `rendering/context/xobject.rs`
+//! invokes the device.
+//!
+//! Image data row 0 maps to the top of the unit square, so with
+//! ctm = [2, 0, 0, 2, 10, 10] a 2x2 image covers device pixels
+//! (10..12, 10..12) with data row 0 at y = 11 and column 0 at x = 10.
+//!
 //! This test verifies that:
 //! - RGB images render correctly
 //! - CMYK images convert to RGB and render correctly
@@ -42,13 +52,14 @@ fn test_render_rgb_image() {
         interpolate: false,
     };
 
-    // Draw at (10, 10) with 1x scale (no scaling, just translation)
+    // Position via the CTM: 2x2 image at 1:1 scale over (10, 10)
+    device.set_matrix(&[2.0, 0.0, 0.0, 2.0, 10.0, 10.0]);
     device
-        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 10.0, 10.0])
+        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
         .unwrap();
 
-    // Check that red pixel exists at (10, 10) - top-left of image
-    let pixel_index = (10 * 100 + 10) * 4;
+    // Data row 0 (red, green) lands on device y = 11
+    let pixel_index = (11 * 100 + 10) * 4;
     let pixel_color = &pixmap.data()[pixel_index..pixel_index + 4];
 
     // Should be red
@@ -73,8 +84,8 @@ fn test_render_rgb_image() {
         pixel_color[3]
     );
 
-    // Check that green pixel exists at (11, 10)
-    let pixel_index2 = (10 * 100 + 11) * 4;
+    // Green pixel (row 0, column 1) at (11, 11)
+    let pixel_index2 = (11 * 100 + 11) * 4;
     let pixel_color2 = &pixmap.data()[pixel_index2..pixel_index2 + 4];
 
     // Should be green
@@ -111,10 +122,14 @@ fn test_render_cmyk_image() {
         0, 0, 0, 0, // White
     ];
 
+    // The core converts CMYK to RGB before the image reaches the device
+    // (pdf.js polynomial coefficients; see cmyk_icc.rs and test_cmyk_conversion_formula)
+    let rgb_data = pdf_x_core::rendering::cmyk_icc::cmyk_image_to_rgb(&image_data);
+
     let image = ImageData {
         width: 2,
         height: 2,
-        data: image_data,
+        data: rgb_data,
         has_alpha: false,
         bits_per_component: 8,
         is_mask: false,
@@ -123,13 +138,14 @@ fn test_render_cmyk_image() {
         interpolate: false,
     };
 
-    // Draw at (10, 10) with 1x scale (no scaling, just translation)
+    // Position via the CTM: 2x2 image at 1:1 scale over (10, 10)
+    device.set_matrix(&[2.0, 0.0, 0.0, 2.0, 10.0, 10.0]);
     device
-        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 10.0, 10.0])
+        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
         .unwrap();
 
-    // Check that red pixel exists at (10, 10) - top-left of image
-    let pixel_index = (10 * 100 + 10) * 4;
+    // Data row 0 starts with CMYK red → device (10, 11)
+    let pixel_index = (11 * 100 + 10) * 4;
     let pixel_color = &pixmap.data()[pixel_index..pixel_index + 4];
 
     // Should be red (or close to it)
@@ -163,6 +179,7 @@ fn test_render_grayscale_image() {
     device.set_matrix(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
 
     // Create a 2x2 grayscale image
+    // row 0: black, medium gray — row 1: white, dark gray
     let image_data = vec![
         0,   // Black
         128, // Medium gray
@@ -182,13 +199,14 @@ fn test_render_grayscale_image() {
         interpolate: false,
     };
 
-    // Draw at (10, 10) with 1x scale (no scaling, just translation)
+    // Position via the CTM: 2x2 image at 1:1 scale over (10, 10)
+    device.set_matrix(&[2.0, 0.0, 0.0, 2.0, 10.0, 10.0]);
     device
-        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 10.0, 10.0])
+        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
         .unwrap();
 
-    // Check that black pixel exists at (10, 10) - top-left of image
-    let pixel_index = (10 * 100 + 10) * 4;
+    // Data row 0, column 0 (black) lands on device (10, 11)
+    let pixel_index = (11 * 100 + 10) * 4;
     let pixel_color = &pixmap.data()[pixel_index..pixel_index + 4];
 
     // Should be black (or close to it)
@@ -208,8 +226,8 @@ fn test_render_grayscale_image() {
         pixel_color[2]
     );
 
-    // Check that white pixel exists at (10, 11) in image coordinates
-    let pixel_index2 = (11 * 100 + 10) * 4;
+    // Data row 1, column 0 (white) lands on device (10, 10)
+    let pixel_index2 = (10 * 100 + 10) * 4;
     let pixel_color2 = &pixmap.data()[pixel_index2..pixel_index2 + 4];
 
     // Should be white
@@ -325,7 +343,8 @@ fn test_cmyk_conversion_formula() {
 
 #[test]
 fn test_image_with_identity_transform() {
-    // Test that images render correctly with identity transform (no scaling)
+    // Test that images render correctly with identity draw transform:
+    // the CTM alone positions a 10x10 image over (50, 50)
     let mut pixmap = Pixmap::new(100, 100).unwrap();
     pixmap.fill(tiny_skia::Color::WHITE);
 
@@ -355,16 +374,19 @@ fn test_image_with_identity_transform() {
         interpolate: false,
     };
 
-    // Draw at (50, 50) with identity transform
+    // 10x10 image at 1:1 scale over (50, 50): the unit square must span
+    // 10x10 device pixels, so the CTM scale is 10, not 1
+    device.set_matrix(&[10.0, 0.0, 0.0, 10.0, 50.0, 50.0]);
     device
-        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 50.0, 50.0])
+        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
         .unwrap();
 
     // Check center pixel at (55, 55)
     let pixel_index = (55 * 100 + 55) * 4;
     let pixel_color = &pixmap.data()[pixel_index..pixel_index + 4];
 
-    assert!(pixel_color[0] > 200, "Should be red");
+    assert!(pixel_color[0] > 200, "Should be red (R high)");
+    assert!(pixel_color[1] < 50, "Should be red, not white (G low)");
 }
 
 #[test]
@@ -400,18 +422,24 @@ fn test_rgba_image_passthrough() {
         interpolate: false,
     };
 
-    // Draw at (10, 10) with 1x scale (no scaling, just translation)
+    // Position via the CTM: 2x2 image at 1:1 scale over (10, 10)
+    device.set_matrix(&[2.0, 0.0, 0.0, 2.0, 10.0, 10.0]);
     device
-        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 10.0, 10.0])
+        .draw_image(image, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
         .unwrap();
 
-    // Just verify it doesn't crash and draws something
-    let pixel_index = (10 * 100 + 10) * 4;
+    // Semi-transparent red over white blends to pink; just verify the blend
+    // happened (a pure white pixel would mean nothing was drawn)
+    let pixel_index = (11 * 100 + 10) * 4;
     let pixel_color = &pixmap.data()[pixel_index..pixel_index + 4];
 
-    // Should have some color (not white)
     assert!(
         pixel_color[0] < 250 || pixel_color[1] < 250 || pixel_color[2] < 250,
         "Should have drawn non-white pixel"
+    );
+    assert!(
+        pixel_color[1] > 50 && pixel_color[1] < 250,
+        "Semi-transparent red over white should blend G to mid-range, got {}",
+        pixel_color[1]
     );
 }

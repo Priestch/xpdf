@@ -72,6 +72,12 @@ impl BaseStream for Stream {
         self.length
     }
 
+    // Positions are absolute offsets into `bytes`, so the readable end is
+    // `start + length`, not `length`.
+    fn end_pos(&self) -> usize {
+        self.start + self.length
+    }
+
     fn is_empty(&self) -> bool {
         self.length == 0
     }

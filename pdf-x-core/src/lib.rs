@@ -14,7 +14,7 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust
+//! ```no_run
 //! use pdf_x_core::core::PDFDocument;
 //!
 //! // Open a PDF file
@@ -27,7 +27,7 @@
 //!
 //! // Extract text from first page
 //! let page = doc.get_page(0)?;
-//! let text_items = page.extract_text(&mut doc.xref_mut())?;
+//! let text_items = page.extract_text(doc.doc_store_mut())?;
 //!
 //! for item in text_items {
 //!     println!("Text: '{}' at {:?}", item.text, item.position);
@@ -48,8 +48,8 @@
 //!
 //! PDF-X supports progressive loading that mirrors PDF.js's architecture:
 //!
-//! //! ```ignore
-//! use pdf_x_core::PDFDocument;
+//! ```ignore
+//! use pdf_x_core::core::PDFDocument;
 //! use pdf_x_source_file::open_file;
 //!
 //! // Open with chunked loading for large files (native file source adapter)
@@ -64,12 +64,13 @@
 //!
 //! Extract text with detailed information:
 //!
-//! ```rust
+//! ```no_run
 //! use pdf_x_core::core::PDFDocument;
 //!
+//! # let pdf_data = std::fs::read("document.pdf")?;
 //! let mut doc = PDFDocument::open(pdf_data)?;
 //! let page = doc.get_page(0)?;
-//! let text_items = page.extract_text(&mut doc.xref_mut())?;
+//! let text_items = page.extract_text(doc.doc_store_mut())?;
 //!
 //! for item in text_items {
 //!     println!("Text: {}", item.text);

@@ -4,11 +4,10 @@
 //! and saving them as PNG images for inspection. Inspired by hayro's test
 //! infrastructure but adapted for pdf-x's testing needs.
 
-use pdf_x_core::rendering::Device;
-use pdf_x_device_tinyskia::SkiaDevice;
-use tiny_skia::Pixmap;
+#![cfg(feature = "rendering")]
 
-#[cfg(feature = "rendering")]
+use pdf_x_core::core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 // ============================================================================
 // Test Configuration
@@ -16,6 +15,15 @@ use tiny_skia::Pixmap;
 
 const OUTPUT_DIR: &str = "/tmp/pdf-x-visual-tests";
 const SCALE: f64 = 2.0; // Render at 2x for better quality
+
+/// Resolve a repo-relative test PDF path against the workspace root
+/// (`pdf-x-core/tests` → `../..`). Fixtures ship in the pdf.js submodule
+/// (`pdf.js/test/pdfs/`).
+fn resolve_repo_path(rel: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
+}
 
 /// Test case definition
 struct TestCase {
@@ -41,56 +49,42 @@ enum TestCategory {
 // ============================================================================
 
 /// Basic text rendering tests
-const TEXT_TESTS: &[TestCase] = &[
-    TestCase {
-        name: "simple_text",
-        path: "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/issue7200.pdf",
-        pages: &[0],
-        category: TestCategory::Text,
-    },
-    TestCase {
-        name: "academic_paper",
-        path: "/home/gp/Books/1807.03341v2.pdf",
-        pages: &[0, 1, 2, 3],
-        category: TestCategory::Text,
-    },
-    TestCase {
-        name: "deep_learning_book",
-        path: "/home/gp/Books/d2l-en.pdf",
-        pages: &[0, 1, 50, 100],
-        category: TestCategory::Text,
-    },
-];
+const TEXT_TESTS: &[TestCase] = &[TestCase {
+    name: "simple_text",
+    path: "pdf.js/test/pdfs/issue7200.pdf",
+    pages: &[0],
+    category: TestCategory::Text,
+}];
 
 /// Annotation tests
 const ANNOTATION_TESTS: &[TestCase] = &[
     TestCase {
         name: "annotation_line",
-        path: "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/annotation-line.pdf",
+        path: "pdf.js/test/pdfs/annotation-line.pdf",
         pages: &[0],
         category: TestCategory::Annotations,
     },
     TestCase {
         name: "annotation_highlight",
-        path: "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/annotation-highlight.pdf",
+        path: "pdf.js/test/pdfs/annotation-highlight.pdf",
         pages: &[0],
         category: TestCategory::Annotations,
     },
     TestCase {
         name: "annotation_link",
-        path: "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/annotation-link-text-popup.pdf",
+        path: "pdf.js/test/pdfs/annotation-link-text-popup.pdf",
         pages: &[0],
         category: TestCategory::Annotations,
     },
     TestCase {
         name: "annotation_square_circle",
-        path: "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/annotation-square-circle.pdf",
+        path: "pdf.js/test/pdfs/annotation-square-circle.pdf",
         pages: &[0],
         category: TestCategory::Annotations,
     },
     TestCase {
         name: "annotation_freetext",
-        path: "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/annotation-freetext.pdf",
+        path: "pdf.js/test/pdfs/annotation-freetext.pdf",
         pages: &[0],
         category: TestCategory::Annotations,
     },
@@ -100,55 +94,32 @@ const ANNOTATION_TESTS: &[TestCase] = &[
 const GRAPHICS_TESTS: &[TestCase] = &[
     TestCase {
         name: "alpha_transparency",
-        path: "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/alphatrans.pdf",
+        path: "pdf.js/test/pdfs/alphatrans.pdf",
         pages: &[0],
         category: TestCategory::Graphics,
     },
     TestCase {
         name: "issue19802",
-        path: "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/issue19802.pdf",
+        path: "pdf.js/test/pdfs/issue19802.pdf",
         pages: &[0],
         category: TestCategory::Graphics,
     },
 ];
 
 /// Font rendering tests
-const FONT_TESTS: &[TestCase] = &[
-    TestCase {
-        name: "truetype_font",
-        path: "/home/gp/Projects/pdf-x/pdf.js/test/pdfs/issue7200.pdf",
-        pages: &[0],
-        category: TestCategory::Fonts,
-    },
-    TestCase {
-        name: "cjk_text",
-        path: "/home/gp/Books/人类起源的故事.pdf",
-        pages: &[0, 1],
-        category: TestCategory::Fonts,
-    },
-];
+const FONT_TESTS: &[TestCase] = &[TestCase {
+    name: "truetype_font",
+    path: "pdf.js/test/pdfs/issue7200.pdf",
+    pages: &[0],
+    category: TestCategory::Fonts,
+}];
 
 /// Complex document tests
-const COMPLEX_TESTS: &[TestCase] = &[
-    TestCase {
-        name: "pdf_reference",
-        path: "/home/gp/Books/pdf17.pdf",
-        pages: &[0, 1, 50, 100, 500],
-        category: TestCategory::Complex,
-    },
-    TestCase {
-        name: "programming_rust",
-        path: "/home/gp/Books/Programming Rust.pdf",
-        pages: &[0, 1, 50],
-        category: TestCategory::Complex,
-    },
-    TestCase {
-        name: "ml_book",
-        path: "/home/gp/Books/Deep Learning by Ian Goodfellow, Yoshua Bengio, Aaron Courville (z-lib.org).pdf",
-        pages: &[0, 1, 2],
-        category: TestCategory::Complex,
-    },
-];
+///
+/// Previously pointed at dev-machine-only book PDFs; the surviving complex
+/// coverage lives in GRAPHICS_TESTS (issue19802). Kept as an (empty) group so
+/// ALL_TESTS and the per-category runners stay shape-compatible.
+const COMPLEX_TESTS: &[TestCase] = &[];
 
 /// All tests combined
 const ALL_TESTS: &[&[TestCase]] = &[
@@ -169,8 +140,8 @@ fn render_page(pdf_path: &str, page_num: usize, output_path: &str) -> Result<(f6
     let pdf_bytes = std::fs::read(pdf_path).map_err(|e| format!("Failed to read PDF: {}", e))?;
 
     // Parse PDF
-    let mut doc = pdf_x_core::PDFDocument::open(pdf_bytes)
-        .map_err(|e| format!("Failed to parse PDF: {:?}", e))?;
+    let mut doc =
+        PDFDocument::open(pdf_bytes).map_err(|e| format!("Failed to parse PDF: {:?}", e))?;
 
     let page_count = doc
         .page_count()
@@ -183,75 +154,42 @@ fn render_page(pdf_path: &str, page_num: usize, output_path: &str) -> Result<(f6
         ));
     }
 
-    // Get the page
-    let page = doc
-        .get_page(page_num)
-        .map_err(|e| format!("Failed to get page {}: {:?}", page_num, e))?;
-
-    // Get page dimensions from MediaBox
-    let (x0, y0, x1, y1) = match page.media_box() {
-        Some(pdf_x_core::PDFObject::Array(arr)) if arr.len() >= 4 => {
-            let get_value = |i: usize| -> f64 {
-                match &**&arr[i] {
-                    pdf_x_core::PDFObject::Number(n) => n.max(0.0),
-                    _ => 0.0,
-                }
-            };
-            (get_value(0), get_value(1), get_value(2), get_value(3))
-        }
-        _ => (0.0, 0.0, 612.0, 792.0), // Default US Letter
-    };
-
-    let page_width = (x1 - x0).ceil() as u32;
-    let page_height = (y1 - y0).ceil() as u32;
-
-    // Create pixmap at specified scale
-    let width = (page_width as f64 * SCALE).ceil() as u32;
-    let height = (page_height as f64 * SCALE).ceil() as u32;
-
-    let mut pixmap = Pixmap::new(width, height).ok_or("Failed to create pixmap")?;
-
-    // Fill with white background
-    pixmap.fill(tiny_skia::Color::WHITE);
-
-    // Create rendering device
-    let mut font_cache_device_1 = std::collections::HashMap::new();
-    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
-
-    // Apply coordinate transform (PDF Y-up to screen Y-down)
-    device.set_matrix(&[
-        SCALE,
-        0.0,
-        0.0,
-        -SCALE,
-        -(x0 as f64) * SCALE,
-        (y1 as f64) * SCALE,
-    ]);
-
-    // Render the page
-    page.render(doc.doc_store_mut(), &mut device)
+    // Render through the resolve → interpret path: scale is applied inside
+    // interpret and annotation appearances are included. (A manual
+    // `Page::render` + pre-set device matrix does not work — Page::render
+    // installs its own unscaled page-initial CTM and overwrites the scale.)
+    let (_width, _height, rgba) = doc
+        .render_page_to_image(page_num, Some(SCALE as f32))
         .map_err(|e| format!("Render error: {:?}", e))?;
 
     // Calculate pixel statistics
-    let pixels = pixmap.data();
-    let non_white_count = pixels
+    let non_white_count = rgba
         .chunks(4)
         .filter(|p| p[0] < 250 || p[1] < 250 || p[2] < 250)
         .count();
 
-    let total_pixels = (pixels.len() / 4) as u32;
+    let total_pixels = (rgba.len() / 4) as u32;
     let percentage = (non_white_count as f64 / total_pixels as f64) * 100.0;
 
     // Save PNG
-    pixmap
-        .save_png(output_path)
-        .map_err(|e| format!("Failed to save PNG: {}", e))?;
+    let file = std::fs::File::create(output_path)
+        .map_err(|e| format!("Failed to create PNG {}: {}", output_path, e))?;
+    let mut encoder = png::Encoder::new(file, _width, _height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| format!("Failed to write PNG header: {}", e))?;
+    writer
+        .write_image_data(&rgba)
+        .map_err(|e| format!("Failed to write PNG data: {}", e))?;
 
     Ok((percentage, total_pixels))
 }
 
 /// Run a single test case
 fn run_test_case(test: &TestCase) -> Result<TestResult, String> {
+    let path = resolve_repo_path(test.path);
     let pdf_name = std::path::Path::new(test.path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -264,7 +202,11 @@ fn run_test_case(test: &TestCase) -> Result<TestResult, String> {
         let filename = format!("{}_{}_page_{}.png", test.name, pdf_name, page_num);
         let filepath = std::path::Path::new(OUTPUT_DIR).join(&filename);
 
-        match render_page(test.path, page_num, filepath.to_str().unwrap()) {
+        match render_page(
+            &path.to_string_lossy(),
+            page_num,
+            filepath.to_str().unwrap(),
+        ) {
             Ok((percentage, pixels)) => {
                 results.push(PageResult {
                     page_num,
@@ -322,7 +264,6 @@ struct TestResult {
 // ============================================================================
 
 #[test]
-#[cfg(feature = "rendering")]
 fn test_visual_text_rendering() {
     println!("\n=== Text Rendering Tests ===\n");
 
@@ -332,7 +273,7 @@ fn test_visual_text_rendering() {
     let mut total_failed = 0;
 
     for test in TEXT_TESTS {
-        if !std::path::Path::new(test.path).exists() {
+        if !resolve_repo_path(test.path).exists() {
             println!("⊘ Skipping {} (file not found)", test.name);
             continue;
         }
@@ -372,7 +313,6 @@ fn test_visual_text_rendering() {
 }
 
 #[test]
-#[cfg(feature = "rendering")]
 fn test_visual_annotations() {
     println!("\n=== Annotation Tests ===\n");
 
@@ -382,7 +322,7 @@ fn test_visual_annotations() {
     let mut total_failed = 0;
 
     for test in ANNOTATION_TESTS {
-        if !std::path::Path::new(test.path).exists() {
+        if !resolve_repo_path(test.path).exists() {
             println!("⊘ Skipping {} (file not found)", test.name);
             continue;
         }
@@ -421,7 +361,6 @@ fn test_visual_annotations() {
 }
 
 #[test]
-#[cfg(feature = "rendering")]
 fn test_visual_graphics() {
     println!("\n=== Graphics Tests ===\n");
 
@@ -431,7 +370,7 @@ fn test_visual_graphics() {
     let mut total_failed = 0;
 
     for test in GRAPHICS_TESTS {
-        if !std::path::Path::new(test.path).exists() {
+        if !resolve_repo_path(test.path).exists() {
             println!("⊘ Skipping {} (file not found)", test.name);
             continue;
         }
@@ -470,7 +409,6 @@ fn test_visual_graphics() {
 }
 
 #[test]
-#[cfg(feature = "rendering")]
 fn test_visual_fonts() {
     println!("\n=== Font Rendering Tests ===\n");
 
@@ -480,7 +418,7 @@ fn test_visual_fonts() {
     let mut total_failed = 0;
 
     for test in FONT_TESTS {
-        if !std::path::Path::new(test.path).exists() {
+        if !resolve_repo_path(test.path).exists() {
             println!("⊘ Skipping {} (file not found)", test.name);
             continue;
         }
@@ -519,7 +457,6 @@ fn test_visual_fonts() {
 }
 
 #[test]
-#[cfg(feature = "rendering")]
 fn test_visual_complex_documents() {
     println!("\n=== Complex Document Tests ===\n");
 
@@ -529,7 +466,7 @@ fn test_visual_complex_documents() {
     let mut total_failed = 0;
 
     for test in COMPLEX_TESTS {
-        if !std::path::Path::new(test.path).exists() {
+        if !resolve_repo_path(test.path).exists() {
             println!("⊘ Skipping {} (file not found)", test.name);
             continue;
         }
@@ -568,7 +505,6 @@ fn test_visual_complex_documents() {
 }
 
 #[test]
-#[cfg(feature = "rendering")]
 fn test_visual_all() {
     println!("\n=== All Visual Tests ===\n");
     println!("Output directory: {}\n", OUTPUT_DIR);
@@ -583,7 +519,7 @@ fn test_visual_all() {
 
     for test_group in ALL_TESTS {
         for test in *test_group {
-            if !std::path::Path::new(test.path).exists() {
+            if !resolve_repo_path(test.path).exists() {
                 continue;
             }
 
@@ -643,7 +579,6 @@ fn test_visual_all() {
 
 /// Quick smoke test - render one page from each category
 #[test]
-#[cfg(feature = "rendering")]
 fn test_visual_smoke_comprehensive() {
     println!("\n=== Comprehensive Smoke Test ===\n");
 
@@ -660,7 +595,7 @@ fn test_visual_smoke_comprehensive() {
     ];
 
     for test in smoke_tests {
-        if !std::path::Path::new(test.path).exists() {
+        if !resolve_repo_path(test.path).exists() {
             println!("⊘ Skipping {} (file not found)", test.name);
             continue;
         }

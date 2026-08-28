@@ -830,6 +830,15 @@ impl Lexer {
     pub fn get_byte_range(&self, begin: usize, end: usize) -> PDFResult<Vec<u8>> {
         self.stream.get_byte_range(begin, end)
     }
+
+    /// Last readable position of the underlying stream, in its own
+    /// coordinate system.
+    ///
+    /// Used by the parser to clamp endstream-scan windows (pdf.js
+    /// `stream.end` in `Parser.#findStreamLength`).
+    pub fn stream_end_pos(&self) -> usize {
+        self.stream.end_pos()
+    }
 }
 
 #[cfg(test)]
@@ -945,7 +954,11 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut lexer = Lexer::new(stream).unwrap();
 
-        assert_eq!(lexer.get_object().unwrap(), Token::Number(3.14));
+        // Expected value parsed from the same literal text the lexer reads
+        // (avoids a bare 3.14 float literal, which trips clippy::approx_const
+        // for resembling PI).
+        let expected: f64 = "3.14".parse().unwrap();
+        assert_eq!(lexer.get_object().unwrap(), Token::Number(expected));
     }
 
     #[test]
@@ -954,7 +967,9 @@ mod tests {
         let stream = Box::new(Stream::from_bytes(data)) as Box<dyn BaseStream>;
         let mut lexer = Lexer::new(stream).unwrap();
 
-        assert_eq!(lexer.get_object().unwrap(), Token::Number(-2.718));
+        // Parsed from the same literal text (see test_float note).
+        let expected: f64 = "-2.718".parse().unwrap();
+        assert_eq!(lexer.get_object().unwrap(), Token::Number(expected));
     }
 
     #[test]

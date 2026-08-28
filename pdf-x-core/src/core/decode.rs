@@ -38,7 +38,7 @@ pub enum PngPredictor {
 ///
 /// # Example
 /// ```no_run
-/// use pdf_x::core::decode::decode_flate;
+/// use pdf_x_core::core::decode::decode_flate;
 ///
 /// let compressed = vec![/* compressed data */];
 /// let decompressed = decode_flate(&compressed).unwrap();
@@ -875,8 +875,9 @@ mod tests {
     #[test]
     fn test_decode_ascii85_accepts_gt_as_digit_not_eod() {
         // '>' is a valid ASCII85 digit (value 29). Only '~' starts EOD.
-        // Digits: '!'=0, '>'=29, '"'=1, '#'=2, '$'=3
-        let n = (((0u64 * 85 + 29) * 85 + 1) * 85 + 2) * 85 + 3;
+        // Digits: '!'=0, '>'=29, '"'=1, '#'=2, '$'=3. Base-85 accumulation
+        // (leading '!' digit contributes 0, so the sum starts at 29).
+        let n = (((29u64 * 85) + 1) * 85 + 2) * 85 + 3;
         assert!(n <= 0xFFFF_FFFF);
         let expected = (n as u32).to_be_bytes();
         let encoded: &[u8] = &[b'!', b'>', b'"', b'#', b'$', b'~', b'>'];

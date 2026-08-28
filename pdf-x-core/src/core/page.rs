@@ -1452,12 +1452,13 @@ impl Page {
     /// ```no_run
     /// use pdf_x_core::core::PDFDocument;
     ///
+    /// # let pdf_data = vec![];
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
     /// let images = page.get_image_metadata(doc.doc_store_mut()).unwrap();
     ///
     /// for image in images {
-    ///     println!("Image: {} ({}x{}, {})",
+    ///     println!("Image: {} ({}x{}, {:?})",
     ///              image.name, image.width, image.height, image.format);
     /// }
     /// ```
@@ -1623,6 +1624,7 @@ impl Page {
     /// ```no_run
     /// use pdf_x_core::core::PDFDocument;
     ///
+    /// # let pdf_data = vec![];
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
     /// let images = page.extract_images(doc.doc_store_mut()).unwrap();
@@ -1934,6 +1936,7 @@ impl Page {
     /// ```no_run
     /// use pdf_x_core::core::PDFDocument;
     ///
+    /// # let pdf_data = vec![];
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
     /// let annotations = page.extract_annotations(doc.doc_store_mut()).unwrap();

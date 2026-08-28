@@ -160,8 +160,9 @@ fn test_transformed_shapes() {
     for y in 0..height {
         for x in 0..width {
             let idx = ((y * width + x) * 4) as usize;
-            let r = pixels[idx];
-            if r > 200 {
+            // Non-white (a plain R-channel check would count the white
+            // background, whose R is 255, as content)
+            if pixels[idx] < 250 || pixels[idx + 1] < 250 || pixels[idx + 2] < 250 {
                 min_x = min_x.min(x);
                 min_y = min_y.min(y);
                 max_x = max_x.max(x);
