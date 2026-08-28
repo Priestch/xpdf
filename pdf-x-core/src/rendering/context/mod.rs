@@ -3396,7 +3396,6 @@ pub(super) fn bool_in(p: Option<&PDFObject>, key: &str) -> Option<bool> {
     })
 }
 
-#[cfg(feature = "hayro-ccitt")]
 impl<'a, D: Device> RenderingContext<'a, D> {
     /// Create a new rendering context.
     ///
