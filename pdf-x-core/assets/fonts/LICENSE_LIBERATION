@@ -1,0 +1,12 @@
+The Liberation font family (LiberationSans/Mono/Serif .ttf files in this
+directory) is (c) 2012 Google, Red Hat, and contributors, licensed under
+the SIL Open Font License, Version 1.1 (dual-licensed GPLv2+ with font
+embedding exception).
+
+Full text: https://openfontlicense.org/open-font-license-official-version/
+The fonts ship unmodified from the liberation-fonts releases and are
+embedded as metric-compatible fallbacks for the Helvetica/Courier/Times
+standard-14 faces.
+
+The Foxit base-14 .pfb files in this directory are covered by
+LICENSE_FOXIT (PDFium BSD license, same terms as pdf.js/mupdf use).
