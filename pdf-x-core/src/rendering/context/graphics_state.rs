@@ -346,6 +346,14 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             return;
         }
 
+        // C.3 render budget: the group stack only blocks re-entering a group
+        // still on it; a long chain of *distinct* nested masks would recurse
+        // (and stack up offscreen surfaces) without bound. 8 is far above any
+        // real document (SMask nesting is practically 1-2 levels).
+        if self.soft_mask_render_depth >= 8 {
+            return;
+        }
+
         let group_obj = match &mut self.resolver {
             Some(r) => r.resolve_if_ref(&group_ref).ok(),
             None => None,

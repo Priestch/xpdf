@@ -939,6 +939,24 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         form_dict: &HashMap<String, PDFObject>,
         form_data: &[u8],
     ) -> PDFResult<()> {
+        // C.3 render budget: stop descending at the nesting cap — a self- or
+        // mutually-recursive Form would otherwise overflow the stack. Matches
+        // the legacy Page::render path, which stops silently at the same depth.
+        if self.form_render_depth >= Self::FORM_XOBJECT_MAX_DEPTH {
+            return Ok(());
+        }
+        self.form_render_depth += 1;
+        let result = self.paint_form_xobject_inner(xobject_name, form_dict, form_data);
+        self.form_render_depth -= 1;
+        result
+    }
+
+    fn paint_form_xobject_inner(
+        &mut self,
+        xobject_name: &str,
+        form_dict: &HashMap<String, PDFObject>,
+        form_data: &[u8],
+    ) -> PDFResult<()> {
         // Decode the form stream if it uses filters.
         let decoded_data = if let Some(filter) = form_dict.get("Filter") {
             crate::core::decode::apply_filters(form_data, filter)

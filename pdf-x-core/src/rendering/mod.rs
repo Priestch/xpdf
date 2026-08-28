@@ -150,7 +150,20 @@ pub fn interpret_with_scale<D: Device>(
         ctx.set_xobject_resources(&mut resolver, page.resources());
     }
 
+    // C.3 render budget: hostile content streams must not loop unbounded.
+    // Real pages are orders of magnitude below this (tracemonkey p0 is ~50k
+    // ops); the cap exists so a pathological stream errors visibly instead of
+    // hanging the shell.
+    const MAX_OPERATIONS: u64 = 20_000_000;
+    let mut operations: u64 = 0;
     while let Some(op) = evaluator.read_operation()? {
+        operations += 1;
+        if operations > MAX_OPERATIONS {
+            return Err(crate::core::error::PDFError::Generic(format!(
+                "Operation budget exceeded: {} content-stream operations (max {})",
+                operations, MAX_OPERATIONS
+            )));
+        }
         ctx.process_operation(&op)?;
     }
 

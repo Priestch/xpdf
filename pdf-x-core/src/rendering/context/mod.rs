@@ -168,6 +168,11 @@ pub struct RenderingContext<'a, D: Device> {
     /// Pattern stream recursion depth guard.
     pattern_depth: usize,
 
+    /// Form XObject nesting depth (C.3 render budget; self- or mutually
+    /// recursive forms must not overflow the stack). Mirrors
+    /// `Page::FORM_XOBJECT_MAX_DEPTH` on the legacy `Page::render` path.
+    form_render_depth: usize,
+
     /// Replacement paint for uncolored tiling pattern streams.
     stencil_pattern_color: Option<Color>,
 }
@@ -3427,9 +3432,14 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             soft_mask_group_stack: Vec::new(),
             soft_mask_render_depth: 0,
             pattern_depth: 0,
+            form_render_depth: 0,
             stencil_pattern_color: None,
         }
     }
+
+    /// Maximum Form XObject nesting depth (C.3 render budget). Matches the
+    /// legacy `Page::render` / text-extraction guard (`page.rs`).
+    const FORM_XOBJECT_MAX_DEPTH: usize = 16;
 
     /// Set the object resolver and page resources for XObject/font/ext-gstate rendering.
     ///

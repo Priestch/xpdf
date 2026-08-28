@@ -1128,10 +1128,19 @@ impl Page {
             }
 
             let mut total_operations = 0;
+            // C.3 render budget: same cap as the `interpret` loop so a
+            // pathological content stream cannot hang the legacy path.
+            const MAX_OPERATIONS: u64 = 20_000_000;
             loop {
                 match evaluator.read_operation() {
                     Ok(Some(op)) => {
                         total_operations += 1;
+                        if total_operations > MAX_OPERATIONS {
+                            return Err(super::PDFError::Generic(format!(
+                                "Operation budget exceeded: {} content-stream operations (max {})",
+                                total_operations, MAX_OPERATIONS
+                            )));
+                        }
                         if let Err(e) = ctx.process_operation(&op) {
                             eprintln!("Warning: Failed to process operator {:?}: {}", op.op, e);
                         }
