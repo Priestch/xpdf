@@ -2,7 +2,7 @@ use super::base_stream::{BaseStream, DocumentSource};
 use super::byte_source::Loadable;
 use super::decode;
 use super::error::{PDFError, PDFResult};
-use super::lexer::Lexer;
+use super::lexer::{Lexer, Token};
 use super::parser::{PDFObject, Parser, Ref};
 use super::stream::Stream;
 use lru::LruCache;
@@ -1410,7 +1410,40 @@ impl XRef {
                 }
 
                 // Read the actual object
-                let object = parser.get_object()?;
+                let mut object = parser.get_object()?;
+
+                // If the object is a stream whose /Length is an indirect reference,
+                // resolve it now and re-read with the correct byte count.
+                // Source: pdf.js makeStream — `dict.get("Length")` auto-resolves
+                // indirect refs in the Dict wrapper; we do it here post-parse.
+                // The `pending_refs` cycle guard (above) prevents infinite recursion.
+                if let PDFObject::Stream { ref dict, ref data } = object {
+                    if let Some(PDFObject::Ref(length_ref)) = dict.get("Length") {
+                        if let Ok(length_obj) =
+                            self.fetch(length_ref.num, length_ref.generation)
+                        {
+                            if let PDFObject::Number(n) = length_obj.as_ref() {
+                                let declared_len = *n as usize;
+                                if declared_len != data.len() {
+                                    // Re-read stream bytes from source at the correct
+                                    // offset. The stream data starts after "stream\n"
+                                    // (or "stream\r\n") in the raw bytes at offset_value.
+                                    if let Ok(corrected) = self
+                                        .reread_stream_bytes(
+                                            offset_value as usize,
+                                            declared_len,
+                                        )
+                                    {
+                                        object = PDFObject::Stream {
+                                            dict: dict.clone(),
+                                            data: corrected,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Decrypt streams/strings inline if a keyed decryptor is installed and
                 // the object is not exempt (the /Encrypt dict itself is never encrypted).
@@ -1448,6 +1481,58 @@ impl XRef {
                 self.fetch_compressed(*obj_stream_num, *index)
             }
         }
+    }
+
+    /// Re-read stream bytes from the raw source at a known object offset.
+    ///
+    /// Scans past `N G obj << ... >> stream\n` to locate the stream data start,
+    /// then reads exactly `declared_len` bytes. This corrects streams whose
+    /// indirect `/Length` was not available during initial parsing.
+    fn reread_stream_bytes(
+        &self,
+        obj_offset: usize,
+        declared_len: usize,
+    ) -> PDFResult<Vec<u8>> {
+        let stream_len = self.source.length();
+        if obj_offset >= stream_len {
+            return Err(PDFError::Generic("reread_stream_bytes: offset out of bounds".into()));
+        }
+        let available = stream_len - obj_offset as usize;
+        let sub = self.source.make_sub_stream(obj_offset, available)?;
+        let mut lexer = Lexer::new(sub)?;
+
+        // Skip: N G obj  <<  dict  >>  stream  \n
+        // Read tokens until we hit the 'stream' command, then skip the newline.
+        loop {
+            let tok = lexer.get_object()?;
+            if let Token::Command(c) = &tok {
+                if c == "stream" {
+                    break;
+                }
+            }
+        }
+        // Skip to next line (consume CR/LF after 'stream' keyword)
+        loop {
+            match lexer.get_stream_byte() {
+                Ok(0x0D) => {
+                    let _ = lexer.get_stream_byte(); // consume optional LF
+                    break;
+                }
+                Ok(0x0A) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        // Read exactly declared_len bytes
+        let mut bytes = Vec::with_capacity(declared_len);
+        for _ in 0..declared_len {
+            match lexer.get_stream_byte() {
+                Ok(b) => bytes.push(b),
+                Err(_) => break,
+            }
+        }
+        Ok(bytes)
     }
 
     /// Check the cache for an object without any I/O or stream access.

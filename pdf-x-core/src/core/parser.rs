@@ -625,15 +625,13 @@ impl Parser {
                         if b == endstream_marker[match_pos] {
                             match_pos += 1;
                             if match_pos == endstream_marker.len() {
-                                // Found endstream - remove it from bytes
+                                // Found endstream - remove it from bytes.
+                                // Do NOT trim trailing whitespace: it may be part of
+                                // the stream data (e.g. a content stream ending
+                                // with "\n"). Only the declared /Length distinguishes
+                                // data from padding; without it we must keep
+                                // everything. Matches pdf.js #findStreamLength.
                                 bytes.truncate(bytes.len() - endstream_marker.len());
-                                // Also trim trailing whitespace before endstream
-                                while bytes.last() == Some(&b'\n')
-                                    || bytes.last() == Some(&b'\r')
-                                    || bytes.last() == Some(&b' ')
-                                {
-                                    bytes.pop();
-                                }
                                 break;
                             }
                         } else {
