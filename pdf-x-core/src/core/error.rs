@@ -24,6 +24,22 @@ pub enum PDFError {
     /// Invalid PDF object encountered
     InvalidObject { expected: String, found: String },
 
+    /// Object marked as deleted in the delta layer (resolve: `delta → base`)
+    ObjectDeleted { num: u32, generation: u32 },
+
+    /// An xref entry's recorded offset is unusable — it doesn't land on the expected
+    /// `N G obj` header (wrong object number, missing generation, out of bounds, or the
+    /// bytes there don't parse as an object header). The signature of a stale xref in a
+    /// regenerated/corrupt PDF. Carries the failing object number so lazy fetch-time
+    /// recovery can rebuild the xref and retry.
+    BadXRefOffset { num: u32, reason: String },
+
+    /// No xref entry for this object number. Can be a legitimate free/absent object, but
+    /// also the signature of a *partial* xref parse (e.g. linearized first-page section
+    /// with a broken `/Prev` that was skipped, so early objects never got indexed). Lazy
+    /// fetch-time recovery rebuilds the table from a full-file scan and retries once.
+    ObjectNotInXRef { num: u32 },
+
     /// Parse error with context
     ParseError {
         message: String,
@@ -52,6 +68,16 @@ pub enum PDFError {
 
     /// Feature not yet implemented
     Unsupported { feature: String },
+
+    /// A configured resource limit was exceeded while processing untrusted input.
+    LimitExceeded {
+        /// Name of the exhausted limit.
+        resource: &'static str,
+        /// Configured maximum.
+        limit: usize,
+        /// Observed or requested amount.
+        actual: usize,
+    },
 
     /// Validation error
     ValidationError { message: String },
@@ -92,6 +118,15 @@ impl fmt::Display for PDFError {
             PDFError::InvalidObject { expected, found } => {
                 write!(f, "Invalid object: expected {}, found {}", expected, found)
             }
+            PDFError::ObjectDeleted { num, generation } => {
+                write!(f, "Object {} {} deleted in delta layer", num, generation)
+            }
+            PDFError::BadXRefOffset { num, reason } => {
+                write!(f, "Bad xref offset for object {num}: {reason}")
+            }
+            PDFError::ObjectNotInXRef { num } => {
+                write!(f, "Object {num} not found in xref")
+            }
             PDFError::ParseError {
                 message,
                 context,
@@ -127,6 +162,16 @@ impl fmt::Display for PDFError {
             }
             PDFError::Unsupported { feature } => {
                 write!(f, "Unsupported feature: {}", feature)
+            }
+            PDFError::LimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Resource limit exceeded for {resource}: {actual} > {limit}"
+                )
             }
             PDFError::ValidationError { message } => {
                 write!(f, "Validation error: {}", message)
@@ -232,6 +277,14 @@ impl PDFError {
             found: found.into(),
         }
     }
+
+    /// Creates a `BadXRefOffset` error (a stale/unusable xref entry offset).
+    pub fn bad_xref_offset<S: Into<String>>(num: u32, reason: S) -> Self {
+        PDFError::BadXRefOffset {
+            num,
+            reason: reason.into(),
+        }
+    }
 }
 
 impl std::error::Error for PDFError {}
@@ -316,6 +369,22 @@ mod tests {
                 assert_eq!(found, "String");
             }
             _ => panic!("Expected InvalidObject"),
+        }
+    }
+
+    #[test]
+    fn test_bad_xref_offset_error() {
+        let err = PDFError::bad_xref_offset(7, "object number mismatch: expected 7, got 5");
+        assert_eq!(
+            format!("{}", err),
+            "Bad xref offset for object 7: object number mismatch: expected 7, got 5"
+        );
+        match err {
+            PDFError::BadXRefOffset { num, reason } => {
+                assert_eq!(num, 7);
+                assert_eq!(reason, "object number mismatch: expected 7, got 5");
+            }
+            _ => panic!("Expected BadXRefOffset"),
         }
     }
 

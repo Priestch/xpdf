@@ -13,56 +13,94 @@ smallvec = { workspace = true }
 lru = { workspace = true }
 flate2 = { workspace = true }
 
+# Adobe Glyph List (static perfect hash, compile-time)
+phf = { workspace = true }
+
 # Optional dependencies
-reqwest = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+# (reqwest/tokio removed — HTTP I/O belongs in the shell per decision A.
+# See archive/shell-http-impls/ for the reference implementation.)
 
 # Crypto dependencies (SHA-2 is optional, AES is now built-in)
 sha2 = { version = "0.10", optional = true }
-
-# Hayro dependencies (direct paths - they have their own workspace)
-hayro-font = { path = "../hayro/hayro-font", default-features = false, optional = true }
 
 # Optional image decoding
 zune-jpeg = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 hayro-jpeg2000 = { path = "../hayro/hayro-jpeg2000", optional = true, default-features = false }
 hayro-jbig2 = { path = "../hayro/hayro-jbig2", optional = true, default-features = false }
+hayro-ccitt = { path = "../hayro/hayro-ccitt", optional = true }
 
-# Rendering (optional for now, will become default later)
-tiny-skia = { version = "0.11", optional = true }
-rustybuzz = { version = "0.20", optional = true }
-ttf-parser = { version = "0.25", optional = true }
+# Optional ICC color management (required for rendering)
+moxcms = { workspace = true, optional = true }
+
+# NOTE: the tiny-skia rendering backend (tiny-skia / rustybuzz / ttf-parser /
+# hayro-font) moved to the `pdf-x-device-tinyskia` adapter crate (Phase 0 step 5).
+# The core is now backend-free; `cargo build -p pdf-x-core --no-default-features`
+# links none of them.
 
 [features]
 default = ["jpeg-decoding"]
 jpeg-decoding = ["zune-jpeg"]
 png-decoding = ["image"]
-advanced-image-formats = ["hayro-jpeg2000", "hayro-jbig2"]
-async = ["reqwest", "tokio"]
+advanced-image-formats = [
+    "image",
+    "hayro-jpeg2000",
+    "hayro-jpeg2000/image",
+    "hayro-jbig2",
+    "hayro-ccitt",
+]
 crypto = ["sha2"]  # AES implementation is now built-in, only SHA-2 is external
-rendering = ["tiny-skia", "rustybuzz", "ttf-parser", "hayro-font"]  # Canvas rendering support
+# Backend-agnostic rendering surface (Device trait, RenderingContext, `interpret`) is
+# always compiled (no external deps). The tiny-skia backend now lives in
+# `pdf-x-device-tinyskia`. This feature is retained as a marker so existing
+# `required-features = ["rendering"]` test targets keep working unchanged.
+#
+# Pull in advanced-image-formats so JPX/JBIG2 (and CCITT via that feature set)
+# decode under normal rendering builds. Without this, Filter=[AHx, JPXDecode]
+# images on stream_jpx_6.pdf etc. stay white (decode_jpx is feature-gated).
+#
+# Also pull in `crypto` (sha2): AES-256 (R=5/6) key derivation needs SHA-2.
+# Without it, empty-password AES-256 corpora (catalog-in-objstm-aes,
+# encrypted_aes_256, …) panic at open instead of decrypting. RC4/AES-128
+# work without sha2, but rendering builds should handle the full encrypted
+# corpus uniformly. `crypto` remains a standalone feature for non-render use.
+rendering = ["dep:moxcms", "advanced-image-formats", "crypto"]
 debug-logging = []  # Enable verbose debug logging for rendering operations
 
 [dev-dependencies]
+# File-source adapter (tests/examples exercise the shell-side open path).
+# dev-dep cycles are legal: pdf-x-source-file depends on pdf-x-core proper.
+pdf-x-source-file = { path = "../pdf-x-source-file" }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3.14"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.5"
 hex = "0.4"
+crc32fast = "1.4"
+# Isolated PNG codec for the golden render-output regression harness.
+# Acceptable per CLAUDE.md (isolated-operation codec; no full-file PDF dependency).
+png = "0.17"
+# The tiny-skia backend lives in its own adapter crate now; core's pixel-rendering
+# integration tests depend on it here (test-only — not a core hard-dep).
+pdf-x-device-tinyskia = { path = "../pdf-x-device-tinyskia" }
+# Test-only: several rendering tests build a `tiny_skia::Pixmap` directly. It is not
+# a core hard-dep (it ships in the adapter crate); listed here so tests compile.
+tiny-skia = "0.11"
 
 [[bench]]
 name = "parsing"
 harness = false
+
+[[bench]]
+name = "perf"
+harness = false
+required-features = ["rendering"]
 
 [[test]]
 name = "rendering_tests"
 path = "tests/rendering_tests.rs"
 required-features = ["rendering"]
 
-[[test]]
-name = "render_pdf_example"
-path = "tests/render_pdf_example.rs"
-required-features = ["rendering"]
 
 [[test]]
 name = "coordinate_transform_test"
@@ -74,7 +112,23 @@ name = "image_rendering_test"
 path = "tests/image_rendering_test.rs"
 required-features = ["rendering"]
 
+[[test]]
+name = "render_golden"
+path = "tests/render_golden.rs"
+required-features = ["rendering", "crypto"]
+
+[[test]]
+name = "encryption_tests"
+path = "tests/encryption_tests.rs"
+required-features = ["crypto"]
+
+[[test]]
+name = "visual_diff"
+path = "tests/visual_diff.rs"
+required-features = ["rendering", "crypto"]
+
 [[example]]
 name = "render"
 path = "examples/render.rs"
 required-features = ["rendering"]
+

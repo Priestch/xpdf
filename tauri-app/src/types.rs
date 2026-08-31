@@ -108,3 +108,11 @@ pub struct RenderedPage {
     /// PNG image data as base64 string
     pub image_data: String,
 }
+
+/// Current undo/redo and persistence state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditorState {
+    pub dirty: bool,
+    pub can_undo: bool,
+    pub can_redo: bool,
+}

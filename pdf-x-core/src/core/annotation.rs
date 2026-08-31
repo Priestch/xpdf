@@ -5,6 +5,7 @@
 //! Based on PDF.js src/core/annotation.js.
 
 use crate::core::error::PDFResult;
+use crate::core::page::PageResolver;
 use crate::core::parser::PDFObject;
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
@@ -403,19 +404,18 @@ pub struct PopupAnnotation {
 ///
 /// # Arguments
 /// * `annots_obj` - The Annots object (array or reference to array)
-/// * `xref` - The cross-reference table for resolving references
+/// * `resolver` - The page resolver for resolving references
 ///
 /// # Returns
 /// A vector of parsed annotations
-pub fn parse_annotations(
+pub fn parse_annotations<R: PageResolver>(
     annots_obj: &PDFObject,
-    xref: &mut crate::core::XRef,
+    resolver: &mut R,
 ) -> PDFResult<Vec<Annotation>> {
-    // Resolve the Annots array
     let annots_array = match annots_obj {
         PDFObject::Array(arr) => arr.clone(),
         PDFObject::Ref(ref_obj) => {
-            let fetched = xref.fetch(ref_obj.num, ref_obj.generation)?;
+            let fetched = resolver.resolve_ref(ref_obj.num, ref_obj.generation)?;
             match &*fetched {
                 PDFObject::Array(arr) => arr.clone(),
                 _ => return Ok(Vec::new()),
@@ -432,13 +432,12 @@ pub fn parse_annotations(
             PDFObject::Ref(ref_obj) => {
                 let ref_key = (ref_obj.num, ref_obj.generation);
 
-                // Prevent circular references
                 if visited_refs.contains(&ref_key) {
                     continue;
                 }
                 visited_refs.insert(ref_key);
 
-                let fetched = xref.fetch(ref_obj.num, ref_obj.generation)?;
+                let fetched = resolver.resolve_ref(ref_obj.num, ref_obj.generation)?;
                 match &*fetched {
                     PDFObject::Dictionary(dict) => dict.clone(),
                     _ => continue,
@@ -455,7 +454,7 @@ pub fn parse_annotations(
             fx_dict.insert(k.clone(), v.clone());
         }
 
-        if let Ok(annot) = parse_annotation_dict(&fx_dict, xref) {
+        if let Ok(annot) = parse_annotation_dict(&fx_dict, resolver) {
             annotations.push(annot);
         } else {
             // Silently skip invalid annotations
@@ -466,9 +465,9 @@ pub fn parse_annotations(
 }
 
 /// Parses a single annotation dictionary.
-fn parse_annotation_dict(
+fn parse_annotation_dict<R: PageResolver>(
     dict: &FxHashMap<String, PDFObject>,
-    xref: &mut crate::core::XRef,
+    resolver: &mut R,
 ) -> PDFResult<Annotation> {
     // Get the annotation subtype (type)
     let subtype = dict.get("Subtype");
@@ -533,7 +532,7 @@ fn parse_annotation_dict(
     let appearance = dict.get("AP").cloned();
 
     // Parse annotation-specific data
-    let data = parse_annotation_data(&annotation_type, dict, xref)?;
+    let data = parse_annotation_data(&annotation_type, dict, resolver)?;
 
     Ok(Annotation {
         annotation_type,
@@ -549,14 +548,14 @@ fn parse_annotation_dict(
 }
 
 /// Parses annotation-specific data based on the annotation type.
-fn parse_annotation_data(
+fn parse_annotation_data<R: PageResolver>(
     annotation_type: &AnnotationType,
     dict: &FxHashMap<String, PDFObject>,
-    xref: &mut crate::core::XRef,
+    resolver: &mut R,
 ) -> PDFResult<AnnotationData> {
     match annotation_type {
         AnnotationType::Link => {
-            let action = parse_link_action(dict, xref)?;
+            let action = parse_link_action(dict, resolver)?;
             Ok(AnnotationData::Link(LinkAnnotation { action }))
         }
         AnnotationType::Text => {
@@ -681,14 +680,13 @@ fn parse_annotation_data(
 }
 
 /// Parses the action for a link annotation.
-fn parse_link_action(
+fn parse_link_action<R: PageResolver>(
     dict: &FxHashMap<String, PDFObject>,
-    xref: &mut crate::core::XRef,
+    resolver: &mut R,
 ) -> PDFResult<LinkAction> {
-    // Check for action dictionary (/A)
     if let Some(action_obj) = dict.get("A") {
-        let action_dict = match xref.fetch_if_ref(action_obj)? {
-            PDFObject::Dictionary(dict) => dict,
+        let action_dict = match &*resolver.resolve_if_ref(action_obj)? {
+            PDFObject::Dictionary(dict) => dict.clone(),
             _ => return Ok(LinkAction::Unknown),
         };
 
@@ -713,7 +711,7 @@ fn parse_link_action(
             }
             "GoTo" => {
                 if let Some(dest_obj) = action_dict.get("D") {
-                    return parse_goto_destination(dest_obj, xref);
+                    return parse_goto_destination(dest_obj, resolver);
                 }
             }
             "GoToR" => {
@@ -766,16 +764,16 @@ fn parse_link_action(
 
     // Check for destination (/Dest)
     if let Some(dest_obj) = dict.get("Dest") {
-        return parse_goto_destination(dest_obj, xref);
+        return parse_goto_destination(dest_obj, resolver);
     }
 
     Ok(LinkAction::Unknown)
 }
 
 /// Parses a GoTo destination.
-fn parse_goto_destination(
+fn parse_goto_destination<R: PageResolver>(
     dest_obj: &PDFObject,
-    xref: &mut crate::core::XRef,
+    resolver: &mut R,
 ) -> PDFResult<LinkAction> {
     match dest_obj {
         PDFObject::Array(arr) => {

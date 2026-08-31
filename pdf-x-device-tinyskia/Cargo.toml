@@ -1,0 +1,33 @@
+[package]
+name = "pdf-x-device-tinyskia"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "tiny-skia Device backend adapter for pdf-x-core (CPU rasterization)"
+
+[dependencies]
+pdf-x-core = { path = "../pdf-x-core" }
+tiny-skia = "0.11"
+rustybuzz = "0.20"
+ttf-parser = "0.25"
+# Type1/CFF glyph outlines (hayro's font library). Mirrors the core's former dep.
+hayro-font = { path = "../hayro/hayro-font", default-features = false }
+fast_image_resize = { workspace = true }
+# TrueType/CFF outlines with optional TT interpreter (hinting). Required for
+# obscure CID TrueType fonts (e.g. MingLiU subsets) that render wrongly when
+# unhinted — matches hayro OpenTypeFontBlob. Source: hayro/hayro-interpret font/blob.rs.
+skrifa = { workspace = true }
+freetype-rs = { version = "0.36.0", optional = true }
+
+[features]
+# `hayro-font` is a hard dependency of this crate; the feature is retained only so
+# `type1_font.rs`'s existing `#[cfg(feature = "hayro-font")]` gates compile verbatim.
+default = ["hayro-font"]
+hayro-font = []
+debug-logging = []
+native-freetype = ["dep:freetype-rs"]
+
+[dev-dependencies]
+# Tests render through core's interpret path — enable its rendering feature.
+pdf-x-core = { path = "../pdf-x-core", features = ["rendering"] }

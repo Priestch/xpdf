@@ -43,10 +43,24 @@ impl Encoding {
                 _ => None,
             },
             crate::core::parser::PDFObject::Dictionary(d) => {
-                // Custom encoding with Differences array
+                // Custom encoding with BaseEncoding and/or Differences
+                // PDF spec §9.6.6: BaseEncoding provides the base mapping;
+                // Differences overrides specific character codes.
+                // Ported from pdf.js src/core/evaluator.js (readEncoding)
+                let base = d.get("BaseEncoding");
+                let mut map = if let Some(base_enc) = encoding_table_from_name(base) {
+                    base_enc
+                } else {
+                    // PDF spec §9.6.6: Type1 fonts with no explicit BaseEncoding
+                    // default to StandardEncoding. Ported from pdf.js evaluator.js
+                    // translateFont() which does the same for simple non-CID fonts.
+                    encoding_table_from_name(Some(&crate::core::parser::PDFObject::Name(
+                        "StandardEncoding".into(),
+                    )))
+                    .unwrap_or_else(|| vec![0u16; 256])
+                };
                 if let Some(diff) = d.get("Differences") {
                     if let crate::core::parser::PDFObject::Array(arr) = diff {
-                        let mut map = vec![0u16; 256];
                         let mut current = 0u16;
                         for item in arr {
                             match &**item {
@@ -55,17 +69,18 @@ impl Encoding {
                                 }
                                 crate::core::parser::PDFObject::Name(name) => {
                                     if let Some(c) = name_to_unicode(name) {
-                                        map[current as usize] = c;
+                                        if (current as usize) < map.len() {
+                                            map[current as usize] = c;
+                                        }
                                     }
                                     current += 1;
                                 }
                                 _ => {}
                             }
                         }
-                        return Some(Encoding::Custom(map));
                     }
                 }
-                None
+                return Some(Encoding::Custom(map));
             }
             _ => None,
         }
@@ -92,79 +107,35 @@ impl Encoding {
     }
 }
 
-/// Convert a glyph name to Unicode character.
-fn name_to_unicode(name: &str) -> Option<u16> {
-    // This is a minimal implementation - a full version would include all PDF glyph names
-    // For now, just handle common single-character names
-    Some(match name {
-        "A" => 'A' as u16,
-        "B" => 'B' as u16,
-        "C" => 'C' as u16,
-        "D" => 'D' as u16,
-        "E" => 'E' as u16,
-        "F" => 'F' as u16,
-        "G" => 'G' as u16,
-        "H" => 'H' as u16,
-        "I" => 'I' as u16,
-        "J" => 'J' as u16,
-        "K" => 'K' as u16,
-        "L" => 'L' as u16,
-        "M" => 'M' as u16,
-        "N" => 'N' as u16,
-        "O" => 'O' as u16,
-        "P" => 'P' as u16,
-        "Q" => 'Q' as u16,
-        "R" => 'R' as u16,
-        "S" => 'S' as u16,
-        "T" => 'T' as u16,
-        "U" => 'U' as u16,
-        "V" => 'V' as u16,
-        "W" => 'W' as u16,
-        "X" => 'X' as u16,
-        "Y" => 'Y' as u16,
-        "Z" => 'Z' as u16,
-        "a" => 'a' as u16,
-        "b" => 'b' as u16,
-        "c" => 'c' as u16,
-        "d" => 'd' as u16,
-        "e" => 'e' as u16,
-        "f" => 'f' as u16,
-        "g" => 'g' as u16,
-        "h" => 'h' as u16,
-        "i" => 'i' as u16,
-        "j" => 'j' as u16,
-        "k" => 'k' as u16,
-        "l" => 'l' as u16,
-        "m" => 'm' as u16,
-        "n" => 'n' as u16,
-        "o" => 'o' as u16,
-        "p" => 'p' as u16,
-        "q" => 'q' as u16,
-        "r" => 'r' as u16,
-        "s" => 's' as u16,
-        "t" => 't' as u16,
-        "u" => 'u' as u16,
-        "v" => 'v' as u16,
-        "w" => 'w' as u16,
-        "x" => 'x' as u16,
-        "y" => 'y' as u16,
-        "z" => 'z' as u16,
-        "space" => ' ' as u16,
-        "quotedbl" => '"' as u16,
-        "quoteright" => '\'' as u16,
-        "quoterightbase" => '\'' as u16,
-        "parenleft" => '(' as u16,
-        "parenright" => ')' as u16,
-        "comma" => ',' as u16,
-        "hyphen" => '-' as u16,
-        "period" => '.' as u16,
-        "slash" => '/' as u16,
-        "colon" => ':' as u16,
-        "semicolon" => ';' as u16,
-        "exclam" => '!' as u16,
-        "question" => '?' as u16,
+/// Returns the base encoding table for a named encoding (Vec<u16>).
+/// Used by Encoding::from_pdf_object to initialize Custom encoding
+/// from BaseEncoding before applying Differences.
+/// Ported from pdf.js src/core/encodings.js getEncoding().
+fn encoding_table_from_name(obj: Option<&crate::core::parser::PDFObject>) -> Option<Vec<u16>> {
+    let name = match obj {
+        Some(crate::core::parser::PDFObject::Name(n)) => n.as_str(),
         _ => return None,
-    })
+    };
+    let table: &[char; 256] = match name {
+        "WinAnsiEncoding" => &WIN_ANSI_ENCODING,
+        "MacRomanEncoding" => &MAC_ROMAN_ENCODING,
+        "MacExpertEncoding" => &MAC_EXPERT_ENCODING,
+        "StandardEncoding" => &STANDARD_ENCODING,
+        "PDFDocEncoding" => &STANDARD_ENCODING,
+        _ => return None,
+    };
+    Some(table.iter().map(|c| *c as u16).collect())
+}
+
+/// Convert a glyph name to Unicode character.
+/// Look up a glyph name's Unicode code point via the Adobe Glyph List.
+/// Delegates to `glyphlist::name_to_unicode` (ported from pdf.js
+/// `src/core/glyphlist.js`, 4528 entries). The previous hand-written table
+/// only covered A-Z/a-z + ~12 punctuation, so glyphs like `less`/`greater`
+/// (`<`/`>`) mapped to nothing — causing `<email>` to render as `f email g`.
+fn name_to_unicode(name: &str) -> Option<u16> {
+    super::glyphlist::name_to_unicode(name)
+        .and_then(|cp| if cp <= 0xFFFF { Some(cp as u16) } else { None })
 }
 
 /// Standard encoding as defined in Adobe Technical Note #5176.
@@ -218,7 +189,7 @@ const WIN_ANSI_ENCODING: [char; 256] = encode_chars([
     0x0074, 0x0075, 0x0076, 0x0077, 0x0078, 0x0079, 0x007A, 0x007B, 0x007C, 0x007D, 0x007E, 0x007F,
     // 0x80-0x9F: Windows-specific characters
     0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039,
-    0x0152, 0x017D, 0xFFFD, 0x0178, 0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0xFFFD,
+    0x0152, 0x017D, 0xFFFD, 0x0178, 0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
     0x2122, 0xFFFD, 0xFB01, 0xFB02, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD,
     // 0xA0-0xFF: Latin-1 supplement
     0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7, 0x00A8, 0x00A9, 0x00AA, 0x00AB,
@@ -248,18 +219,18 @@ const MAC_ROMAN_ENCODING: [char; 256] = encode_chars([
     0x005C, 0x005D, 0x005E, 0x005F, 0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
     0x0068, 0x0069, 0x006A, 0x006B, 0x006C, 0x006D, 0x006E, 0x006F, 0x0070, 0x0071, 0x0072, 0x0073,
     0x0074, 0x0075, 0x0076, 0x0077, 0x0078, 0x0079, 0x007A, 0x007B, 0x007C, 0x007D, 0x007E, 0x007F,
-    // 0x80-0xFF: Macintosh-specific characters
-    0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7, 0x00EA, 0x00EB, 0x00E8, 0x00EF,
-    0x00EE, 0x00EC, 0x00C4, 0x00C5, 0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2, 0x00FB, 0x00F9,
-    0x00FF, 0x00D6, 0x00DC, 0x00A2, 0x00A3, 0x00A5, 0x20A7, 0x0192, 0x00E1, 0x00ED, 0x00F3, 0x00FA,
-    0x00F1, 0x00D1, 0x00AA, 0x00BA, 0x00BF, 0x2310, 0x00AC, 0x00BD, 0x00BC, 0x00A1, 0x00AB, 0x00BB,
-    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556, 0x2555, 0x2563, 0x2551, 0x2557,
-    0x255D, 0x255C, 0x255B, 0x2510, 0x2514, 0x2534, 0x252C, 0x251C, 0x2500, 0x253C, 0x255E, 0x255F,
-    0x255A, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256C, 0x2567, 0x2568, 0x2564, 0x2565, 0x2559,
-    0x2558, 0x2552, 0x2553, 0x256B, 0x256A, 0x2518, 0x250C, 0x2588, 0x2584, 0x258C, 0x2590, 0x2580,
-    0x03B1, 0x03B2, 0x0393, 0x03C0, 0x03A3, 0x03C3, 0x03BC, 0x03C4, 0x03A6, 0x0398, 0x03A9, 0x03B4,
-    0x221E, 0x03C6, 0x03B5, 0x2229, 0x2261, 0x00B1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00F7, 0x2248,
-    0x00B0, 0x2219, 0x00B7, 0x221A, 0x207F, 0x00B2, 0x25A0, 0x00A0,
+    // 0x80-0xFF: Macintosh-specific characters (from pdf.js encodings.js MacRomanEncoding)
+    0x00C4, 0x00C5, 0x00C7, 0x00C9, 0x00D1, 0x00D6, 0x00DC, 0x00E1, 0x00E0, 0x00E2, 0x00E4, 0x00E3,
+    0x00E5, 0x00E7, 0x00E9, 0x00E8, 0x00EA, 0x00EB, 0x00ED, 0x00EC, 0x00EE, 0x00EF, 0x00F1, 0x00F3,
+    0x00F2, 0x00F4, 0x00F6, 0x00F5, 0x00FA, 0x00F9, 0x00FB, 0x00FC, 0x2020, 0x00B0, 0x00A2, 0x00A3,
+    0x00A7, 0x2022, 0x00B6, 0x00DF, 0x00AE, 0x00A9, 0x2122, 0x00B4, 0x00A8, 0x2260, 0x00C6, 0x00D8,
+    0x221E, 0x00B1, 0x2264, 0x2265, 0x00A5, 0x00B5, 0x2202, 0x2211, 0x220F, 0x03C0, 0x222B, 0x00AA,
+    0x00BA, 0x2126, 0x00E6, 0x00F8, 0x00BF, 0x00A1, 0x00AC, 0x221A, 0x0192, 0x2248, 0x2206, 0x00AB,
+    0x00BB, 0x2026, 0x00A0, 0x00C0, 0x00C3, 0x00D5, 0x0152, 0x0153, 0x2013, 0x2014, 0x201C, 0x201D,
+    0x2018, 0x2019, 0x00F7, 0x25CA, 0x00FF, 0x0178, 0x2044, 0x00A4, 0x2039, 0x203A, 0xFB01, 0xFB02,
+    0x2021, 0x00B7, 0x201A, 0x201E, 0x2030, 0x00C2, 0x00CA, 0x00C1, 0x00CB, 0x00C8, 0x00CD, 0x00CE,
+    0x00CF, 0x00CC, 0x00D3, 0x00D4, 0xF8FF, 0x00D2, 0x00DA, 0x00DB, 0x00D9, 0x0131, 0x02C6, 0x02DC,
+    0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7,
 ]);
 
 /// MacExpert encoding (simplified placeholder - not commonly used).

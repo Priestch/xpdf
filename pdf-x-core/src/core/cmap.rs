@@ -58,7 +58,7 @@ impl CMap {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::cmap::CMap;
+    /// use pdf_x_core::core::cmap::CMap;
     ///
     /// let cmap_data = b"1 beginbfchar\n<03> <0020>\nendbfchar\n";
     /// let cmap = CMap::parse(cmap_data).unwrap();
@@ -68,6 +68,9 @@ impl CMap {
         let mut cmap = CMap::new();
         let content = std::str::from_utf8(stream_data)
             .map_err(|e| PDFError::Generic(format!("Invalid UTF-8 in CMap stream: {}", e)))?;
+        // Normalize CR-only line endings (old Mac style) before splitting.
+        // Rust's str::lines() only splits on \n, not on standalone \r.
+        let content = content.replace("\r\n", "\n").replace('\r', "\n");
 
         // Parse the CMap stream line by line
         let mut lines = content.lines().peekable();
@@ -133,8 +136,14 @@ impl CMap {
                 continue; // Skip invalid lines
             }
 
-            let src_code = Self::parse_hex_code(parts[0])?;
-            let dst_unicode = Self::parse_hex_unicode(parts[1])?;
+            let src_code = match Self::parse_hex_code(parts[0]) {
+                Ok(code) => code,
+                Err(_) => continue,
+            };
+            let dst_unicode = match Self::parse_hex_unicode(parts[1]) {
+                Ok(ch) => ch,
+                Err(_) => continue,
+            };
 
             cmap.mappings.insert(src_code, dst_unicode);
         }
@@ -162,15 +171,54 @@ impl CMap {
                 break;
             }
 
-            // Parse the range: <srcCodeLo> <srcCodeHi> <dstUnicode>
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() < 3 {
+            // Some CMaps encode destination ranges as arrays and may wrap the
+            // array across multiple lines. Collect continuation lines so we can
+            // parse both `<dst>` and `[<dst1> <dst2> ...]` forms.
+            let mut entry = trimmed.to_string();
+            if entry.contains('[') && !entry.contains(']') {
+                while let Some(next_line) = lines.next() {
+                    let next_trimmed = next_line.trim();
+                    if next_trimmed == "endbfrange" {
+                        break;
+                    }
+                    entry.push(' ');
+                    entry.push_str(next_trimmed);
+                    if next_trimmed.contains(']') {
+                        break;
+                    }
+                }
+            }
+
+            let hex_tokens = Self::extract_hex_tokens(&entry);
+            if hex_tokens.len() < 3 {
                 continue; // Skip invalid lines
             }
 
-            let src_code_lo = Self::parse_hex_code(parts[0])?;
-            let src_code_hi = Self::parse_hex_code(parts[1])?;
-            let dst_unicode = Self::parse_hex_unicode(parts[2])?;
+            let src_code_lo = match Self::parse_hex_code(&hex_tokens[0]) {
+                Ok(code) => code,
+                Err(_) => continue,
+            };
+            let src_code_hi = match Self::parse_hex_code(&hex_tokens[1]) {
+                Ok(code) => code,
+                Err(_) => continue,
+            };
+
+            if entry.contains('[') {
+                for (idx, src_code) in (src_code_lo..=src_code_hi).enumerate() {
+                    let Some(dst_hex) = hex_tokens.get(2 + idx) else {
+                        break;
+                    };
+                    if let Ok(unicode_char) = Self::parse_hex_unicode(dst_hex) {
+                        cmap.mappings.insert(src_code, unicode_char);
+                    }
+                }
+                continue;
+            }
+
+            let dst_unicode = match Self::parse_hex_unicode(&hex_tokens[2]) {
+                Ok(ch) => ch,
+                Err(_) => continue,
+            };
 
             // Map the range
             let dst_code = dst_unicode as u32;
@@ -182,6 +230,24 @@ impl CMap {
         }
 
         Ok(())
+    }
+
+    /// Extracts all `<...>` hex tokens from a line.
+    fn extract_hex_tokens(line: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut rest = line;
+
+        while let Some(start) = rest.find('<') {
+            let after_start = &rest[start + 1..];
+            let Some(end_rel) = after_start.find('>') else {
+                break;
+            };
+            let end = start + 1 + end_rel;
+            tokens.push(rest[start..=end].to_string());
+            rest = &rest[end + 1..];
+        }
+
+        tokens
     }
 
     /// Parses a hex code like `<0003>` or `<03>` into a u16.
@@ -200,6 +266,42 @@ impl CMap {
         // Remove angle brackets
         let hex = hex_str.trim_start_matches('<').trim_end_matches('>');
 
+        if hex.is_empty() {
+            return Err(PDFError::Generic(format!(
+                "Invalid empty hex Unicode: '{}'",
+                hex_str
+            )));
+        }
+
+        // Per PDF spec, destination strings in ToUnicode CMaps are UTF-16BE
+        // sequences. We use the first decoded scalar value for rendering paths
+        // that currently expect one code point per CID.
+        if hex.len() % 2 == 0 {
+            let mut bytes = Vec::with_capacity(hex.len() / 2);
+            for pair in hex.as_bytes().chunks_exact(2) {
+                let pair_str = std::str::from_utf8(pair).map_err(|_| {
+                    PDFError::Generic(format!("Invalid hex Unicode: '{}'", hex_str))
+                })?;
+                let byte = u8::from_str_radix(pair_str, 16).map_err(|_| {
+                    PDFError::Generic(format!("Invalid hex Unicode: '{}'", hex_str))
+                })?;
+                bytes.push(byte);
+            }
+
+            if bytes.len() % 2 == 0 && !bytes.is_empty() {
+                let mut units = Vec::with_capacity(bytes.len() / 2);
+                for chunk in bytes.chunks_exact(2) {
+                    units.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+                }
+
+                if let Ok(decoded) = String::from_utf16(&units) {
+                    if let Some(ch) = decoded.chars().next() {
+                        return Ok(ch);
+                    }
+                }
+            }
+        }
+
         let code = u32::from_str_radix(hex, 16)
             .map_err(|_| PDFError::Generic(format!("Invalid hex Unicode: '{}'", hex_str)))?;
 
@@ -217,7 +319,7 @@ impl CMap {
     ///
     /// # Example
     /// ```no_run
-    /// # use pdf_x::core::cmap::CMap;
+    /// # use pdf_x_core::core::cmap::CMap;
     /// let cmap = CMap::parse(b"1 beginbfchar\n<03> <0020>\nendbfchar\n").unwrap();
     /// assert_eq!(cmap.to_unicode(3), Some(' '));
     /// assert_eq!(cmap.to_unicode(999), None);
@@ -351,6 +453,8 @@ endbfchar
         assert_eq!(CMap::parse_hex_unicode("<0020>").unwrap(), ' ');
         assert_eq!(CMap::parse_hex_unicode("<0041>").unwrap(), 'A');
         assert_eq!(CMap::parse_hex_unicode("<4E2D>").unwrap(), '中');
+        assert_eq!(CMap::parse_hex_unicode("<00660069>").unwrap(), 'f');
+        assert_eq!(CMap::parse_hex_unicode("<D83DDE00>").unwrap(), '😀');
     }
 
     #[test]
@@ -400,5 +504,31 @@ end
         assert_eq!(cmap.to_unicode(0x20), Some('q'));
 
         assert_eq!(cmap.len(), 19); // 2 bfchar + 17 bfrange
+    }
+
+    #[test]
+    fn test_parse_bfrange_array_form() {
+        let cmap_data = b"\
+1 beginbfrange
+<0010> <0012> [<0041> <0042> <0043>]
+endbfrange
+";
+        let cmap = CMap::parse(cmap_data).unwrap();
+        assert_eq!(cmap.to_unicode(0x10), Some('A'));
+        assert_eq!(cmap.to_unicode(0x11), Some('B'));
+        assert_eq!(cmap.to_unicode(0x12), Some('C'));
+    }
+
+    #[test]
+    fn test_parse_bfchar_ignores_multicodepoint_without_failing() {
+        let cmap_data = b"\
+2 beginbfchar
+<00E0> <00660069>
+<0005> <0041>
+endbfchar
+";
+        let cmap = CMap::parse(cmap_data).unwrap();
+        assert_eq!(cmap.to_unicode(0x00E0), Some('f'));
+        assert_eq!(cmap.to_unicode(0x0005), Some('A'));
     }
 }

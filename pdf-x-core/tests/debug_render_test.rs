@@ -2,7 +2,8 @@
 //!
 //! This test uses real PDF files to debug rendering issues.
 
-use pdf_x_core::rendering::{Device, SkiaDevice};
+use pdf_x_core::rendering::Device;
+use pdf_x_device_tinyskia::SkiaDevice;
 use tiny_skia::Pixmap;
 
 /// Find the test PDFs directory
@@ -116,7 +117,8 @@ fn test_debug_real_pdf_rendering() {
     println!("DEBUG: Filled background with white");
 
     // Create rendering device
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
     // Apply coordinate transform (PDF Y-up to screen Y-down)
     device.set_matrix(&[
@@ -131,7 +133,7 @@ fn test_debug_real_pdf_rendering() {
 
     // Render the page
     println!("DEBUG: Starting page render...");
-    match page.render(&mut doc.xref_mut(), &mut device) {
+    match page.render(doc.doc_store_mut(), &mut device) {
         Ok(_) => println!("DEBUG: Page render completed"),
         Err(e) => {
             eprintln!("ERROR: Page render failed: {:?}", e);
@@ -238,7 +240,9 @@ fn test_debug_device_drawing() {
     let mut pixmap = Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_2 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_2);
 
     // Draw a simple red rectangle at (100, 100) with size 200x100
     println!("DEBUG: Drawing red rectangle at (100, 100) size 200x100");

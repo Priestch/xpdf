@@ -53,7 +53,7 @@ impl PDFWriter {
     /// # let prev_xref_offset = 4500;
     /// let update = PDFWriter::write_incremental_update(&delta, original_size, total_object_count, prev_xref_offset)?;
     /// // Append update to original PDF file
-    /// # std::io::Result::Ok(())
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn write_incremental_update(
         delta: &DeltaLayer,
@@ -61,11 +61,28 @@ impl PDFWriter {
         total_object_count: u32,
         prev_xref_offset: usize,
     ) -> PDFResult<Vec<u8>> {
-        let mut buffer = Vec::new();
+        Self::write_incremental_update_with_trailer(
+            delta,
+            original_size,
+            total_object_count,
+            prev_xref_offset,
+            None,
+        )
+    }
+
+    /// Write an incremental update while inheriting document trailer entries.
+    pub fn write_incremental_update_with_trailer(
+        delta: &DeltaLayer,
+        original_size: usize,
+        total_object_count: u32,
+        prev_xref_offset: usize,
+        original_trailer: Option<&PDFObject>,
+    ) -> PDFResult<Vec<u8>> {
+        let mut buffer = vec![b'\n'];
 
         // Track object offsets for the new xref table
         let mut object_offsets: HashMap<(u32, u32), u64> = HashMap::new();
-        let mut current_offset = original_size as u64;
+        let mut current_offset = original_size as u64 + 1;
 
         // Collect all objects to write (modified + new)
         let objects_to_write: Vec<_> = delta
@@ -111,6 +128,7 @@ impl PDFWriter {
             xref_start_offset,
             total_object_count,
             prev_xref_offset,
+            original_trailer,
         )?;
 
         // Write EOF marker
@@ -163,6 +181,11 @@ impl PDFWriter {
                 buffer
                     .write_all(b">")
                     .map_err(|e| PDFError::Generic(format!("Failed to write hex suffix: {}", e)))?;
+            }
+            PDFObject::InlineImageData(_) => {
+                buffer.write_all(b"").map_err(|e| {
+                    PDFError::Generic(format!("Failed to write inline image data: {}", e))
+                })?;
             }
             PDFObject::Name(name) => {
                 // Write name with leading slash
@@ -334,43 +357,24 @@ impl PDFWriter {
 
         // Group consecutive objects into subsections
         // PDF spec requires subsection headers: "start_index count"
-        let mut subsection_start: Option<u32> = None;
-        let mut subsection_objs: Vec<(u32, u64)> = Vec::new();
-
-        for obj_num in obj_nums {
-            let offset = object_offsets.get(&(obj_num, 0)).ok_or_else(|| {
-                PDFError::Generic(format!("Missing offset for object {}", obj_num))
-            })?;
-
-            match subsection_start {
-                None => {
-                    // Start a new subsection
-                    subsection_start = Some(obj_num);
-                    subsection_objs.push((obj_num, *offset));
-                }
-                Some(start) => {
-                    let last_obj = subsection_objs.last().map(|(n, _)| *n).unwrap_or(start);
-                    if obj_num == last_obj + 1 {
-                        // Consecutive - add to current subsection
-                        subsection_objs.push((obj_num, *offset));
-                    } else {
-                        // Non-consecutive - write current subsection and start new one
-                        Self::write_xref_subsection(buffer, start, subsection_objs.len() as u32)?;
-                        subsection_start = Some(obj_num);
-                        subsection_objs = vec![(obj_num, *offset)];
-                    }
-                }
+        let mut index = 0;
+        while index < obj_nums.len() {
+            let start = index;
+            while index + 1 < obj_nums.len() && obj_nums[index + 1] == obj_nums[index] + 1 {
+                index += 1;
             }
-        }
-
-        // Write the last subsection
-        if let Some(start) = subsection_start {
-            Self::write_xref_subsection(buffer, start, subsection_objs.len() as u32)?;
-            for (_obj_num, offset) in subsection_objs {
-                // Format: offset (10 digits) + space + generation (5 digits) + space + type (n/f) + newline
-                write!(buffer, "{:010} {:05} n \n", offset, 0)
+            Self::write_xref_subsection(buffer, obj_nums[start], (index - start + 1) as u32)?;
+            for obj_num in &obj_nums[start..=index] {
+                let ((_, generation), offset) = object_offsets
+                    .iter()
+                    .find(|((num, _), _)| num == obj_num)
+                    .ok_or_else(|| {
+                        PDFError::Generic(format!("Missing offset for object {}", obj_num))
+                    })?;
+                write!(buffer, "{:010} {:05} n \n", offset, generation)
                     .map_err(|e| PDFError::Generic(format!("Failed to write xref entry: {}", e)))?;
             }
+            index += 1;
         }
 
         Ok(())
@@ -398,6 +402,7 @@ impl PDFWriter {
         xref_start_offset: u64,
         total_object_count: u32,
         prev_xref_offset: usize,
+        original_trailer: Option<&PDFObject>,
     ) -> PDFResult<()> {
         buffer
             .write_all(b"trailer\n")
@@ -413,6 +418,17 @@ impl PDFWriter {
         // Previous: offset of previous xref table
         write!(buffer, " /Prev {}", prev_xref_offset)
             .map_err(|e| PDFError::Generic(format!("Failed to write /Prev: {}", e)))?;
+
+        if let Some(PDFObject::Dictionary(dict)) = original_trailer {
+            for key in ["Root", "Info", "ID", "Encrypt"] {
+                if let Some(value) = dict.get(key) {
+                    write!(buffer, " /{} ", key).map_err(|e| {
+                        PDFError::Generic(format!("Failed to write trailer /{}: {}", key, e))
+                    })?;
+                    Self::write_object(buffer, value)?;
+                }
+            }
+        }
 
         buffer.write_all(b">>\n").map_err(|e| {
             PDFError::Generic(format!("Failed to write trailer dict suffix: {}", e))
@@ -442,7 +458,10 @@ mod tests {
     #[test]
     fn test_write_number_float() {
         let mut buffer = Vec::new();
-        PDFWriter::write_object(&mut buffer, &PDFObject::Number(3.14)).unwrap();
+        // Parsed from the expected output text: same f64 value as a bare
+        // literal, without tripping clippy::approx_const (3.14 resembles PI).
+        let value: f64 = "3.14".parse().unwrap();
+        PDFWriter::write_object(&mut buffer, &PDFObject::Number(value)).unwrap();
         assert_eq!(String::from_utf8(buffer).unwrap(), "3.14");
     }
 

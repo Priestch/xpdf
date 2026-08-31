@@ -14,7 +14,7 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust
+//! ```no_run
 //! use pdf_x_core::core::PDFDocument;
 //!
 //! // Open a PDF file
@@ -27,7 +27,7 @@
 //!
 //! // Extract text from first page
 //! let page = doc.get_page(0)?;
-//! let text_items = page.extract_text(&mut doc.xref_mut())?;
+//! let text_items = page.extract_text(doc.doc_store_mut())?;
 //!
 //! for item in text_items {
 //!     println!("Text: '{}' at {:?}", item.text, item.position);
@@ -48,12 +48,12 @@
 //!
 //! PDF-X supports progressive loading that mirrors PDF.js's architecture:
 //!
-//! ```rust
-//! use pdf_x_core::core::{PDFDocument, FileChunkedStream};
+//! ```ignore
+//! use pdf_x_core::core::PDFDocument;
+//! use pdf_x_source_file::open_file;
 //!
-//! // Open with chunked loading for large files
-//! let mut stream = FileChunkedStream::open("large.pdf")?;
-//! let mut doc = PDFDocument::open_stream(Box::new(stream))?;
+//! // Open with chunked loading for large files (native file source adapter)
+//! let mut doc = open_file("large.pdf", None, None)?;
 //!
 //! // Pages are loaded on-demand, not all at once
 //! let page = doc.get_page(0)?; // This will trigger progressive loading
@@ -64,12 +64,13 @@
 //!
 //! Extract text with detailed information:
 //!
-//! ```rust
+//! ```no_run
 //! use pdf_x_core::core::PDFDocument;
 //!
+//! # let pdf_data = std::fs::read("document.pdf")?;
 //! let mut doc = PDFDocument::open(pdf_data)?;
 //! let page = doc.get_page(0)?;
-//! let text_items = page.extract_text(&mut doc.xref_mut())?;
+//! let text_items = page.extract_text(doc.doc_store_mut())?;
 //!
 //! for item in text_items {
 //!     println!("Text: {}", item.text);
@@ -94,8 +95,11 @@
 //! PDF-X is optimized for performance:
 //! - Lazy loading of pages and content
 //! - Efficient memory usage with caching
-//! - Exception-driven progressive loading
-//! - Thread-safe operations
+//! - Pull-based progressive loading (sync, runtime-free core; shells own I/O)
+//! - Thread-safe snapshot types (`ResolvedPage`, `Page`, `PDFObject` are
+//!   `Send + Sync + 'static`); the live `PDFDocument` is `Send` but `!Sync`
+//!   (internal caches use `RefCell`). Render snapshots across threads via the
+//!   resolve-then-interpret boundary.
 //!
 //! For more detailed examples and advanced usage, see the examples directory.
 
@@ -104,23 +108,21 @@ pub mod rendering;
 
 // Re-export main types for convenience
 pub use core::{
-    Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags, AnnotationRect,
-    AnnotationType, BaseStream, DestinationType, FileAttachmentAnnotation, FileChunkedStream,
-    FormFieldType, ImageDecoder, ImageFormat, Lexer, LinearizedInfo, LinkAction, LinkAnnotation,
-    OutlineDestination, OutlineItem, PDFDocument, PDFError, PDFObject, Page, Parser,
-    PopupAnnotation, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef, XRefEntry,
+    AddHighlightCommand, Annotation, AnnotationBorder, AnnotationColor, AnnotationData,
+    AnnotationFlags, AnnotationRect, AnnotationType, BaseStream, ByteSource, DeltaLayer,
+    DestinationType, DocStore, FileAttachmentAnnotation, FormFieldType, ImageDecoder, ImageFormat,
+    Lexer, LinearizedInfo, LinkAction, LinkAnnotation, MemoryByteSource, Need, OutlineDestination,
+    OutlineItem, PDFDocument, PDFError, PDFObject, PDFResult, Page, PageResolver, Parser,
+    PopupAnnotation, ResolvedPage, Stream, TextAnnotation, TextItem, Token, WidgetAnnotation, XRef,
+    XRefEntry,
 };
 
-// Re-export rendering types
+// Re-export rendering types. The `Device` trait + `RenderingContext` + `interpret`
+// are backend-agnostic and live here; concrete backends (e.g. tiny-skia's
+// `SkiaDevice`) are in the `pdf-x-device-tinyskia` adapter crate (Phase 0 step 5).
 pub use rendering::{
-    Device, GraphicsState, Paint, Path, PathBuilder, PathDrawMode, RenderingContext,
+    Device, GraphicsState, Paint, Path, PathBuilder, PathDrawMode, RenderingContext, interpret,
 };
-
-#[cfg(feature = "rendering")]
-pub use rendering::SkiaDevice;
 
 // Re-export decode module
 pub use core::decode;
-
-#[cfg(feature = "async")]
-pub use core::{AsyncHttpChunkedStream, HttpChunkedStream, ProgressCallback};

@@ -3,9 +3,8 @@
 //! This test directly constructs vector graphics using the Device trait
 //! to verify that the rendering pipeline works independently of PDF parsing.
 
-use pdf_x_core::rendering::{
-    Color, Device, FillRule, Paint, PathDrawMode, SkiaDevice, StrokeProps,
-};
+use pdf_x_core::rendering::{Color, Device, FillRule, Paint, PathDrawMode, StrokeProps};
+use pdf_x_device_tinyskia::SkiaDevice;
 use tiny_skia::Pixmap;
 
 #[test]
@@ -19,7 +18,9 @@ fn test_colored_shapes_rendering() {
     let mut pixmap = Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
     // Test 1: Red rectangle at (50, 50) size 100x100
     println!("DEBUG: Drawing red rectangle");
@@ -123,7 +124,9 @@ fn test_transformed_shapes() {
     let mut pixmap = Pixmap::new(width, height).expect("Failed to create pixmap");
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_2 = std::collections::HashMap::new();
+
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_2);
 
     // Apply a transform (translate + scale)
     device.concat_matrix(&[2.0, 0.0, 0.0, 2.0, 50.0, 50.0]);
@@ -157,8 +160,9 @@ fn test_transformed_shapes() {
     for y in 0..height {
         for x in 0..width {
             let idx = ((y * width + x) * 4) as usize;
-            let r = pixels[idx];
-            if r > 200 {
+            // Non-white (a plain R-channel check would count the white
+            // background, whose R is 255, as content)
+            if pixels[idx] < 250 || pixels[idx + 1] < 250 || pixels[idx + 2] < 250 {
                 min_x = min_x.min(x);
                 min_y = min_y.min(y);
                 max_x = max_x.max(x);

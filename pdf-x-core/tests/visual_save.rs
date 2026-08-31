@@ -1,5 +1,6 @@
 //! Save rendered pages as PNG using tiny-skia's built-in PNG encoding
 use pdf_x_core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 #[test]
 #[cfg(feature = "rendering")]

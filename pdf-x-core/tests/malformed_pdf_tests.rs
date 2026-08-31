@@ -382,12 +382,15 @@ fn test_bad_xref_pdf_loading() {
         return;
     }
 
-    let result = assert_pdf_loads("bad-xref.pdf");
-    // The bad-xref.pdf has an invalid startxref, so it should fail gracefully
-    assert!(
-        result.is_err(),
-        "bad-xref.pdf should fail to load but not panic"
-    );
+    // bad-xref.pdf's startxref points far past EOF (999999 in a 427-byte file).
+    // An out-of-range offset is xref-read garbage, not a reason to reject the file:
+    // pdf.js catches the read failure and rebuilds via `indexObjects`
+    // (core/xref.js `readXRef` catch → recovery), and `open_file`'s drive loop has
+    // always fallen through to the same recovery scan. Since `open` converged on
+    // the shared DocumentLoader (D step 2) it recovers identically instead of
+    // failing at set_stream_pos — the buffered path was the outlier, not the rule.
+    let mut doc = assert_pdf_loads("bad-xref.pdf").expect("bad-xref.pdf opens via recovery scan");
+    assert_eq!(doc.page_count().expect("recovered page tree resolves"), 1);
 }
 
 // ============================================================================

@@ -167,10 +167,8 @@ pub enum OpCode {
     // Inline Image Operators
     /// BI - Begin inline image
     BeginInlineImage = 63,
-    /// ID - Begin inline image data
-    BeginImageData = 64,
     /// EI - End inline image
-    EndInlineImage = 65,
+    EndInlineImage = 64,
 
     // XObject Operator
     /// Do - Paint XObject
@@ -290,7 +288,6 @@ impl OpCode {
 
             // Inline images
             "BI" => Ok(OpCode::BeginInlineImage),
-            "ID" => Ok(OpCode::BeginImageData),
             "EI" => Ok(OpCode::EndInlineImage),
 
             // XObject
@@ -379,7 +376,6 @@ impl OpCode {
             OpCode::SetFillCMYKColor => "k",
             OpCode::ShadingFill => "sh",
             OpCode::BeginInlineImage => "BI",
-            OpCode::BeginImageData => "ID",
             OpCode::EndInlineImage => "EI",
             OpCode::PaintXObject => "Do",
             OpCode::MarkPoint => "MP",
@@ -428,6 +424,87 @@ impl fmt::Display for Operation {
             write!(f, "{:?}", arg)?;
         }
         write!(f, ")")
+    }
+}
+
+fn normalize_inline_image_dict(
+    dict: std::collections::HashMap<String, PDFObject>,
+) -> std::collections::HashMap<String, PDFObject> {
+    let mut normalized = std::collections::HashMap::new();
+    let mut abbreviated = Vec::new();
+
+    for (key, value) in dict {
+        let normalized_key = expand_inline_key_name(&key).to_string();
+        let value = normalize_inline_image_value(&normalized_key, value);
+
+        if normalized_key == key {
+            normalized.insert(normalized_key, value);
+        } else {
+            abbreviated.push((normalized_key, value));
+        }
+    }
+
+    for (key, value) in abbreviated {
+        normalized.insert(key, value);
+    }
+
+    normalized
+}
+
+fn normalize_inline_image_value(key: &str, value: PDFObject) -> PDFObject {
+    match value {
+        PDFObject::Name(name) if key == "Filter" => {
+            PDFObject::Name(expand_inline_filter_name(&name).to_string())
+        }
+        PDFObject::Name(name) if key == "ColorSpace" => {
+            PDFObject::Name(expand_inline_color_space_name(&name).to_string())
+        }
+        PDFObject::Array(values) => PDFObject::Array(
+            values
+                .into_iter()
+                .map(|item| Box::new(normalize_inline_image_value(key, *item)))
+                .collect(),
+        ),
+        PDFObject::Dictionary(dict) => PDFObject::Dictionary(normalize_inline_image_dict(dict)),
+        other => other,
+    }
+}
+
+fn expand_inline_key_name(name: &str) -> &str {
+    match name {
+        "BPC" => "BitsPerComponent",
+        "CS" => "ColorSpace",
+        "D" => "Decode",
+        "DP" => "DecodeParms",
+        "F" => "Filter",
+        "H" => "Height",
+        "IM" => "ImageMask",
+        "I" => "Interpolate",
+        "W" => "Width",
+        _ => name,
+    }
+}
+
+fn expand_inline_filter_name(name: &str) -> &str {
+    match name {
+        "AHx" => "ASCIIHexDecode",
+        "A85" => "ASCII85Decode",
+        "LZW" => "LZWDecode",
+        "Fl" => "FlateDecode",
+        "RL" => "RunLengthDecode",
+        "CCF" => "CCITTFaxDecode",
+        "DCT" => "DCTDecode",
+        _ => name,
+    }
+}
+
+fn expand_inline_color_space_name(name: &str) -> &str {
+    match name {
+        "G" => "DeviceGray",
+        "RGB" => "DeviceRGB",
+        "CMYK" => "DeviceCMYK",
+        "I" => "Indexed",
+        _ => name,
     }
 }
 
@@ -485,11 +562,41 @@ struct TextExtractionState {
     /// Current text rendering mode
     text_rendering_mode: Option<i32>,
 
+    /// Current text leading (set by TL operator)
+    leading: f64,
+
     /// Whether we're in a text object (BT...ET)
     in_text_object: bool,
 
     /// Extracted text items
     extracted_text: Vec<TextItem>,
+
+    /// Accumulated text for the current text run (consecutive Tj/TJ on same line).
+    /// Instead of pushing a TextItem per Tj/TJ, we accumulate across same-line
+    /// operations and flush to extracted_text only when the line changes (significant
+    /// Ty change via Td/Tm/T*/ET). This keeps superscript markers, font-change text,
+    /// and horizontally-offset text attached to their base word.
+    run_accumulator: String,
+
+    /// Position of the first operation in the current text run
+    run_start_position: Option<(f64, f64)>,
+
+    /// Font name at the start of the current text run
+    run_start_font_name: Option<String>,
+
+    /// Font size at the start of the current text run
+    run_start_font_size: Option<f64>,
+
+    /// Rendering mode at the start of the current text run
+    run_start_rendering_mode: Option<i32>,
+
+    /// Y position for line-change detection (used instead of storing Ty separately)
+    /// — stored as the Ty component of run_start_position.
+
+    /// Form XObject names encountered via `Do` during this extraction. The caller
+    /// (Page::extract_text) drains this after the run and recursively extracts text
+    /// from each Form XObject, so text inside Form XObjects is not silently lost.
+    form_xobject_names: Vec<String>,
 }
 
 impl Default for TextExtractionState {
@@ -501,8 +608,15 @@ impl Default for TextExtractionState {
             current_font_name: None,
             current_font_size: None,
             text_rendering_mode: None,
+            leading: 0.0,
             in_text_object: false,
             extracted_text: Vec::new(),
+            run_accumulator: String::new(),
+            run_start_position: None,
+            run_start_font_name: None,
+            run_start_font_size: None,
+            run_start_rendering_mode: None,
+            form_xobject_names: Vec::new(),
         }
     }
 }
@@ -558,7 +672,7 @@ impl ContentStreamEvaluator {
             let font_dict_obj = xref.fetch_if_ref(font_ref)?;
 
             // Create Font object
-            match Font::new(font_dict_obj, xref) {
+            match Font::new((*font_dict_obj).clone(), xref) {
                 Ok(font) => {
                     self.fonts.insert(font_name.clone(), font);
                 }
@@ -583,8 +697,8 @@ impl ContentStreamEvaluator {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::content_stream::ContentStreamEvaluator;
-    /// # use pdf_x::core::{Parser, Lexer, Stream};
+    /// use pdf_x_core::core::content_stream::ContentStreamEvaluator;
+    /// # use pdf_x_core::core::{Parser, Lexer, Stream};
     /// # let stream = Box::new(Stream::from_bytes(vec![]));
     /// # let lexer = Lexer::new(stream).unwrap();
     /// # let parser = Parser::new(lexer).unwrap();
@@ -596,6 +710,60 @@ impl ContentStreamEvaluator {
     ///     println!("Text: '{}' at position {:?}", item.text, item.position);
     /// }
     /// ```
+
+    /// Flush the accumulated text run as a single TextItem.
+    /// Consumes the run accumulator and appends to extracted_text.
+    fn flush_text_run(&mut self) {
+        let s = &mut self.text_state;
+        if !s.run_accumulator.is_empty() {
+            s.extracted_text.push(TextItem {
+                text: std::mem::take(&mut s.run_accumulator),
+                font_name: s.run_start_font_name.clone(),
+                font_size: s.run_start_font_size,
+                position: s.run_start_position,
+                rendering_mode: s.run_start_rendering_mode,
+            });
+        }
+        s.run_start_position = None;
+    }
+
+    /// Start a new text run at the current text matrix position.
+    /// Clears the accumulator and captures current font/position state.
+    fn start_new_run(&mut self) {
+        let s = &mut self.text_state;
+        s.run_accumulator.clear();
+        s.run_start_position = Some((s.text_matrix[4], s.text_matrix[5]));
+        s.run_start_font_name = s.current_font_name.clone();
+        s.run_start_font_size = s.current_font_size;
+        s.run_start_rendering_mode = s.text_rendering_mode;
+    }
+
+    /// Check if the current text position's Y has moved far enough from
+    /// the run's start Y that we should flush and start a new run.
+    fn should_flush_run(&self) -> bool {
+        let s = &self.text_state;
+        let Some(start_pos) = s.run_start_position else {
+            return false;
+        };
+        let current_y = s.text_matrix[5];
+        let dy = (current_y - start_pos.1).abs();
+        let threshold = s
+            .run_start_font_size
+            .unwrap_or(12.0)
+            .max(s.current_font_size.unwrap_or(12.0))
+            * 0.5;
+        dy > threshold
+    }
+
+    /// Flush the run if the Y position has changed significantly, then
+    /// start a new run at the current text matrix position.
+    fn maybe_flush_and_start_run(&mut self) {
+        if self.should_flush_run() {
+            self.flush_text_run();
+            self.start_new_run();
+        }
+    }
+
     pub fn extract_text(&mut self) -> PDFResult<Vec<TextItem>> {
         // Reset text state
         self.text_state = TextExtractionState::default();
@@ -605,19 +773,33 @@ impl ContentStreamEvaluator {
             self.process_text_operation(&op)?;
         }
 
+        // Flush any remaining accumulated text
+        self.flush_text_run();
+
         Ok(self.text_state.extracted_text.clone())
+    }
+
+    /// Returns the Form XObject names encountered via `Do` during the last
+    /// `extract_text` run, draining the internal buffer. The caller is expected
+    /// to recursively extract text from each Form XObject (resolving it through
+    /// the page's resources) so text inside Form XObjects is not lost.
+    pub fn take_form_xobject_names(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.text_state.form_xobject_names)
     }
 
     /// Processes an operation for text extraction.
     fn process_text_operation(&mut self, op: &Operation) -> PDFResult<()> {
         match op.op {
             OpCode::BeginText => {
+                self.flush_text_run();
                 self.text_state.in_text_object = true;
                 // Initialize text matrices
                 self.text_state.text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
                 self.text_state.text_line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+                self.start_new_run();
             }
             OpCode::EndText => {
+                self.flush_text_run();
                 self.text_state.in_text_object = false;
             }
             OpCode::SetFont => {
@@ -638,7 +820,16 @@ impl ContentStreamEvaluator {
                     }
                 }
             }
+            OpCode::SetLeading => {
+                if op.args.len() >= 1 {
+                    if let PDFObject::Number(leading) = &op.args[0] {
+                        self.text_state.leading = *leading;
+                    }
+                }
+            }
             OpCode::SetTextMatrix => {
+                // Tm — absolute text positioning (always a new text run)
+                self.flush_text_run();
                 if op.args.len() >= 6 {
                     // Set text matrix from 6 numbers [a b c d e f]
                     for i in 0..6 {
@@ -648,6 +839,7 @@ impl ContentStreamEvaluator {
                         }
                     }
                 }
+                self.start_new_run();
             }
             OpCode::MoveText => {
                 if op.args.len() >= 2 && self.text_state.in_text_object {
@@ -660,36 +852,53 @@ impl ContentStreamEvaluator {
                         self.text_state.text_line_matrix[5] += ty;
                         // Copy to text matrix
                         self.text_state.text_matrix = self.text_state.text_line_matrix;
+                        // Check if this is a line change (significant Ty shift)
+                        self.maybe_flush_and_start_run();
                     }
                 }
             }
             OpCode::NextLine => {
                 if self.text_state.in_text_object {
-                    // T* - move to next line using leading
-                    self.text_state.text_line_matrix[5] -=
-                        self.text_state.text_line_matrix[5] * 0.0; // Simplified
+                    // T* - move to start of next line
+                    self.text_state.text_line_matrix[4] = 0.0;
+                    self.text_state.text_line_matrix[5] -= self.text_state.leading;
                     self.text_state.text_matrix = self.text_state.text_line_matrix;
+                    self.maybe_flush_and_start_run();
+                }
+            }
+            OpCode::SetLeadingMoveText => {
+                if op.args.len() >= 2 && self.text_state.in_text_object {
+                    // TD - set leading and move text position
+                    if let (PDFObject::Number(tx), PDFObject::Number(ty)) =
+                        (&op.args[0], &op.args[1])
+                    {
+                        self.text_state.leading = -*ty;
+                        self.text_state.text_line_matrix[4] += tx;
+                        self.text_state.text_line_matrix[5] += ty;
+                        self.text_state.text_matrix = self.text_state.text_line_matrix;
+                        self.maybe_flush_and_start_run();
+                    }
                 }
             }
             OpCode::ShowText => {
                 // Tj - show text string
                 if op.args.len() >= 1 && self.text_state.in_text_object {
-                    if let PDFObject::String(text_bytes) = &op.args[0] {
-                        let text = self.decode_text(text_bytes);
-                        let position = Some((
-                            self.text_state.text_matrix[4],
-                            self.text_state.text_matrix[5],
-                        ));
-
-                        let text_item = TextItem {
-                            text,
-                            font_name: self.text_state.current_font_name.clone(),
-                            font_size: self.text_state.current_font_size,
-                            position,
-                            rendering_mode: self.text_state.text_rendering_mode,
-                        };
-
-                        self.text_state.extracted_text.push(text_item);
+                    self.maybe_flush_and_start_run();
+                    match &op.args[0] {
+                        PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
+                            let text = self.decode_text(text_bytes);
+                            let s = &mut self.text_state;
+                            if !s.run_accumulator.is_empty() && !s.run_accumulator.ends_with(' ') {
+                                // Insert space before alphanumeric-starting items (words).
+                                // Items starting with punctuation/symbols (superscript markers,
+                                // commas, etc.) are attached without space.
+                                if text.starts_with(|c: char| c.is_alphanumeric()) {
+                                    s.run_accumulator.push(' ');
+                                }
+                            }
+                            s.run_accumulator.push_str(&text);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -699,26 +908,92 @@ impl ContentStreamEvaluator {
                 // Format: [(string1) -100 (string2) 50 (string3)] where numbers are spacing adjustments
                 if op.args.len() >= 1 && self.text_state.in_text_object {
                     if let PDFObject::Array(items) = &op.args[0] {
+                        self.maybe_flush_and_start_run();
+
+                        // Pre-scan: detect word-based TJ arrays (at least one multi-char
+                        // string). Per-char arrays like issue6961's [(P) -207 (a) ...] use
+                        // spacing as glyph advances; word-based arrays insert word spaces.
+                        let has_multi_char = items.iter().any(|item| {
+                            match &**item {
+                                // byte-length > 1 is a reliable approximation for Latin
+                                // fonts; multi-byte CJK won't falsely trigger per-char
+                                // detection since CJK rarely uses glyph-advance arrays.
+                                PDFObject::String(b) | PDFObject::HexString(b) => b.len() > 1,
+                                _ => false,
+                            }
+                        });
                         let mut accumulated_text = String::new();
-                        let start_position = Some((
-                            self.text_state.text_matrix[4],
-                            self.text_state.text_matrix[5],
-                        ));
+
+                        // Track whether the last string in the array was a full word
+                        // or punctuation. Only spacing values following a multi-char
+                        // string or punctuation can be word boundaries (separating full
+                        // words). Per-char TJ arrays (e.g., `[(P) -207 (a) ...]`) use
+                        // spacing values that represent glyph advances, not word spaces.
+                        let mut last_was_word_or_punct = false;
+                        // Also track whether we've skipped an initial single-character
+                        // word (meaning subsequent spacing should still be word spaces).
+                        let mut seen_word = false;
 
                         for item in items {
                             match &**item {
-                                PDFObject::String(text_bytes) => {
+                                PDFObject::String(text_bytes)
+                                | PDFObject::HexString(text_bytes) => {
                                     // Decode text using font encoding (CMap)
                                     let text = self.decode_text(text_bytes);
+                                    let count = text.chars().count();
+                                    last_was_word_or_punct = count > 1
+                                        || count == 1
+                                            && text.chars().next().is_some_and(|c| {
+                                                c == ','
+                                                    || c == '.'
+                                                    || c == ';'
+                                                    || c == ':'
+                                                    || c == '!'
+                                                    || c == '?'
+                                                    || c == ')'
+                                                    || c == ']'
+                                                    || c == '}'
+                                                    || c == '%'
+                                            });
+                                    // In a word-based TJ array, even single-char items
+                                    // like "A" or "I" are real words, so mark seen_word.
+                                    if count > 1 || (has_multi_char && count == 1) {
+                                        seen_word = true;
+                                    }
                                     accumulated_text.push_str(&text);
                                 }
                                 PDFObject::Number(spacing) => {
-                                    // Spacing adjustment in 1/1000ths of a text space unit
-                                    // Negative numbers move text closer together (like kerning)
-                                    // Large negative numbers (< -100) typically indicate word spaces
-
-                                    // Add a space if the adjustment is significant (word boundary)
-                                    if *spacing < -100.0 {
+                                    // Spacing adjustment in 1/1000ths of a text space unit.
+                                    // Negative values move subsequent glyphs right (gap), positive
+                                    // values move left (tightening / kerning).
+                                    //
+                                    // pdf.js thresholds (evaluator.js):
+                                    //   SPACE_IN_FLOW_MIN_FACTOR = 0.102  →  spacing < -102
+                                    //   SPACE_IN_FLOW_MAX_FACTOR = 0.6    →  spacing < -600
+                                    // Gaps in [-600, -102) are word spaces — but only when the
+                                    // preceding string was multi-character (otherwise it's just
+                                    // a glyph advance in a per-char TJ array, e.g. issue6961).
+                                    // Gaps < -600 are too large — flush as a separate item.
+                                    // Gaps ≥ -102 are kerning — no space.
+                                    if *spacing < -600.0 {
+                                        // Large gap — paragraph break: flush the current run
+                                        // (including text accumulated before and within this TJ)
+                                        // and start a new run for remaining TJ content.
+                                        if !accumulated_text.is_empty() {
+                                            self.text_state
+                                                .run_accumulator
+                                                .push_str(&accumulated_text);
+                                            accumulated_text.clear();
+                                            self.flush_text_run();
+                                            self.start_new_run();
+                                        }
+                                    } else if *spacing < -102.0
+                                        && (last_was_word_or_punct || seen_word)
+                                    {
+                                        // Word-space gap — only if preceded by a word or
+                                        // punctuation. Per-char TJ arrays (all single-char,
+                                        // non-punct strings) skip space insertion even when
+                                        // the spacing value falls in the word-space range.
                                         accumulated_text.push(' ');
                                     }
 
@@ -731,19 +1006,65 @@ impl ContentStreamEvaluator {
                             }
                         }
 
-                        // Create a single text item for the entire TJ operation
+                        // Append accumulated TJ text to the run accumulator.
+                        // Insert a space before alphanumeric-starting text if the
+                        // run already has content (word boundary). Punctuation/symbol
+                        // items (superscript markers, commas) attach without space.
                         if !accumulated_text.is_empty() {
-                            let text_item = TextItem {
-                                text: accumulated_text,
-                                font_name: self.text_state.current_font_name.clone(),
-                                font_size: self.text_state.current_font_size,
-                                position: start_position,
-                                rendering_mode: self.text_state.text_rendering_mode,
-                            };
-
-                            self.text_state.extracted_text.push(text_item);
+                            let s = &mut self.text_state;
+                            if !s.run_accumulator.is_empty() && !s.run_accumulator.ends_with(' ') {
+                                if accumulated_text.starts_with(|c: char| c.is_alphanumeric()) {
+                                    s.run_accumulator.push(' ');
+                                }
+                            }
+                            s.run_accumulator.push_str(&accumulated_text);
                         }
                     }
+                }
+            }
+            OpCode::NextLineShowText => {
+                // ' - move to next line and show text (T* + Tj)
+                if op.args.len() >= 1 && self.text_state.in_text_object {
+                    self.flush_text_run();
+                    self.text_state.text_line_matrix[4] = 0.0;
+                    self.text_state.text_line_matrix[5] -= self.text_state.leading;
+                    self.text_state.text_matrix = self.text_state.text_line_matrix;
+                    self.start_new_run();
+                    match &op.args[0] {
+                        PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
+                            let text = self.decode_text(text_bytes);
+                            self.text_state.run_accumulator.push_str(&text);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OpCode::NextLineSetSpacingShowText => {
+                // " - set word/char spacing, move to next line, and show text
+                // args: word_spacing char_spacing text_string
+                if op.args.len() >= 3 && self.text_state.in_text_object {
+                    self.flush_text_run();
+                    self.text_state.text_line_matrix[4] = 0.0;
+                    self.text_state.text_line_matrix[5] -= self.text_state.leading;
+                    self.text_state.text_matrix = self.text_state.text_line_matrix;
+                    self.start_new_run();
+                    match &op.args[2] {
+                        PDFObject::String(text_bytes) | PDFObject::HexString(text_bytes) => {
+                            let text = self.decode_text(text_bytes);
+                            self.text_state.run_accumulator.push_str(&text);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OpCode::PaintXObject => {
+                // Record Form XObject names so the caller can recursively extract
+                // text from them. We don't know here whether it's a Form or Image
+                // XObject (that requires resolving resources), so we record the name
+                // and let Page::extract_text decide. Only names are collected; args
+                // that aren't a Name are ignored.
+                if let Some(PDFObject::Name(name)) = op.args.first() {
+                    self.text_state.form_xobject_names.push(name.clone());
                 }
             }
             _ => {
@@ -821,8 +1142,8 @@ impl ContentStreamEvaluator {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::content_stream::ContentStreamEvaluator;
-    /// # use pdf_x::core::{Parser, Lexer, Stream};
+    /// use pdf_x_core::core::content_stream::ContentStreamEvaluator;
+    /// # use pdf_x_core::core::{Parser, Lexer, Stream};
     /// # let stream = Box::new(Stream::from_bytes(vec![]));
     /// # let lexer = Lexer::new(stream).unwrap();
     /// # let parser = Parser::new(lexer).unwrap();
@@ -866,14 +1187,47 @@ impl ContentStreamEvaluator {
                 obj if obj.is_command_like() => {
                     // Extract command string
                     let cmd_str = self.extract_command(&obj)?;
+
                     let op = OpCode::from_command(&cmd_str)?;
-                    return Ok(Some(Operation::new(op, args)));
+                    if op == OpCode::BeginInlineImage {
+                        return self.read_inline_image_operation();
+                    }
+                    return Ok(Some(Operation::new(op, normalize_args(op, args))));
                 }
                 // Everything else is an operand
                 _ => {
                     args.push(obj);
                 }
             }
+        }
+    }
+
+    fn read_inline_image_operation(&mut self) -> PDFResult<Option<Operation>> {
+        let mut dict = std::collections::HashMap::new();
+
+        loop {
+            let key = match self.parser.get_object()? {
+                PDFObject::EOF => return Ok(None),
+                PDFObject::Command(cmd) if cmd == "ID" => {
+                    let data = match self.parser.get_object()? {
+                        PDFObject::InlineImageData(data) => data,
+                        _ => Vec::new(),
+                    };
+                    let normalized = normalize_inline_image_dict(dict);
+                    return Ok(Some(Operation::new(
+                        OpCode::BeginInlineImage,
+                        vec![PDFObject::Stream {
+                            dict: normalized,
+                            data,
+                        }],
+                    )));
+                }
+                PDFObject::Name(name) | PDFObject::Command(name) => name,
+                _ => continue,
+            };
+
+            let value = self.parser.get_object()?;
+            dict.insert(key, value);
         }
     }
 
@@ -892,6 +1246,96 @@ impl ContentStreamEvaluator {
     pub fn has_more(&self) -> bool {
         self.parser.has_more()
     }
+}
+
+fn normalize_args(op: OpCode, args: Vec<PDFObject>) -> Vec<PDFObject> {
+    let Some(count) = fixed_arg_count(op) else {
+        return args;
+    };
+    if args.len() <= count {
+        return args;
+    }
+    args[args.len() - count..].to_vec()
+}
+
+fn fixed_arg_count(op: OpCode) -> Option<usize> {
+    Some(match op {
+        OpCode::SetLineWidth
+        | OpCode::SetLineCap
+        | OpCode::SetLineJoin
+        | OpCode::SetMiterLimit
+        | OpCode::SetRenderingIntent
+        | OpCode::SetFlatness
+        | OpCode::SetGState
+        | OpCode::SetCharSpacing
+        | OpCode::SetWordSpacing
+        | OpCode::SetHScale
+        | OpCode::SetLeading
+        | OpCode::SetTextRenderingMode
+        | OpCode::SetTextRise
+        | OpCode::ShowText
+        | OpCode::ShowSpacedText
+        | OpCode::NextLineShowText
+        | OpCode::PaintXObject
+        | OpCode::MarkPoint
+        | OpCode::BeginMarkedContent
+        | OpCode::ShadingFill => 1,
+
+        OpCode::SetDash
+        | OpCode::SetFont
+        | OpCode::MoveTo
+        | OpCode::LineTo
+        | OpCode::MoveText
+        | OpCode::SetLeadingMoveText => 2,
+
+        OpCode::SetFillRGBColor
+        | OpCode::SetStrokeRGBColor
+        | OpCode::NextLineSetSpacingShowText => 3,
+
+        OpCode::Rectangle
+        | OpCode::SetFillCMYKColor
+        | OpCode::SetStrokeCMYKColor
+        | OpCode::CurveTo2
+        | OpCode::CurveTo3
+        | OpCode::SetCharWidth => 4,
+
+        OpCode::Transform | OpCode::SetTextMatrix | OpCode::CurveTo => 6,
+        OpCode::SetCharWidthAndBounds => 6,
+
+        OpCode::Save
+        | OpCode::Restore
+        | OpCode::Stroke
+        | OpCode::CloseStroke
+        | OpCode::Fill
+        | OpCode::EOFill
+        | OpCode::FillStroke
+        | OpCode::EOFillStroke
+        | OpCode::CloseFillStroke
+        | OpCode::CloseEOFillStroke
+        | OpCode::ClosePath
+        | OpCode::EndPath
+        | OpCode::Clip
+        | OpCode::EOClip
+        | OpCode::BeginText
+        | OpCode::EndText
+        | OpCode::NextLine
+        | OpCode::EndMarkedContent
+        | OpCode::BeginCompat
+        | OpCode::EndCompat => 0,
+
+        OpCode::SetStrokeColorSpace
+        | OpCode::SetFillColorSpace
+        | OpCode::SetStrokeColor
+        | OpCode::SetStrokeColorN
+        | OpCode::SetFillColor
+        | OpCode::SetFillColorN
+        | OpCode::SetStrokeGray
+        | OpCode::SetFillGray
+        | OpCode::MarkPointProps
+        | OpCode::BeginMarkedContentProps
+        | OpCode::BeginInlineImage
+        | OpCode::EndInlineImage => return None,
+    })
 }
 
 #[cfg(test)]
@@ -989,6 +1433,38 @@ mod tests {
         // End text
         let op4 = eval.read_operation().unwrap().unwrap();
         assert_eq!(op4.op, OpCode::EndText);
+    }
+
+    #[test]
+    fn test_fixed_arity_operators_ignore_extra_prefix_operands() {
+        let mut eval =
+            create_evaluator("BT\n. /F1 12 Tf\n. 5 Tr\n. 1 0 0 1 10 20 Tm\n. (Hi) Tj\nET");
+
+        assert_eq!(
+            eval.read_operation().unwrap().unwrap().op,
+            OpCode::BeginText
+        );
+
+        let font = eval.read_operation().unwrap().unwrap();
+        assert_eq!(font.op, OpCode::SetFont);
+        assert_eq!(
+            font.args,
+            vec![PDFObject::Name("F1".into()), PDFObject::Number(12.0)]
+        );
+
+        let mode = eval.read_operation().unwrap().unwrap();
+        assert_eq!(mode.op, OpCode::SetTextRenderingMode);
+        assert_eq!(mode.args, vec![PDFObject::Number(5.0)]);
+
+        let matrix = eval.read_operation().unwrap().unwrap();
+        assert_eq!(matrix.op, OpCode::SetTextMatrix);
+        assert_eq!(matrix.args.len(), 6);
+        assert_eq!(matrix.args[4], PDFObject::Number(10.0));
+        assert_eq!(matrix.args[5], PDFObject::Number(20.0));
+
+        let text = eval.read_operation().unwrap().unwrap();
+        assert_eq!(text.op, OpCode::ShowText);
+        assert_eq!(text.args, vec![PDFObject::String(b"Hi".to_vec())]);
     }
 
     #[test]

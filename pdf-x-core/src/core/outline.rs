@@ -273,7 +273,7 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
     };
 
     // Get /First reference (first top-level outline item)
-    let first_ref = match &outlines_obj {
+    let first_ref = match &*outlines_obj {
         PDFObject::Dictionary(dict) => match dict.get("First") {
             Some(PDFObject::Ref(ref_obj)) => Some((ref_obj.num, ref_obj.generation)),
             _ => None,
@@ -299,12 +299,11 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
         let (num, generation) = ref_num_gen;
 
         // Fetch the outline dictionary
-        let outline_dict = match doc
-            .xref_mut()
-            .fetch_if_ref(&PDFObject::Ref(Ref::new(num, generation)))
+        let outline_obj = match doc
+            .doc_store_mut()
+            .resolve_if_ref(&PDFObject::Ref(Ref::new(num, generation)))
         {
-            Ok(PDFObject::Dictionary(dict)) => dict,
-            Ok(_) => continue, // Not a dictionary, skip
+            Ok(obj) => obj,
             Err(PDFError::DataMissing { .. }) => {
                 return Err(PDFError::DataMissing {
                     position: 0,
@@ -312,6 +311,10 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
                 });
             }
             Err(_) => continue,
+        };
+        let outline_dict = match &*outline_obj {
+            PDFObject::Dictionary(dict) => dict,
+            _ => continue,
         };
 
         // Title is required

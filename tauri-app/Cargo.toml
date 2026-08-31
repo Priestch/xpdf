@@ -7,7 +7,12 @@ license = "Apache-2.0"
 description = "Tauri desktop app for PDF-X"
 
 [dependencies]
-pdf-x-core = { path = "../pdf-x-core", features = ["rendering", "debug-logging"] }
+pdf-x-core = { path = "../pdf-x-core", features = ["rendering"] }
+# tiny-skia render backend adapter (Phase 0 step 5: backends are adapter crates).
+pdf-x-device-tinyskia = { path = "../pdf-x-device-tinyskia" }
+# Shell-side chunked file source (Phase D step 5): the app owns file I/O and
+# drives the core DocumentLoader over it.
+pdf-x-source-file = { path = "../pdf-x-source-file" }
 tauri = { version = "2.0", features = [] }
 tauri-plugin-dialog = "2.0"
 serde = { version = "1.0", features = ["derive"] }

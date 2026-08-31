@@ -8,9 +8,9 @@
 //! Example:
 //!     cargo run --example render --features rendering -- test.pdf output.png 0
 
+use pdf_x_core::PDFDocument;
 use pdf_x_core::rendering::Device; // Import Device trait for concat_matrix
-use pdf_x_core::rendering::skia_device::SkiaDevice;
-use pdf_x_core::{PDFDocument, Page};
+use pdf_x_device_tinyskia::SkiaDevice;
 use std::env;
 use std::path::Path;
 use tiny_skia::Pixmap;
@@ -100,25 +100,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pixmap.fill(tiny_skia::Color::WHITE);
 
     // Create rendering device
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache = pdf_x_device_tinyskia::FontCache::new();
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
 
     // Set up coordinate transform
     // PDF coordinates: (0,0) at bottom-left, y increases upward
     // Image coordinates: (0,0) at top-left, y increases downward
     // We need to flip Y and translate the origin
     device.concat_matrix(&[
-        scale,     // sx: scale X
-        0.0,       // kx: no skew
-        0.0,       // ky: no skew
-        -scale,    // sy: negative scale flips Y-axis
-        0.0,       // tx: no X translation
+        scale,             // sx: scale X
+        0.0,               // kx: no skew
+        0.0,               // ky: no skew
+        -scale,            // sy: negative scale flips Y-axis
+        0.0,               // tx: no X translation
         coords[3] * scale, // ty: move origin to page height
     ]);
 
     println!("Rendering page {}...", page_number);
 
     // Render the page
-    match page.render(&mut doc.xref_mut(), &mut device) {
+    match page.render(doc.doc_store_mut(), &mut device) {
         Ok(_) => println!("Rendering complete!"),
         Err(e) => {
             eprintln!("Warning: Rendering encountered errors: {:?}", e);

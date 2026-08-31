@@ -69,7 +69,7 @@ fn main() {
 
     // Open PDF document using progressive/chunked loading
     // This loads the PDF in 64KB chunks rather than reading the entire file into memory
-    let mut doc = match PDFDocument::open_file(pdf_path, None, None) {
+    let mut doc = match pdf_x_source_file::open_file(pdf_path, None, None) {
         Ok(doc) => doc,
         Err(e) => {
             eprintln!("Error parsing PDF: {:?}", e);
@@ -266,6 +266,9 @@ fn print_object(obj: &PDFObject, indent: usize) {
                 println!("{}<{}>", indent_str, hex_str);
             }
         }
+        PDFObject::InlineImageData(data) => {
+            println!("{}inline image data ({} bytes)", indent_str, data.len())
+        }
         PDFObject::Name(n) => println!("{}/{}", indent_str, n),
         PDFObject::Command(c) => println!("{}{}", indent_str, c),
         PDFObject::Array(arr) => {
@@ -362,6 +365,7 @@ fn print_object_inline(obj: &PDFObject) {
                 println!("<{}>", hex_str);
             }
         }
+        PDFObject::InlineImageData(data) => println!("inline image data ({} bytes)", data.len()),
         PDFObject::Name(n) => println!("/{}", n),
         PDFObject::Command(c) => println!("{}", c),
         PDFObject::Array(_) => println!("[...]"),
@@ -485,12 +489,14 @@ fn extract_page_images(page: &Page, doc: &mut PDFDocument, total_size: &mut usiz
             if let Some(xobject_obj) = xobject_dict.get("XObject") {
                 // Follow reference if needed
                 let xobject_dict = match doc.xref_mut().fetch_if_ref(xobject_obj) {
-                    Ok(PDFObject::Dictionary(dict)) => dict,
-                    Ok(PDFObject::Stream { dict, .. }) => dict,
-                    Ok(_) => {
-                        println!("  ⚠️  XObject is not a dictionary or stream");
-                        return 0;
-                    }
+                    Ok(obj) => match &*obj {
+                        PDFObject::Dictionary(dict) => dict.clone(),
+                        PDFObject::Stream { dict, .. } => dict.clone(),
+                        _ => {
+                            println!("  ⚠️  XObject is not a dictionary or stream");
+                            return 0;
+                        }
+                    },
                     Err(e) => {
                         println!("  ⚠️  Error fetching XObject: {:?}", e);
                         return 0;
@@ -511,7 +517,7 @@ fn extract_page_images(page: &Page, doc: &mut PDFDocument, total_size: &mut usiz
                     };
 
                     // Check if it's an image stream
-                    if let PDFObject::Stream { dict, data } = xobject {
+                    if let PDFObject::Stream { dict, data } = &*xobject {
                         // Check if it's an image XObject
                         if let Some(subtype) = dict.get("Subtype") {
                             if let PDFObject::Name(subtype_name) = subtype {
@@ -1005,10 +1011,12 @@ fn extract_fonts(doc: &mut PDFDocument) {
                     if let Some(font_obj) = res_dict.get("Font") {
                         // Follow reference if needed
                         let font_dict = match doc.xref_mut().fetch_if_ref(font_obj) {
-                            Ok(PDFObject::Dictionary(dict)) => dict,
-                            Ok(_) => {
-                                continue;
-                            }
+                            Ok(obj) => match &*obj {
+                                PDFObject::Dictionary(dict) => dict.clone(),
+                                _ => {
+                                    continue;
+                                }
+                            },
                             Err(_) => continue,
                         };
 
@@ -1046,41 +1054,24 @@ fn extract_all_text(doc: &mut PDFDocument) {
     let mut total_chars = 0;
 
     for page_num in 0..page_count {
-        if let Ok(page) = doc.get_page(page_num as usize) {
-            println!("═══ Page {} ═══", page_num + 1);
+        println!("═══ Page {} ═══", page_num + 1);
 
-            match page.extract_text(doc.xref_mut()) {
-                Ok(text_items) => {
-                    if text_items.is_empty() {
-                        println!("  (No text on this page)");
-                    } else {
-                        // Group text by line (similar Y position)
-                        let mut lines: std::collections::BTreeMap<i32, Vec<String>> =
-                            std::collections::BTreeMap::new();
-
-                        for item in text_items {
-                            let y_key = if let Some(pos) = item.position {
-                                (pos.1 * 10.0) as i32
-                            } else {
-                                0
-                            };
-                            lines.entry(y_key).or_insert_with(Vec::new).push(item.text);
-                        }
-
-                        // Print lines
-                        for (_, texts) in lines.into_iter().rev() {
-                            let line = texts.join(" ");
-                            println!("  {}", line);
-                            total_chars += line.len();
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("  Error extracting text: {:?}", e);
+        // Routes through DocStore (delta → base) per decision B/C.
+        // Uses extract_text_as_string for positional gap joining.
+        match doc.extract_text_from_page_as_string(page_num as usize) {
+            Ok(line) => {
+                if line.is_empty() {
+                    println!("  (No text on this page)");
+                } else {
+                    println!("  {}", line);
+                    total_chars += line.len();
                 }
             }
-            println!();
+            Err(e) => {
+                println!("  Error extracting text: {:?}", e);
+            }
         }
+        println!();
     }
 
     println!("Total characters extracted: {}", total_chars);
@@ -1427,7 +1418,7 @@ fn count_fonts(doc: &mut PDFDocument) -> usize {
                 if let PDFObject::Dictionary(res_dict) = resources {
                     if let Some(font_obj) = res_dict.get("Font") {
                         if let Ok(font_dict) = doc.xref_mut().fetch_if_ref(font_obj) {
-                            if let PDFObject::Dictionary(dict) = font_dict {
+                            if let PDFObject::Dictionary(dict) = &*font_dict {
                                 for (font_name, _) in dict {
                                     font_set.insert(font_name.clone());
                                 }

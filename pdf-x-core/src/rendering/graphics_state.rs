@@ -58,6 +58,9 @@ pub struct StrokeProps {
 
     /// Dash phase - offset into the dash pattern (default: 0)
     pub dash_offset: f64,
+
+    /// Minimum stroke width in device pixels used by the raster backend.
+    pub min_device_width: f64,
 }
 
 impl Default for StrokeProps {
@@ -69,6 +72,7 @@ impl Default for StrokeProps {
             miter_limit: 10.0,
             dash_array: Vec::new(),
             dash_offset: 0.0,
+            min_device_width: 0.2,
         }
     }
 }
@@ -136,18 +140,19 @@ impl Color {
                 255,
             ),
             Color::CMYK(c, m, y, k) => {
-                // Convert CMYK to RGB
-                let c = 1.0 - c.clamp(0.0, 1.0);
-                let m = 1.0 - m.clamp(0.0, 1.0);
-                let y = 1.0 - y.clamp(0.0, 1.0);
-                let k = 1.0 - k.clamp(0.0, 1.0);
-
-                (
-                    (c * k * 255.0) as u8,
-                    (m * k * 255.0) as u8,
-                    (y * k * 255.0) as u8,
-                    255,
-                )
+                #[cfg(feature = "rendering")]
+                {
+                    return {
+                        let (r, g, b) = crate::rendering::cmyk_icc::cmyk_pixel_to_rgb(
+                            *c as f32, *m as f32, *y as f32, *k as f32,
+                        );
+                        (r, g, b, 255)
+                    };
+                }
+                #[cfg(not(feature = "rendering"))]
+                {
+                    cmyk_polynomial(*c, *m, *y, *k)
+                }
             }
         }
     }
@@ -206,6 +211,54 @@ impl Default for TextRenderingMode {
     }
 }
 
+#[cfg(not(feature = "rendering"))]
+pub(crate) fn cmyk_polynomial(c: f64, m: f64, y: f64, k: f64) -> (u8, u8, u8, u8) {
+    let c = c.clamp(0.0, 1.0);
+    let m = m.clamp(0.0, 1.0);
+    let y = y.clamp(0.0, 1.0);
+    let k = k.clamp(0.0, 1.0);
+
+    let r = 255.0
+        + c * (-4.387332384609988 * c
+            + 54.48615194189176 * m
+            + 18.82290502165302 * y
+            + 212.25662451639585 * k
+            - 285.2331026137004)
+        + m * (1.7149763477362134 * m
+            - 5.6096736904047315 * y
+            - 17.873870861415444 * k
+            - 5.497006427196366)
+        + y * (-2.5217340131683033 * y - 21.248923337353073 * k + 17.5119270841813)
+        + k * (-21.86122147463605 * k - 189.48180835922747);
+
+    let g = 255.0
+        + c * (8.841041422036149 * c
+            + 60.118027045597366 * m
+            + 6.871425592049007 * y
+            + 31.159100130055922 * k
+            - 79.2970844816548)
+        + m * (-15.310361306967817 * m + 17.575251261109482 * y + 131.35250912493976 * k
+            - 190.9453302588951)
+        + y * (4.444339102852739 * y + 9.8632861493405 * k - 24.86741582555878)
+        + k * (-20.737325471181034 * k - 187.80453709719578);
+
+    let b = 255.0
+        + c * (0.8842522430003296 * c + 8.078677503112928 * m + 30.89978309703729 * y
+            - 0.23883238689178934 * k
+            - 14.183576799673286)
+        + m * (10.49593273432072 * m + 63.02378494754052 * y + 50.606957656360734 * k
+            - 112.23884253719248)
+        + y * (0.03296041114873217 * y + 115.60384449646641 * k - 193.58209356861505)
+        + k * (-22.33816807309886 * k - 180.12613974708367);
+
+    (
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+        255,
+    )
+}
+
 /// Fill rule for path filling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillRule {
@@ -218,6 +271,34 @@ pub enum FillRule {
 impl Default for FillRule {
     fn default() -> Self {
         FillRule::NonZero
+    }
+}
+
+/// Blend mode for compositing painting operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendMode {
+    /// Normal source-over compositing.
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl Default for BlendMode {
+    fn default() -> Self {
+        BlendMode::Normal
     }
 }
 
@@ -239,6 +320,15 @@ pub struct GraphicsState {
 
     /// Fill color
     pub fill_color: Color,
+
+    /// Current blend mode from ExtGState (`/BM`), defaults to Normal.
+    pub blend_mode: BlendMode,
+
+    /// Fill alpha from ExtGState (`/ca`), defaults to 1.0.
+    pub fill_alpha: f64,
+
+    /// Stroke alpha from ExtGState (`/CA`), defaults to 1.0.
+    pub stroke_alpha: f64,
 
     /// Stroke properties
     pub stroke_props: StrokeProps,
@@ -281,6 +371,9 @@ impl Default for GraphicsState {
             ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             stroke_color: Color::black(),
             fill_color: Color::black(),
+            blend_mode: BlendMode::default(),
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
             stroke_props: StrokeProps::default(),
             text_rendering_mode: TextRenderingMode::default(),
             text_leading: 0.0,
@@ -443,5 +536,25 @@ mod tests {
         assert_eq!(props.miter_limit, 10.0);
         assert!(props.dash_array.is_empty());
         assert_eq!(props.dash_offset, 0.0);
+    }
+
+    #[cfg(feature = "rendering")]
+    #[test]
+    fn test_cmyk_to_rgb_icc() {
+        assert_eq!(Color::CMYK(0.0, 0.0, 0.0, 0.0).rgba(), (255, 255, 255, 255));
+        assert_eq!(Color::CMYK(0.0, 0.0, 0.0, 1.0).rgba(), (35, 31, 32, 255));
+        assert_eq!(Color::CMYK(1.0, 0.0, 0.0, 0.0).rgba(), (0, 174, 239, 255));
+        assert_eq!(Color::CMYK(0.0, 1.0, 0.0, 0.0).rgba(), (236, 0, 140, 255));
+        assert_eq!(Color::CMYK(0.0, 0.0, 1.0, 0.0).rgba(), (255, 234, 0, 255));
+    }
+
+    #[cfg(not(feature = "rendering"))]
+    #[test]
+    fn test_cmyk_to_rgb_polynomial() {
+        assert_eq!(Color::CMYK(0.0, 0.0, 0.0, 0.0).rgba(), (255, 255, 255, 255));
+        assert_eq!(Color::CMYK(0.0, 0.0, 0.0, 1.0).rgba(), (43, 46, 52, 255));
+        assert_eq!(Color::CMYK(1.0, 0.0, 0.0, 0.0).rgba(), (0, 184, 241, 255));
+        assert_eq!(Color::CMYK(0.0, 1.0, 0.0, 0.0).rgba(), (251, 48, 153, 255));
+        assert_eq!(Color::CMYK(0.0, 0.0, 1.0, 0.0).rgba(), (255, 234, 61, 255));
     }
 }

@@ -120,7 +120,8 @@ fn test_create_and_render_colored_pdf() {
     pixmap.fill(tiny_skia::Color::WHITE);
 
     // Create rendering device
-    let mut device = pdf_x_core::rendering::SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache = pdf_x_device_tinyskia::FontCache::new();
+    let mut device = pdf_x_device_tinyskia::SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
 
     // Apply coordinate transform (PDF Y-up to screen Y-down)
     device.set_matrix(&[
@@ -135,7 +136,7 @@ fn test_create_and_render_colored_pdf() {
 
     // Render the page
     println!("DEBUG: Starting page render...");
-    match page.render(&mut doc.xref_mut(), &mut device) {
+    match page.render(doc.doc_store_mut(), &mut device) {
         Ok(_) => println!("DEBUG: Page render completed"),
         Err(e) => {
             eprintln!("ERROR: Page render failed: {:?}", e);

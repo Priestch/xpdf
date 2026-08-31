@@ -11,6 +11,7 @@
 //! 2. Complete image decoding (feature-gated) - full image data when requested
 
 use super::error::{PDFError, PDFResult};
+use std::num::NonZeroU32;
 
 /// Image format types supported by PDF-X.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +152,15 @@ impl DecodedImage {
 /// Image decoder following hayro's specialized approach.
 pub struct ImageDecoder;
 
+/// PDF-specific options for DCTDecode image streams.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JpegDecodeOptions {
+    /// Number of components expected by the PDF image color space.
+    pub components: Option<u8>,
+    /// DCTDecode DecodeParms /ColorTransform value.
+    pub color_transform: Option<i32>,
+}
+
 impl ImageDecoder {
     /// Detect image format from data header
     pub fn detect_format(data: &[u8]) -> ImageFormat {
@@ -181,6 +191,16 @@ impl ImageDecoder {
                 feature: "Unknown image format".to_string()
             }),
         }
+    }
+
+    /// Decode a PDF DCTDecode stream while honoring image dictionary context.
+    ///
+    /// PDF stores the actual color interpretation outside the JPEG stream. This follows
+    /// hayro's DCT filter strategy: choose the JPEG decoder output color space from the
+    /// stream input space, DecodeParms /ColorTransform, and the PDF color-space component
+    /// count instead of always forcing RGB.
+    pub fn decode_pdf_jpeg(data: &[u8], options: JpegDecodeOptions) -> PDFResult<DecodedImage> {
+        Self::decode_jpeg_with_options(data, options)
     }
 
     /// Decode raw image data (for FlateDecode and uncompressed images)
@@ -276,6 +296,13 @@ impl ImageDecoder {
 
     /// Decode JPEG image using zune-jpeg (hayro's approach)
     fn decode_jpeg(data: &[u8]) -> PDFResult<DecodedImage> {
+        Self::decode_jpeg_with_options(data, JpegDecodeOptions::default())
+    }
+
+    fn decode_jpeg_with_options(
+        data: &[u8],
+        jpeg_options: JpegDecodeOptions,
+    ) -> PDFResult<DecodedImage> {
         #[cfg(feature = "jpeg-decoding")]
         {
             use std::io::Cursor;
@@ -300,14 +327,25 @@ impl ImageDecoder {
 
             let width = info.width as u32;
             let height = info.height as u32;
+            let input_color_space = decoder.input_colorspace().unwrap_or(ColorSpace::RGB);
+            let out_color_space =
+                jpeg_output_color_space(input_color_space, jpeg_options, info.components);
+            decoder.set_options(
+                DecoderOptions::default()
+                    .jpeg_set_out_colorspace(out_color_space)
+                    .set_max_width(u16::MAX as usize)
+                    .set_max_height(u16::MAX as usize),
+            );
 
             // Decode full image
-            let decoded_data = decoder
+            let mut decoded_data = decoder
                 .decode()
                 .map_err(|e| PDFError::Generic(format!("JPEG decode error: {:?}", e)))?;
+            if out_color_space == ColorSpace::YCCK {
+                convert_ycck_to_cmyk(&mut decoded_data);
+            }
 
             let channels = decoded_data.len() / (width as usize * height as usize);
-            let color_space = decoder.input_colorspace().unwrap_or(ColorSpace::RGB);
 
             let metadata = ImageMetadata {
                 name: "JPEG".to_string(),
@@ -315,7 +353,7 @@ impl ImageDecoder {
                 width,
                 height,
                 bits_per_component: 8,
-                color_space: format!("{:?}", color_space),
+                color_space: format!("{:?}", out_color_space),
                 has_alpha: channels == 4 || channels == 2,
                 data_length: Some(data.len()),
             };
@@ -363,13 +401,16 @@ impl ImageDecoder {
         }
     }
 
-    /// Decode JBIG2 image using hayro-jbig2
+    /// Decode a standalone JBIG2 file (with file header) via hayro-jbig2.
+    ///
+    /// PDF-embedded bare streams with `/JBIG2Globals` are handled by the
+    /// rendering path (`context::decode_jbig2` → hayro-syntax), which has
+    /// access to Width/Height and DecodeParms.
+    ///
+    /// Source: hayro-jbig2 (ITU-T T.88 standalone files).
     #[cfg(feature = "advanced-image-formats")]
     fn decode_jbig2(data: &[u8]) -> PDFResult<DecodedImage> {
-        use hayro_jbig2::decode;
-
-        // Try to decode the image
-        match decode(data) {
+        match hayro_jbig2::decode(data) {
             Ok(image) => {
                 let metadata = ImageMetadata {
                     name: "JBIG2".to_string(),
@@ -382,16 +423,18 @@ impl ImageDecoder {
                     data_length: Some(data.len()),
                 };
 
-                // Convert bool array to bytes (1 bit per pixel)
-                let mut pixel_data = Vec::new();
-                for chunk in image.data.chunks(8) {
-                    let mut byte = 0u8;
-                    for (i, &pixel) in chunk.iter().enumerate() {
-                        if pixel {
-                            byte |= 1 << (7 - i);
+                // DeviceGray: bit 0 = black, bit 1 = white. hayro-jbig2 true=black.
+                let width = image.width as usize;
+                let height = image.height as usize;
+                let row_bytes = (width + 7) / 8;
+                let mut pixel_data = vec![0u8; row_bytes * height];
+                for y in 0..height {
+                    for x in 0..width {
+                        let i = y * width + x;
+                        if i < image.data.len() && !image.data[i] {
+                            pixel_data[y * row_bytes + x / 8] |= 1 << (7 - (x % 8));
                         }
                     }
-                    pixel_data.push(byte);
                 }
 
                 Ok(DecodedImage::new(metadata, pixel_data, 1))
@@ -443,6 +486,64 @@ impl ImageDecoder {
         Err(PDFError::Unsupported {
             feature: "PNG decoding not enabled. Enable the 'jpeg-decoding' feature.".to_string(),
         })
+    }
+}
+
+#[cfg(feature = "jpeg-decoding")]
+fn jpeg_output_color_space(
+    input_color_space: zune_jpeg::zune_core::colorspace::ColorSpace,
+    options: JpegDecodeOptions,
+    jpeg_components: u8,
+) -> zune_jpeg::zune_core::colorspace::ColorSpace {
+    use zune_jpeg::zune_core::colorspace::ColorSpace;
+
+    if let Some(components) = options.components {
+        if !matches!(components, 1 | 3 | 4) {
+            if let Some(n) = NonZeroU32::new(components as u32) {
+                return ColorSpace::MultiBand(n);
+            }
+        }
+    }
+
+    let mut out = match input_color_space {
+        ColorSpace::YCbCr => {
+            if options.color_transform.is_some_and(|c| c == 0) {
+                ColorSpace::YCbCr
+            } else {
+                ColorSpace::RGB
+            }
+        }
+        ColorSpace::RGB | ColorSpace::RGBA => ColorSpace::RGB,
+        ColorSpace::Luma | ColorSpace::LumaA => ColorSpace::Luma,
+        ColorSpace::CMYK => ColorSpace::CMYK,
+        ColorSpace::YCCK => ColorSpace::YCCK,
+        _ => ColorSpace::RGB,
+    };
+
+    // APP14 CMYK marker can be present on 3-component JPEGs; zune/hayro treat
+    // those as RGB after reading headers.
+    if input_color_space == ColorSpace::CMYK && jpeg_components == 3 {
+        out = ColorSpace::RGB;
+    }
+
+    out
+}
+
+/// Convert YCCK output into CMYK samples.
+///
+/// Reference: hayro-syntax/src/filter/dct.rs, which mirrors pdf.js jpg.js.
+#[cfg(feature = "jpeg-decoding")]
+fn convert_ycck_to_cmyk(data: &mut [u8]) {
+    for c in data.chunks_mut(4) {
+        if c.len() < 4 {
+            continue;
+        }
+        let y = c[0] as f32;
+        let cb = c[1] as f32;
+        let cr = c[2] as f32;
+        c[0] = (434.456 - y - 1.402 * cr).clamp(0.0, 255.0) as u8;
+        c[1] = (119.541 - y + 0.344 * cb + 0.714 * cr).clamp(0.0, 255.0) as u8;
+        c[2] = (481.816 - y - 1.772 * cb).clamp(0.0, 255.0) as u8;
     }
 }
 

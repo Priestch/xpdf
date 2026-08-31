@@ -17,6 +17,7 @@ use crate::core::encoding::Encoding;
 use crate::core::error::{PDFError, PDFResult};
 use crate::core::parser::PDFObject;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 /// PDF font type enumeration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,8 @@ pub enum FontType {
     CIDFontType0,
     /// CID TrueType font
     CIDFontType2,
+    /// Type0 composite font (wraps a CID font via /DescendantFonts)
+    Type0,
     /// Unknown font type
     Unknown,
 }
@@ -45,6 +48,7 @@ impl FontType {
             "Type1C" => FontType::Type1C,
             "TrueType" => FontType::TrueType,
             "Type3" => FontType::Type3,
+            "Type0" => FontType::Type0,
             "CIDFontType0" => FontType::CIDFontType0,
             "CIDFontType2" => FontType::CIDFontType2,
             _ => FontType::Unknown,
@@ -52,8 +56,12 @@ impl FontType {
     }
 
     /// Returns true if this is a CID font (multi-byte character IDs).
+    /// Type0 is a composite font that always uses a CIDFont descendant.
     pub fn is_cid_font(&self) -> bool {
-        matches!(self, FontType::CIDFontType0 | FontType::CIDFontType2)
+        matches!(
+            self,
+            FontType::Type0 | FontType::CIDFontType0 | FontType::CIDFontType2
+        )
     }
 }
 
@@ -201,35 +209,34 @@ impl Font {
     /// # Arguments
     /// * `font_dict` - The PDF font dictionary object
     /// * `xref` - Cross-reference table for fetching referenced objects
-    pub fn new(font_dict: PDFObject, xref: &mut crate::core::xref::XRef) -> PDFResult<Self> {
+    pub fn new<R: crate::core::page::PageResolver>(
+        font_dict: PDFObject,
+        resolver: &mut R,
+    ) -> PDFResult<Self> {
         let dict = FontDict::from_pdf_object(&font_dict)?;
 
-        // Parse encoding from the font dictionary
         let encoding = if let Some(enc_obj) = &dict.encoding {
-            Encoding::from_pdf_object(enc_obj).unwrap_or(Encoding::Standard) // Default to StandardEncoding
+            let fetched = resolver
+                .resolve_if_ref(enc_obj)
+                .unwrap_or_else(|_| Arc::new(enc_obj.clone()));
+            Encoding::from_pdf_object(&fetched).unwrap_or(Encoding::Standard)
         } else {
-            // No encoding specified - default to StandardEncoding for simple fonts
             Encoding::Standard
         };
 
-        // Parse ToUnicode CMap if present
         let cmap = if let Some(to_unicode_ref) = &dict.to_unicode {
-            match xref.fetch_if_ref(to_unicode_ref)? {
+            match &*resolver.resolve_if_ref(to_unicode_ref)? {
                 PDFObject::Stream {
                     dict: stream_dict,
                     data,
                 } => {
-                    // Decompress the stream
-                    let filter_name = stream_dict.get("Filter").and_then(|f| match f {
-                        PDFObject::Name(name) => Some(name.as_str()),
-                        _ => None,
-                    });
-
-                    let decompressed = decode::decode_stream(&data, filter_name).map_err(|e| {
-                        PDFError::Generic(format!("ToUnicode stream decode error: {}", e))
-                    })?;
-
-                    // Parse CMap
+                    let decompressed = if let Some(filter) = stream_dict.get("Filter") {
+                        decode::apply_filters(&data, filter).map_err(|e| {
+                            PDFError::Generic(format!("ToUnicode stream decode error: {}", e))
+                        })?
+                    } else {
+                        data.to_vec()
+                    };
                     Some(CMap::parse(&decompressed)?)
                 }
                 _ => None,
@@ -238,7 +245,6 @@ impl Font {
             None
         };
 
-        // Build width cache from /Widths array
         let mut width_cache = FxHashMap::default();
         if let (Some(widths), Some(first_char)) = (&dict.widths, dict.first_char) {
             for (i, &width) in widths.iter().enumerate() {
@@ -247,9 +253,8 @@ impl Font {
             }
         }
 
-        // Try to extract embedded font data (CFF or Type1)
         let embedded_font = if let Some(descriptor_ref) = &dict.font_descriptor {
-            Self::extract_embedded_font(descriptor_ref, xref)?
+            Self::extract_embedded_font(descriptor_ref, resolver)?
         } else {
             None
         };
@@ -263,59 +268,53 @@ impl Font {
         })
     }
 
-    /// Extracts embedded font data from the font descriptor.
-    ///
-    /// Looks for:
-    /// - /FontFile (Type1 font program)
-    /// - /FontFile2 (TrueType font program)
-    /// - /FontFile3 (CFF or OpenType font program)
-    fn extract_embedded_font(
+    fn extract_embedded_font<R: crate::core::page::PageResolver>(
         descriptor_ref: &PDFObject,
-        xref: &mut crate::core::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Option<Vec<u8>>> {
-        let descriptor = xref.fetch_if_ref(descriptor_ref)?;
+        let descriptor = resolver.resolve_if_ref(descriptor_ref)?;
 
-        let descriptor_dict = match descriptor {
-            PDFObject::Dictionary(d) => d,
+        let descriptor_dict = match &*descriptor {
+            PDFObject::Dictionary(d) => d.clone(),
             _ => return Ok(None),
         };
 
-        // Try FontFile3 first (CFF)
         if let Some(font_file3_ref) = descriptor_dict.get("FontFile3") {
-            return Self::extract_font_stream(font_file3_ref, xref);
+            return Self::extract_font_stream(font_file3_ref, resolver);
         }
 
-        // Try FontFile (Type1)
         if let Some(font_file_ref) = descriptor_dict.get("FontFile") {
-            return Self::extract_font_stream(font_file_ref, xref);
+            return Self::extract_font_stream(font_file_ref, resolver);
         }
 
-        // Try FontFile2 (TrueType) - not supported yet
         if descriptor_dict.contains_key("FontFile2") {
-            // TrueType fonts would need ttf-parser, which we're not using yet
             return Ok(None);
         }
 
         Ok(None)
     }
 
-    /// Extracts font data from a font file stream.
-    fn extract_font_stream(
+    fn extract_font_stream<R: crate::core::page::PageResolver>(
         stream_ref: &PDFObject,
-        xref: &mut crate::core::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Option<Vec<u8>>> {
-        let stream_obj = xref.fetch_if_ref(stream_ref)?;
+        let stream_obj = resolver.resolve_if_ref(stream_ref)?;
 
-        match stream_obj {
+        match &*stream_obj {
             PDFObject::Stream { dict, data } => {
-                // Decompress the stream
-                let filter_name = dict.get("Filter").and_then(|f| match f {
-                    PDFObject::Name(name) => Some(name.as_str()),
-                    _ => None,
-                });
-
-                let decompressed = decode::decode_stream(&data, filter_name)
-                    .map_err(|e| PDFError::Generic(format!("Font stream decode error: {}", e)))?;
+                // Use apply_filters (not decode_stream): FontFile streams commonly
+                // use /ASCIIHexDecode, /ASCII85Decode, filter arrays, etc.
+                // decode_stream only handles a bare FlateDecode name and rejects
+                // everything else as "Unsupported filter" — which broke extract
+                // for many Type1 embeddings (ASCIIHex FontFile).
+                // Source: same path as ToUnicode / page content decoding.
+                let decompressed = if let Some(filter) = dict.get("Filter") {
+                    decode::apply_filters(data, filter).map_err(|e| {
+                        PDFError::Generic(format!("Font stream decode error: {}", e))
+                    })?
+                } else {
+                    data.clone()
+                };
 
                 Ok(Some(decompressed))
             }

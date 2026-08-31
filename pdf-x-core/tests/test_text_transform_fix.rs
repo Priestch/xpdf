@@ -12,25 +12,26 @@
 #[cfg(test)]
 mod text_transform_tests {
     use pdf_x_core::rendering::device::Device;
-    use pdf_x_core::rendering::skia_device::SkiaDevice;
     use pdf_x_core::rendering::{Color, Paint};
+    use pdf_x_device_tinyskia::SkiaDevice;
     use tiny_skia::{Pixmap, Transform};
 
     #[test]
     fn test_text_transform_stays_on_screen() {
         // Create a 500x500 canvas
         let mut pixmap = Pixmap::new(500, 500).unwrap();
-        let mut device = SkiaDevice::new(pixmap.as_mut());
+        let mut font_cache_device_1 = std::collections::HashMap::new();
+        let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
 
         // Set up a typical PDF CTM that flips Y-axis
         // PDF: origin at bottom-left, Y increases upward
         // Device: origin at top-left, Y increases downward
         let ctm = [
-            1.5,  // sx
-            0.0,  // kx
-            0.0,  // ky
-            -1.5, // sy (negative to flip Y)
-            0.0,  // tx
+            1.5,   // sx
+            0.0,   // kx
+            0.0,   // ky
+            -1.5,  // sy (negative to flip Y)
+            0.0,   // tx
             500.0, // ty (page height)
         ];
         device.concat_matrix(&ctm);
@@ -104,7 +105,10 @@ mod text_transform_tests {
             expected_y
         );
 
-        println!("✅ Text transform fix verified: Y={} (on-screen)", adjusted_ty);
+        println!(
+            "✅ Text transform fix verified: Y={} (on-screen)",
+            adjusted_ty
+        );
     }
 
     #[test]

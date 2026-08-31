@@ -55,34 +55,32 @@ fn debug_issue7200_transform() {
     println!("\nResources found: {}", page.resources().is_some());
     if let Some(resources) = page.resources() {
         // Try to fetch the resources if it's a reference
-        let resources_res = page.fetch_if_ref(resources, &mut doc.xref_mut());
+        let resources_res = doc.doc_store_mut().resolve_if_ref(resources);
         println!("Resources (after fetch): {:?}", resources_res.is_ok());
 
-        let res = resources_res.unwrap_or(resources.clone());
-        match &res {
+        let res = resources_res.unwrap_or_else(|_| std::sync::Arc::new(resources.clone()));
+        match res.as_ref() {
             pdf_x_core::PDFObject::Dictionary(res_dict) => {
                 let keys: Vec<_> = res_dict.keys().collect();
                 println!("Resource dict keys: {:?}", keys);
 
                 if let Some(xobject) = res_dict.get("XObject") {
                     println!("XObject found: {:?}", xobject);
-                    if let Ok(xobj_dict) = page.fetch_if_ref(xobject, &mut doc.xref_mut()) {
+                    if let Ok(xobj_dict) = doc.doc_store_mut().resolve_if_ref(xobject) {
                         println!(
                             "XObject dict type: {:?}",
-                            std::mem::discriminant(&xobj_dict)
+                            std::mem::discriminant(xobj_dict.as_ref())
                         );
-                        match &xobj_dict {
+                        match xobj_dict.as_ref() {
                             pdf_x_core::PDFObject::Dictionary(xobj) => {
                                 println!("\n=== XObject Analysis ===");
 
                                 for (name, obj) in xobj.iter() {
                                     println!("\nXObject: {}", name);
 
-                                    if let Ok(xobj_data) =
-                                        page.fetch_if_ref(obj, &mut doc.xref_mut())
-                                    {
+                                    if let Ok(xobj_data) = doc.doc_store_mut().resolve_if_ref(obj) {
                                         if let pdf_x_core::PDFObject::Stream { dict, .. } =
-                                            &xobj_data
+                                            xobj_data.as_ref()
                                         {
                                             // Get Subtype
                                             if let Some(subtype) = dict.get("Subtype") {
@@ -199,8 +197,8 @@ fn debug_issue7200_transform() {
     // Check content stream for transforms
     println!("\n=== Content Stream Analysis ===");
     if let Some(contents) = page.contents() {
-        if let Ok(content_data) = page.fetch_if_ref(contents, &mut doc.xref_mut()) {
-            if let pdf_x_core::PDFObject::Stream { dict, data } = &content_data {
+        if let Ok(content_data) = doc.doc_store_mut().resolve_if_ref(contents) {
+            if let pdf_x_core::PDFObject::Stream { dict, data } = content_data.as_ref() {
                 // Decode if needed
                 let decoded = if let Some(_filter) = dict.get("Filter") {
                     // For now, just try to decode

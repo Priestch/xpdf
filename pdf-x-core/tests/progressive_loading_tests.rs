@@ -4,10 +4,10 @@
 //! Based on PDF.js's fetch_stream_spec.js and common_pdfstream_tests.js
 
 use pdf_x_core::core::base_stream::BaseStream;
-use pdf_x_core::core::file_chunked_stream::FileChunkedStream;
 use pdf_x_core::core::stream::Stream;
 use pdf_x_core::core::*;
 use pdf_x_core::retry_on_data_missing;
+use pdf_x_source_file::FileChunkedStream;
 
 #[test]
 fn test_chunk_caching_behavior() {
@@ -218,7 +218,7 @@ fn test_pdf_open_with_progressive_loading() {
     use pdf_x_core::core::PDFDocument;
 
     // Open with small chunks to simulate network loading
-    let result = PDFDocument::open_file(
+    let result = pdf_x_source_file::open_file(
         test_pdf,
         Some(2048), // 2KB chunks
         Some(3),    // Cache 3 chunks
@@ -248,7 +248,8 @@ fn test_lazy_page_loading() {
 
     use pdf_x_core::core::PDFDocument;
 
-    let mut doc = PDFDocument::open_file(test_pdf, Some(4096), Some(3)).expect("Should open PDF");
+    let mut doc =
+        pdf_x_source_file::open_file(test_pdf, Some(4096), Some(3)).expect("Should open PDF");
 
     // Get page count without loading page contents
     let page_count = doc.page_count().expect("Should get page count");
@@ -271,7 +272,7 @@ fn test_xref_stream_parsing() {
 
     use pdf_x_core::core::PDFDocument;
 
-    let result = PDFDocument::open_file(test_pdf, Some(4096), Some(3));
+    let result = pdf_x_source_file::open_file(test_pdf, Some(4096), Some(3));
 
     assert!(result.is_ok(), "Should open PDF with XRef stream");
 }
@@ -288,7 +289,7 @@ fn test_incremental_updates_parsing() {
 
     use pdf_x_core::core::PDFDocument;
 
-    let result = PDFDocument::open_file(test_pdf, Some(4096), Some(5));
+    let result = pdf_x_source_file::open_file(test_pdf, Some(4096), Some(5));
 
     assert!(result.is_ok(), "Should open PDF with incremental updates");
 
@@ -314,7 +315,7 @@ fn test_linearized_pdf_loading() {
 
     use pdf_x_core::core::PDFDocument;
 
-    let result = PDFDocument::open_file(test_pdf, Some(4096), Some(5));
+    let result = pdf_x_source_file::open_file(test_pdf, Some(4096), Some(5));
 
     assert!(result.is_ok(), "Should open linearized PDF");
 

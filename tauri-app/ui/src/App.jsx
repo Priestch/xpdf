@@ -9,7 +9,7 @@ function App() {
   const [metadata, setMetadata] = useState(null);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [viewMode, setViewMode] = useState('inspector'); // 'inspector' or 'viewer'
+  const [viewMode, setViewMode] = useState('viewer'); // default: page viewer
 
   const handleOpenFile = async () => {
     try {
@@ -34,8 +34,8 @@ function App() {
       console.log('Metadata:', meta);
       setMetadata(meta);
 
-      // Reset to inspector mode when opening new file
-      setViewMode('inspector');
+      // Open into the page viewer so the first page is visible immediately.
+      setViewMode('viewer');
     } catch (err) {
       console.error('Error:', err);
       setError(err.toString());

@@ -1,10 +1,11 @@
 use pdf_x_core::PDFDocument;
+use pdf_x_device_tinyskia::RenderToImage;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pdf_path = "/home/gp/Books/Automate the Boring Stuff with Python, 3rd Edition.pdf";
 
     println!("Loading PDF: {}", pdf_path);
-    let mut doc = PDFDocument::open_file(pdf_path, None, None)?;
+    let mut doc = pdf_x_source_file::open_file(pdf_path, None, None)?;
     println!("PDF loaded successfully");
     println!("Number of pages: {}", doc.page_count()?);
 

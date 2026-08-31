@@ -1,0 +1,13 @@
+[package]
+name = "pdf-x-source-file"
+description = "Native filesystem byte source for PDF-X (chunked, progressive, shell-owned I/O)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pdf-x-core = { path = "../pdf-x-core" }
+
+[dev-dependencies]
+tempfile = "3"

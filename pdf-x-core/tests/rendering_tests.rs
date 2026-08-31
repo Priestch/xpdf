@@ -7,7 +7,7 @@ use pdf_x_core::rendering::graphics_state::{Color, FillRule, StrokeProps};
 use pdf_x_core::rendering::{Device, Paint, PathDrawMode, TestDevice};
 
 #[cfg(feature = "rendering")]
-use pdf_x_core::rendering::skia_device::SkiaDevice;
+use pdf_x_device_tinyskia::{FontCache, SkiaDevice};
 
 #[cfg(feature = "rendering")]
 use tiny_skia::Pixmap;
@@ -250,6 +250,10 @@ fn test_draw_text() {
             12.0,
             &paint,
             &[1.0, 0.0, 0.0, 1.0, 100.0, 700.0],
+            100.0,
+            0.0,
+            0.0,
+            0.0,
         )
         .unwrap();
 
@@ -269,6 +273,10 @@ fn test_draw_multiple_text_objects() {
             12.0,
             &paint,
             &[1.0, 0.0, 0.0, 1.0, 100.0, 700.0],
+            100.0,
+            0.0,
+            0.0,
+            0.0,
         )
         .unwrap();
     device
@@ -278,6 +286,10 @@ fn test_draw_multiple_text_objects() {
             14.0,
             &paint,
             &[1.0, 0.0, 0.0, 1.0, 100.0, 680.0],
+            100.0,
+            0.0,
+            0.0,
+            0.0,
         )
         .unwrap();
 
@@ -476,6 +488,11 @@ fn test_draw_image() {
         data: pixel_data,
         has_alpha: true,
         bits_per_component: 8,
+        original_bits_per_component: 8,
+        is_mask: false,
+        mask_paint_one: true,
+        mask_color: [0, 0, 0],
+        interpolate: false,
     };
 
     let transform = [10.0, 0.0, 0.0, 10.0, 0.0, 0.0];
@@ -496,7 +513,8 @@ fn test_draw_image() {
 #[test]
 fn test_skia_draw_rectangle() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache = FontCache::new();
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
 
     device.begin_path();
     device.rect(10.0, 10.0, 80.0, 80.0);
@@ -518,7 +536,8 @@ fn test_skia_draw_rectangle() {
 #[test]
 fn test_skia_draw_path() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache = FontCache::new();
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
 
     device.begin_path();
     device.move_to(10.0, 10.0);
@@ -540,7 +559,8 @@ fn test_skia_draw_path() {
 #[test]
 fn test_skia_transformations() {
     let mut pixmap = Pixmap::new(100, 100).unwrap();
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache = FontCache::new();
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
 
     device.save_state();
     device.concat_matrix(&[0.5, 0.0, 0.0, 0.5, 25.0, 25.0]);
@@ -578,4 +598,64 @@ fn test_a4_page_bounds() {
     let (width, height) = device.page_bounds();
     assert_eq!(width, 595.0);
     assert_eq!(height, 842.0);
+}
+
+// ============================================================================
+// Parallel Rendering Tests
+// ============================================================================
+
+#[cfg(feature = "rendering")]
+mod parallel {
+    use pdf_x_core::core::PDFDocument;
+    use pdf_x_device_tinyskia::RenderToImage;
+    use std::path::PathBuf;
+
+    fn fixtures_dir() -> PathBuf {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .parent()
+            .expect("pdf-x-core has a parent workspace dir")
+            .join("tests")
+            .join("fixtures")
+    }
+
+    /// Parallel render of the same page twice must produce byte-identical output
+    /// to the sequential render — verifies `Arc<ResolvedPage>` + `interpret` are
+    /// safe to run on multiple threads with no shared mutable state.
+    #[test]
+    fn parallel_matches_sequential() {
+        let path = fixtures_dir().join("pdfs").join("tracemonkey.pdf");
+        let bytes = std::fs::read(&path).expect("fixture should exist");
+        let mut doc = PDFDocument::open(bytes).expect("pdf should open");
+
+        // Sequential render of page 0 (twice, to warm the LRU cache so both paths
+        // hit the same Arc<ResolvedPage> snapshot).
+        let seq0 = doc
+            .render_page_to_image(0, Some(1.0))
+            .expect("seq render p0");
+        let seq1 = doc
+            .render_page_to_image(0, Some(1.0))
+            .expect("seq render p0 again");
+
+        // Parallel render of page 0 twice.
+        let par = doc.render_pages_to_images(&[0, 0], Some(1.0));
+        assert_eq!(par.len(), 2, "should return one result per input index");
+        let par0 = par[0].as_ref().expect("parallel render p0 (first)");
+        let par1 = par[1].as_ref().expect("parallel render p0 (second)");
+
+        // Dimensions match.
+        assert_eq!(par0.0, seq0.0, "width: parallel vs sequential");
+        assert_eq!(par0.1, seq0.1, "height: parallel vs sequential");
+
+        // Byte-identical pixels (the LRU cache returns the same Arc<ResolvedPage> to
+        // both threads, so interpret runs over the exact same snapshot).
+        assert_eq!(
+            par0.2, seq0.2,
+            "pixels: parallel render must match sequential"
+        );
+        assert_eq!(
+            par1.2, seq1.2,
+            "pixels: second parallel slot must match too"
+        );
+    }
 }

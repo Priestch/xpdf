@@ -1,6 +1,9 @@
+use super::content_stream::TextItem;
 use super::error::{PDFError, PDFResult};
 use super::parser::PDFObject;
+use super::{ContentStreamEvaluator, Lexer, Stream};
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 /// A single page in a PDF document.
 ///
@@ -24,6 +27,49 @@ pub struct Page {
     page_ref: Option<(u32, u32)>, // (obj_num, generation)
 }
 
+/// Object resolver used by the render/extract paths, abstracting over the legacy base-only
+/// path (`&mut XRef`) and the delta-aware path (`&mut DocStore`).
+///
+/// `resolve_if_ref` / `resolve_ref` are delta-aware for `DocStore` (`delta → base`), so all
+/// object fetches — page contents AND nested resources (fonts/xobjects/ext-gstate) — honor
+/// delta overrides. `as_xref_mut` exposes the base `XRef` only for operations not expressed
+/// through the resolver (e.g. stream positioning).
+pub trait PageResolver {
+    /// Resolve `obj` if it is an indirect Reference (delta-aware where supported).
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>>;
+    /// Resolve object `(num, generation)` (delta-aware where supported).
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<Arc<PDFObject>>;
+    /// Base `XRef` for legacy operations not yet migrated to the resolver trait.
+    /// Panics for snapshot-backed resolvers (no live XRef).
+    fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
+        unimplemented!("this resolver has no live XRef")
+    }
+}
+
+impl PageResolver for super::xref::XRef {
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>> {
+        self.fetch_if_ref(obj)
+    }
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
+        self.fetch(num, generation)
+    }
+    fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
+        self
+    }
+}
+
+impl PageResolver for super::doc_store::DocStore {
+    fn resolve_if_ref(&mut self, obj: &PDFObject) -> PDFResult<Arc<PDFObject>> {
+        super::doc_store::DocStore::resolve_if_ref(self, obj)
+    }
+    fn resolve_ref(&mut self, num: u32, generation: u32) -> PDFResult<Arc<PDFObject>> {
+        super::doc_store::DocStore::resolve_ref(self, num, generation)
+    }
+    fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
+        super::doc_store::DocStore::xref_mut(self)
+    }
+}
+
 impl Page {
     /// Creates a new Page from a page dictionary.
     ///
@@ -31,10 +77,14 @@ impl Page {
     /// * `page_index` - The 0-based index of this page in the document
     /// * `page_dict` - The page dictionary object
     /// * `page_ref` - Optional indirect reference (obj_num, generation) for this page
-    pub fn new(page_index: usize, page_dict: PDFObject, page_ref: Option<(u32, u32)>) -> Self {
+    pub(crate) fn new(
+        page_index: usize,
+        page_dict: Arc<PDFObject>,
+        page_ref: Option<(u32, u32)>,
+    ) -> Self {
         Page {
             page_index,
-            page_dict,
+            page_dict: (*page_dict).clone(),
             page_ref,
         }
     }
@@ -100,15 +150,16 @@ impl Page {
 
     /// Resolve an inheritable page property, merging dictionaries across the page tree.
     /// Reference: pdf.js/src/core/core_utils.js - getInheritableProperty
-    fn get_inheritable_property(
+    fn get_inheritable_property<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         key: &str,
         stop_when_found: bool,
-    ) -> PDFResult<Option<PDFObject>> {
+    ) -> PDFResult<Option<Arc<PDFObject>>> {
         let mut current = self.page_dict.clone();
-        let mut visited_refs: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
-        let mut values: Vec<PDFObject> = Vec::new();
+        let mut visited_refs: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::new();
+        let mut values: Vec<Arc<PDFObject>> = Vec::new();
 
         loop {
             let dict = match &current {
@@ -117,7 +168,7 @@ impl Page {
             };
 
             if let Some(value) = dict.get(key) {
-                let resolved = xref.fetch_if_ref(value)?;
+                let resolved = resolver.resolve_if_ref(value)?;
                 if stop_when_found {
                     return Ok(Some(resolved));
                 }
@@ -138,7 +189,7 @@ impl Page {
                         ));
                     }
                     visited_refs.insert(ref_key);
-                    let parent_obj = xref.fetch(ref_obj.num, ref_obj.generation)?;
+                    let parent_obj = resolver.resolve_ref(ref_obj.num, ref_obj.generation)?;
                     current = (*parent_obj).clone();
                 }
                 _ => {
@@ -152,13 +203,17 @@ impl Page {
         }
 
         if values.len() == 1 {
-            return Ok(Some(values.remove(0)));
+            return Ok(Some(Arc::clone(&values.remove(0))));
         }
 
-        match values.first() {
-            Some(PDFObject::Dictionary(_)) => Ok(Some(Self::merge_dict_values(values))),
-            Some(first) => Ok(Some(first.clone())),
-            None => Ok(None),
+        // For Dictionary values, merge keys across the inheritance chain. For all
+        // other types (Array, Number, etc.) the closest value wins — mirrors pdf.js
+        // `inherit` behavior for non-dict properties like MediaBox.
+        match &*values[0] {
+            PDFObject::Dictionary(_) => Ok(Some(Arc::new(Self::merge_dict_values(
+                values.into_iter().map(|a| (*a).clone()).collect(),
+            )))),
+            _ => Ok(Some(Arc::clone(&values[0]))),
         }
     }
 
@@ -201,21 +256,21 @@ impl Page {
         Some([min_x, min_y, max_x, max_y])
     }
 
-    pub(crate) fn resolve_view_box_for_rendering(
-        &self,
-        xref: &mut super::xref::XRef,
-    ) -> [f64; 4] {
-        // Reference: pdf.js/src/core/document.js - Page.view
+    /// Resolve the render view box (MediaBox ∩ CropBox) for this page.
+    ///
+    /// Public so a `Device` backend adapter (e.g. `pdf-x-device-tinyskia`) can size
+    /// its raster target without core knowing about any specific backend.
+    pub fn resolve_view_box_for_rendering<R: PageResolver>(&self, resolver: &mut R) -> [f64; 4] {
         let media_box = self
-            .get_inheritable_property(xref, "MediaBox", false)
+            .get_inheritable_property(resolver, "MediaBox", false)
             .ok()
-            .and_then(|value| value.as_ref().and_then(Self::resolve_rect))
+            .and_then(|value| value.as_deref().and_then(Self::resolve_rect))
             .unwrap_or([0.0, 0.0, 612.0, 792.0]);
 
         let crop_box = self
-            .get_inheritable_property(xref, "CropBox", false)
+            .get_inheritable_property(resolver, "CropBox", false)
             .ok()
-            .and_then(|value| value.as_ref().and_then(Self::resolve_rect))
+            .and_then(|value| value.as_deref().and_then(Self::resolve_rect))
             .unwrap_or(media_box);
 
         let intersect = [
@@ -232,15 +287,17 @@ impl Page {
         }
     }
 
-    pub(crate) fn resolve_rotate_for_rendering(&self, xref: &mut super::xref::XRef) -> i32 {
-        // Reference: pdf.js/src/core/document.js - Page.rotate
+    /// Resolve the normalized `/Rotate` for this page. Public for backend adapters.
+    pub fn resolve_rotate_for_rendering<R: PageResolver>(&self, resolver: &mut R) -> i32 {
         let mut rotate = self
-            .get_inheritable_property(xref, "Rotate", false)
+            .get_inheritable_property(resolver, "Rotate", false)
             .ok()
-            .and_then(|value| value.as_ref().and_then(|obj| match obj {
-                PDFObject::Number(n) => Some(*n as i32),
-                _ => None,
-            }))
+            .and_then(|value| {
+                value.as_deref().and_then(|obj| match obj {
+                    PDFObject::Number(n) => Some(*n as i32),
+                    _ => None,
+                })
+            })
             .unwrap_or(0);
 
         if rotate % 90 != 0 {
@@ -254,25 +311,23 @@ impl Page {
         rotate
     }
 
-    pub(crate) fn get_inheritable_resources(
+    pub(crate) fn get_inheritable_resources<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
-    ) -> PDFResult<Option<PDFObject>> {
-        // Reference: pdf.js/src/core/document.js - Page.resources
-        self.get_inheritable_property(xref, "Resources", false)
+        resolver: &mut R,
+    ) -> PDFResult<Option<Arc<PDFObject>>> {
+        self.get_inheritable_property(resolver, "Resources", false)
     }
 
-    fn merge_stream_resources(
+    fn merge_stream_resources<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         stream_resources: Option<&PDFObject>,
-        page_resources: &Option<PDFObject>,
+        page_resources: &Option<Arc<PDFObject>>,
     ) -> PDFResult<Option<PDFObject>> {
-        // Reference: pdf.js/src/core/document.js - #getMergedResources
         let local_resources = match stream_resources {
-            Some(value) => match xref.fetch_if_ref(value)? {
+            Some(value) => match &*resolver.resolve_if_ref(value)? {
                 PDFObject::Dictionary(dict) if !dict.is_empty() => {
-                    Some(PDFObject::Dictionary(dict))
+                    Some(PDFObject::Dictionary(dict.clone()))
                 }
                 _ => None,
             },
@@ -281,19 +336,19 @@ impl Page {
 
         match (local_resources, page_resources) {
             (Some(local), Some(page)) => {
-                let merged = Self::merge_dict_values(vec![local, page.clone()]);
+                let merged = Self::merge_dict_values(vec![local, (**page).clone()]);
                 Ok(Some(merged))
             }
             (Some(local), None) => Ok(Some(local)),
-            (None, Some(page)) => Ok(Some(page.clone())),
+            (None, Some(page)) => Ok(Some((**page).clone())),
             (None, None) => Ok(None),
         }
     }
 
     #[cfg(feature = "rendering")]
-    fn load_fonts_for_rendering_with_resources<D: crate::rendering::Device>(
+    fn load_fonts_for_rendering_with_resources<D: crate::rendering::Device, R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         device: &mut D,
         resources: Option<&PDFObject>,
     ) -> PDFResult<()> {
@@ -312,14 +367,14 @@ impl Page {
             None => return Ok(()),
         };
 
-        let font_dict = match xref.fetch_if_ref(font_entry)? {
-            PDFObject::Dictionary(d) => d,
+        let font_dict = match &*resolver.resolve_if_ref(font_entry)? {
+            PDFObject::Dictionary(d) => d.clone(),
             _ => return Ok(()),
         };
 
         for (font_name, font_ref) in font_dict {
-            if let Ok(font_obj) = xref.fetch_if_ref(&font_ref) {
-                if let Ok(pdf_font) = super::font::Font::new(font_obj, xref) {
+            if let Ok(font_obj) = resolver.resolve_if_ref(&font_ref) {
+                if let Ok(pdf_font) = super::font::Font::new((*font_obj).clone(), resolver) {
                     if let Some(embedded_data) = pdf_font.embedded_font {
                         if let Err(e) = device.load_font_data(&font_name, embedded_data, None) {
                             if !e.to_string().contains("UnknownMagic") {
@@ -329,7 +384,9 @@ impl Page {
                                 );
                             }
                         }
-                    } else if let Some(fallback_data) = Self::get_fallback_font_data(pdf_font.base_font()) {
+                    } else if let Some(fallback_data) =
+                        Self::get_fallback_font_data(pdf_font.base_font())
+                    {
                         if let Err(e) = device.load_font_data(&font_name, fallback_data, None) {
                             eprintln!(
                                 "Warning: Failed to load fallback font for '{}': {}",
@@ -354,22 +411,21 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
     /// let pdf_data = std::fs::read("document.pdf").unwrap();
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
     ///
-    /// let text_items = page.extract_text(&mut doc).unwrap();
+    /// let text_items = page.extract_text(doc.doc_store_mut()).unwrap();
     /// for item in text_items {
     ///     println!("Text: '{}' at {:?}", item.text, item.position);
     /// }
     /// ```
-    pub fn extract_text(
+    pub fn extract_text<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<super::content_stream::TextItem>> {
-        use super::decode::decode_flate;
         use super::{ContentStreamEvaluator, Lexer, Stream};
 
         let contents = match self.contents() {
@@ -377,23 +433,23 @@ impl Page {
             None => return Ok(Vec::new()), // No content streams
         };
 
-        // Dereference if it's a reference
-        let contents = xref.fetch_if_ref(contents)?;
+        // Dereference if it's a reference — delta-aware (delta → base) via the resolver.
+        let contents = resolver.resolve_if_ref(contents)?;
 
         let mut all_text_items = Vec::new();
 
         // Handle single content stream
-        let content_streams = match contents {
+        let content_streams = match &*contents {
             PDFObject::Stream { dict, data } => {
                 vec![(dict.clone(), data.clone())]
             }
             PDFObject::Array(arr) => {
                 // Multiple content streams - fetch each one
                 let mut streams = Vec::new();
-                for content_obj in &arr {
-                    match xref.fetch_if_ref(content_obj)? {
+                for content_obj in arr.iter() {
+                    match &*resolver.resolve_if_ref(content_obj)? {
                         PDFObject::Stream { dict, data } => {
-                            streams.push((dict, data));
+                            streams.push((dict.clone(), data.clone()));
                         }
                         _ => {
                             return Err(super::PDFError::Generic(
@@ -412,42 +468,178 @@ impl Page {
             }
         };
 
-        // Process each content stream
+        // Concatenate decoded content streams BEFORE parsing. Real PDFs (e.g.
+        // font_truetype_slow_post_lookup.pdf) split /Contents mid-operator/mid-BT
+        // so each fragment is not a self-contained program. pdf.js / ResolvedPage
+        // concatenate first; parsing streams independently aborts with
+        // "ended with operands but no operator".
+        // Source: ResolvedPage::resolve_contents, pdf.js Page.getOperatorList.
+        let mut concatenated = Vec::new();
         for (dict, data) in content_streams {
-            // Decode the stream if it's compressed
             let decoded_data = if let Some(filter) = dict.get("Filter") {
-                match filter {
-                    PDFObject::Name(filter_name) if filter_name == "FlateDecode" => {
-                        // Decompress FlateDecode stream
-                        match decode_flate(&data) {
-                            Ok(decompressed) => decompressed,
-                            Err(_) => continue, // Skip this stream if decompression fails
-                        }
-                    }
-                    _ => data, // Other filters not yet supported, use raw data
+                match super::decode::apply_filters(&data, filter) {
+                    Ok(decoded) => decoded,
+                    Err(_) => continue, // Skip this stream if decoding fails
                 }
             } else {
-                data // No filter, use raw data
+                data
             };
+            if !concatenated.is_empty() && !concatenated.ends_with(b"\n") {
+                concatenated.push(b'\n');
+            }
+            concatenated.extend(decoded_data);
+        }
 
+        if !concatenated.is_empty() {
             // Create a stream from the (decoded) content data
-            let stream = Box::new(Stream::from_bytes(decoded_data)) as Box<dyn super::BaseStream>;
+            let stream = Box::new(Stream::from_bytes(concatenated)) as Box<dyn super::BaseStream>;
             let lexer = Lexer::new(stream)?;
             let parser = super::Parser::new(lexer)?;
             let mut evaluator = ContentStreamEvaluator::new(parser);
 
-            // Load fonts from page resources (for proper character encoding)
-            if let Some(resources) = self.resources() {
+            // Load fonts from page resources (for proper character encoding).
+            // Use get_inheritable_resources so /Resources as a Ref is fetched and
+            // inherited resources from parent Pages nodes are honored — the render
+            // path does the same. The previous self.resources() returned a raw Ref
+            // which load_fonts skipped (not a Dictionary), so NO fonts were loaded
+            // for any page with /Resources as an indirect object.
+            let page_resources = self.get_inheritable_resources(resolver)?;
+            if let Some(resources) = page_resources {
                 // Ignore font loading errors - text extraction will still work with fallback encoding
-                let _ = evaluator.load_fonts(resources, xref);
+                let _ = evaluator.load_fonts(&resources, resolver.as_xref_mut());
             }
 
-            // Extract text from this stream
+            // Extract text from the concatenated page content
             let text_items = evaluator.extract_text()?;
             all_text_items.extend(text_items);
+
+            // Recurse into Form XObjects referenced by `Do` — text inside Form
+            // XObjects must be extracted too (many PDFs put body text in Form
+            // XObjects, e.g. TAMReview.pdf).
+            let form_names = evaluator.take_form_xobject_names();
+            if !form_names.is_empty() {
+                let resources = self.get_inheritable_resources(resolver)?;
+                for name in form_names {
+                    if let Some(ref res) = resources {
+                        if let Err(e) = self.extract_text_from_form_xobject(
+                            &name,
+                            res,
+                            resolver,
+                            &mut all_text_items,
+                            0,
+                        ) {
+                            eprintln!(
+                                "Warning: Form XObject '{}' text extraction failed: {:?}",
+                                name, e
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         Ok(all_text_items)
+    }
+
+    /// Maximum recursion depth for nested Form XObjects (prevent infinite loops).
+    const FORM_XOBJECT_MAX_DEPTH: u8 = 16;
+
+    /// Recursively extract text from a Form XObject referenced by name in the
+    /// given resources. Mirrors `RenderingContext::paint_form_xobject` but for
+    /// text extraction: decodes the form stream, loads its fonts (from the form's
+    /// own /Resources or the inherited page resources), and runs the evaluator.
+    fn extract_text_from_form_xobject<R: PageResolver>(
+        &self,
+        xobject_name: &str,
+        resources: &PDFObject,
+        resolver: &mut R,
+        out: &mut Vec<super::content_stream::TextItem>,
+        depth: u8,
+    ) -> PDFResult<()> {
+        if depth >= Self::FORM_XOBJECT_MAX_DEPTH {
+            return Ok(());
+        }
+
+        let resources_dict = match resources {
+            PDFObject::Dictionary(d) => d,
+            _ => return Ok(()),
+        };
+
+        // Find /XObject in resources and resolve if Ref.
+        let xobject_obj = match resources_dict.get("XObject") {
+            Some(o) => o,
+            None => return Ok(()),
+        };
+        let xobject_dict = match &*resolver.resolve_if_ref(xobject_obj)? {
+            PDFObject::Dictionary(d) => d.clone(),
+            _ => return Ok(()),
+        };
+
+        // Find the named XObject.
+        let xobject_ref = match xobject_dict.get(xobject_name) {
+            Some(o) => o,
+            None => return Ok(()),
+        };
+        let xobject = resolver.resolve_if_ref(xobject_ref)?;
+
+        let (form_dict, form_data) = match &*xobject {
+            PDFObject::Stream { dict, data } => (dict.clone(), data.clone()),
+            _ => return Ok(()),
+        };
+
+        // Only Form XObjects contain text; Image XObjects don't.
+        let is_form = form_dict
+            .get("Subtype")
+            .and_then(|s| match s {
+                PDFObject::Name(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .map(|n| n == "Form")
+            .unwrap_or(false);
+        if !is_form {
+            return Ok(());
+        }
+
+        // Decode the form stream.
+        let decoded_data = if let Some(filter) = form_dict.get("Filter") {
+            match super::decode::apply_filters(&form_data, filter) {
+                Ok(d) => d,
+                Err(_) => return Ok(()),
+            }
+        } else {
+            form_data.clone()
+        };
+
+        let stream = Box::new(Stream::from_bytes(decoded_data)) as Box<dyn super::BaseStream>;
+        let lexer = Lexer::new(stream)?;
+        let parser = super::Parser::new(lexer)?;
+        let mut evaluator = ContentStreamEvaluator::new(parser);
+
+        // Load fonts: Form XObjects may define their own /Resources; otherwise
+        // inherit the page's. Fetch if Ref.
+        let form_resources = if let Some(res_obj) = form_dict.get("Resources") {
+            resolver.resolve_if_ref(res_obj).ok()
+        } else {
+            Some(Arc::new(resources.clone()))
+        };
+        if let Some(ref form_res) = form_resources {
+            let _ = evaluator.load_fonts(form_res, resolver.as_xref_mut());
+        }
+
+        // Extract text from the form's content stream.
+        let text_items = evaluator.extract_text()?;
+        out.extend(text_items);
+
+        // Recurse into nested Form XObjects.
+        let nested_names = evaluator.take_form_xobject_names();
+        for name in nested_names {
+            if let Some(ref form_res) = form_resources {
+                let _ =
+                    self.extract_text_from_form_xobject(&name, form_res, resolver, out, depth + 1);
+            }
+        }
+
+        Ok(())
     }
 
     /// Extracts all text from the page as a single string.
@@ -460,62 +652,296 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
-    /// let mut doc = PDFDocument::open_file("document.pdf", None, None).unwrap();
+    /// let mut doc = pdf_x_source_file::open_file("document.pdf", None, None).unwrap();
     /// let page = doc.get_page(0).unwrap();
     ///
-    /// let text = page.extract_text_as_string(&mut doc.xref_mut()).unwrap();
+    /// let text = page.extract_text_as_string(doc.doc_store_mut()).unwrap();
     /// println!("Page text:\n{}", text);
     /// ```
-    pub fn extract_text_as_string(&self, xref: &mut super::xref::XRef) -> PDFResult<String> {
-        let mut text_items = self.extract_text(xref)?;
+    /// Same as `extract_text` but returns all text as a single string.
+    ///
+    /// This is the method called from the CLI.
+    pub fn extract_text_as_string<R: PageResolver>(&self, resolver: &mut R) -> PDFResult<String> {
+        let text_items = self.extract_text(resolver)?;
 
-        // Sort text items by position (top to bottom, left to right)
-        // Y-axis in PDF goes bottom to top, so we sort by descending Y, then ascending X
-        text_items.sort_by(|a, b| {
-            match (a.position, b.position) {
-                (Some((x1, y1)), Some((x2, y2))) => {
-                    // First sort by Y (descending - top to bottom)
-                    let y_cmp = y2.partial_cmp(&y1).unwrap_or(std::cmp::Ordering::Equal);
-                    if y_cmp != std::cmp::Ordering::Equal {
-                        y_cmp
-                    } else {
-                        // Then sort by X (ascending - left to right)
-                        x1.partial_cmp(&x2).unwrap_or(std::cmp::Ordering::Equal)
+        // Determine line threshold: use the largest font size * 0.5, min 2.0.
+        let line_threshold = text_items
+            .iter()
+            .filter_map(|t| t.font_size)
+            .fold(2.0_f64, |m, fs| m.max(fs * 0.5));
+
+        Ok(Self::decompose_ligatures(&Self::cluster_and_join(
+            text_items,
+            line_threshold,
+        )))
+    }
+
+    /// Replace Unicode ligature codepoints with their ASCII equivalents.
+    /// PDF fonts often encode ﬁ, ﬂ, ﬀ, etc. as single codepoints; pdftotext
+    /// and pdf.js decompose them for plain-text output.
+    fn decompose_ligatures(s: &str) -> String {
+        s.replace('\u{FB00}', "ff")
+            .replace('\u{FB01}', "fi")
+            .replace('\u{FB02}', "fl")
+            .replace('\u{FB03}', "ffi")
+            .replace('\u{FB04}', "ffl")
+            .replace('\u{FB05}', "st")
+            .replace('\u{FB06}', "st")
+    }
+
+    /// Merge hyphenated line breaks: "word-\nword" → "wordword".
+    /// Only when `-` is preceded by a letter and `\n` is followed by a
+    /// lowercase letter (the common hyphenation pattern in English text).
+    fn dehyphenate(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut result = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if i + 2 < chars.len()
+                && chars[i] == '-'
+                && chars[i + 1] == '\n'
+                && chars[i + 2].is_ascii_lowercase()
+                && i > 0
+                && chars[i - 1].is_alphabetic()
+            {
+                i += 2;
+                continue;
+            }
+            result.push(chars[i]);
+            i += 1;
+        }
+        result
+    }
+
+    /// Join pre-clustered lines in per-char mode (running average gap detection).
+    fn join_per_char(lines: &[Vec<&TextItem>], line_threshold: f64) -> String {
+        let mut result = String::new();
+        let mut last_y: Option<f64> = None;
+        let mut last_x: Option<f64> = None;
+        let mut avg_gap: f64 = 0.0;
+        let mut has_avg: bool = false;
+
+        for line in lines {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            for item in line {
+                if let Some(pos) = item.position {
+                    if let Some(prev_y) = last_y {
+                        if (pos.1 - prev_y).abs() > line_threshold {
+                            result.push('\n');
+                            avg_gap = 0.0;
+                            has_avg = false;
+                        } else if let Some(prev_x) = last_x {
+                            let gap = pos.0 - prev_x;
+                            if has_avg {
+                                if gap > avg_gap * 1.35
+                                    && !result.is_empty()
+                                    && !result.ends_with(' ')
+                                {
+                                    result.push(' ');
+                                    has_avg = false;
+                                } else {
+                                    avg_gap = avg_gap * 0.6 + gap * 0.4;
+                                }
+                            } else if gap > 0.0 {
+                                avg_gap = gap;
+                                has_avg = true;
+                            }
+                        }
                     }
+                    last_y = Some(pos.1);
+                    last_x = Some(pos.0);
+                }
+                result.push_str(&item.text);
+            }
+        }
+        result
+    }
+
+    /// Cluster text items by Y proximity, sort each cluster by X, then join.
+    ///
+    /// In multi-column layouts, items from different columns at the same Y end up
+    /// in the same line. We detect large X-gaps within each line and insert newlines
+    /// to separate columns, producing row-major output.
+    fn cluster_and_join(items: Vec<TextItem>, line_threshold: f64) -> String {
+        if items.is_empty() {
+            return String::new();
+        }
+
+        // Y-cluster items into lines by Y proximity, then sort each line by X.
+        let mut sorted: Vec<&TextItem> = items.iter().collect();
+        sorted.sort_by(|a, b| match (a.position, b.position) {
+            (Some((_, y1)), Some((_, y2))) => {
+                y2.partial_cmp(&y1).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+
+        let mut lines: Vec<Vec<&TextItem>> = Vec::new();
+        for item in sorted.into_iter() {
+            let y = item.position.map(|p| p.1);
+            let placed = lines.last_mut().and_then(|line| {
+                line.first()
+                    .and_then(|f| f.position.map(|p| p.1))
+                    .and_then(|first_y| y.map(|iy| (iy - first_y).abs() <= line_threshold))
+            });
+            if placed == Some(true) {
+                lines.last_mut().unwrap().push(item);
+            } else {
+                lines.push(vec![item]);
+            }
+        }
+        for line in &mut lines {
+            line.sort_by(|a, b| match (a.position, b.position) {
+                (Some((x1, _)), Some((x2, _))) => {
+                    x1.partial_cmp(&x2).unwrap_or(std::cmp::Ordering::Equal)
                 }
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => std::cmp::Ordering::Equal,
-            }
-        });
+            });
+        }
 
-        // Group text items into lines based on Y position
-        let mut result = String::new();
-        let mut last_y: Option<f64> = None;
-        let line_threshold = 2.0; // Y-distance threshold to consider same line
-
-        for item in text_items {
-            if let Some((_, y)) = item.position {
-                if let Some(prev_y) = last_y {
-                    // If Y position changed significantly, start a new line
-                    if (y - prev_y).abs() > line_threshold {
-                        result.push('\n');
-                    } else {
-                        // Same line, add a space between items
-                        if !result.is_empty() && !result.ends_with(' ') && !result.ends_with('\n') {
-                            result.push(' ');
+        // Compute a dynamic column-gap threshold from the median X-gap.
+        let column_threshold = {
+            let mut gaps: Vec<f64> = Vec::new();
+            for line in &lines {
+                for pair in line.windows(2) {
+                    if let (Some((x1, _)), Some((x2, _))) = (pair[0].position, pair[1].position) {
+                        let gap = x2 - x1;
+                        if gap > 0.0 {
+                            gaps.push(gap);
                         }
                     }
                 }
-                last_y = Some(y);
             }
+            if gaps.is_empty() {
+                50.0
+            } else {
+                gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mid = gaps.len() / 2;
+                let med = if gaps.len() % 2 == 0 {
+                    (gaps[mid - 1] + gaps[mid]) / 2.0
+                } else {
+                    gaps[mid]
+                };
+                (med * 3.0).max(80.0).min(150.0)
+            }
+        };
 
-            result.push_str(&item.text);
+        // Multi-column detection: find the MODAL gap midpoint across all Y-lines.
+        // For each line, only the LARGEST gap participates — the column gap is
+        // always the widest intra-line gap.  This avoids false positives from
+        // word-spacing gaps while not requiring an arbitrary X threshold that
+        // would exclude left-column items starting near x=54.
+        let mut midpoints: Vec<f64> = Vec::new();
+        for line in &lines {
+            let mut best_gap: Option<(f64, f64)> = None; // (gap, midpoint)
+            for pair in line.windows(2) {
+                if let (Some((x1, _)), Some((x2, _))) = (pair[0].position, pair[1].position) {
+                    let gap = x2 - x1;
+                    if gap >= 60.0 {
+                        let mid = (x1 + x2) / 2.0;
+                        if best_gap.is_none_or(|(g, _)| gap > g) {
+                            best_gap = Some((gap, mid));
+                        }
+                    }
+                }
+            }
+            if let Some((_, mid)) = best_gap {
+                midpoints.push(mid);
+            }
+        }
+        let col_boundary = if midpoints.len() >= 6 {
+            midpoints.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // Sliding 25‑pt window: find the densest region.
+            let window = 25.0;
+            let mut best_count = 0usize;
+            let mut best_mid = 0.0;
+            for (i, &start) in midpoints.iter().enumerate() {
+                let limit = start + window;
+                let count = midpoints[i..].iter().take_while(|&&m| m <= limit).count();
+                if count > best_count {
+                    best_count = count;
+                    best_mid = start + window / 2.0;
+                }
+            }
+            if best_count >= 3 { best_mid } else { f64::MAX }
+        } else {
+            f64::MAX
+        };
+
+        if col_boundary == f64::MAX {
+            // Single column: standard join.
+            let all_single_char = lines.iter().flatten().all(|t| t.text.chars().count() == 1);
+            if all_single_char {
+                return Self::dehyphenate(&Self::join_per_char(&lines, line_threshold));
+            } else {
+                let mut result = String::new();
+                for line in &lines {
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    for (i, item) in line.iter().enumerate() {
+                        if i > 0 && !item.text.starts_with(' ') && !result.ends_with(' ') {
+                            result.push(' ');
+                        }
+                        result.push_str(&item.text);
+                    }
+                }
+                return Self::dehyphenate(&result);
+            }
         }
 
-        Ok(result)
+        // Multi-column: partition each line's items by the global column boundary.
+        // Items with x < col_boundary go left, items with x >= col_boundary go right.
+        // This handles lines with any number of items on either side (e.g. multi-item
+        // reference entries with hanging-indent continuation lines).
+        let mut col_lines: [Vec<Vec<&TextItem>>; 2] = [Vec::new(), Vec::new()];
+
+        for line in &lines {
+            let mut left: Vec<&TextItem> = Vec::new();
+            let mut right: Vec<&TextItem> = Vec::new();
+            for item in line {
+                let is_right = item.position.is_some_and(|p| p.0 >= col_boundary);
+                if is_right {
+                    right.push(item);
+                } else {
+                    left.push(item);
+                }
+            }
+            if !left.is_empty() {
+                col_lines[0].push(left);
+            }
+            if !right.is_empty() {
+                col_lines[1].push(right);
+            }
+        }
+
+        let mut col_groups: Vec<Vec<String>> = vec![Vec::new(), Vec::new()];
+        for (ci, lines_for_col) in col_lines.iter().enumerate() {
+            for items in lines_for_col {
+                let mut s = String::new();
+                for (i, t) in items.iter().enumerate() {
+                    if i > 0 && !t.text.starts_with(' ') && !s.ends_with(' ') {
+                        s.push(' ');
+                    }
+                    s.push_str(&t.text);
+                }
+                col_groups[ci].push(s);
+            }
+        }
+
+        col_groups
+            .into_iter()
+            .map(|g| Self::dehyphenate(&g.join("\n")))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Renders this page to a rendering device.
@@ -534,7 +960,8 @@ impl Page {
     /// # Example
     /// ```no_run
     /// use pdf_x_core::PDFDocument;
-    /// use pdf_x_core::rendering::{SkiaDevice, Device};
+    /// use pdf_x_core::rendering::Device;
+    /// use pdf_x_device_tinyskia::SkiaDevice;
     /// use tiny_skia::Pixmap;
     ///
     /// let pdf_data = std::fs::read("document.pdf").unwrap();
@@ -543,35 +970,36 @@ impl Page {
     ///
     /// // Create a pixmap for rendering
     /// let mut pixmap = Pixmap::new(800, 600).unwrap();
-    /// let mut device = SkiaDevice::new(pixmap.as_mut());
+    /// let mut font_cache = Default::default();
+    /// let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache);
     ///
     /// // Render the page
-    /// page.render(&mut doc.xref_mut(), &mut device).unwrap();
+    /// page.render(doc.doc_store_mut(), &mut device).unwrap();
     ///
     /// // Save the result
     /// pixmap.save_png("page1.png").unwrap();
     /// ```
-    pub fn render<D: crate::rendering::Device>(
+    pub fn render<D: crate::rendering::Device, R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         device: &mut D,
     ) -> PDFResult<()> {
         use super::{Lexer, Parser, Stream};
         use crate::rendering::RenderingContext;
 
         // Reference: pdf.js/src/core/document.js - Page.view (MediaBox/CropBox handling)
-        let view_box = self.resolve_view_box_for_rendering(xref);
+        let view_box = self.resolve_view_box_for_rendering(resolver);
 
         let contents = match self.contents() {
             Some(contents) => contents,
             None => return Ok(()), // No content streams to render
         };
 
-        // Dereference if it's a reference
-        let contents = xref.fetch_if_ref(contents)?;
+        // Dereference if it's a reference — delta-aware (delta → base) via the resolver.
+        let contents = resolver.resolve_if_ref(contents)?;
 
         // Handle single content stream or array of streams
-        let content_streams = match contents {
+        let content_streams = match &*contents {
             PDFObject::Stream { dict, data } => {
                 vec![(dict.clone(), data.clone())]
             }
@@ -579,7 +1007,7 @@ impl Page {
                 // Multiple content streams - fetch each one
                 let mut streams = Vec::new();
                 let mut seen_streams = std::collections::HashSet::new();
-                for content_obj in &arr {
+                for content_obj in arr.iter() {
                     // Track which object references we've already processed
                     // to avoid duplicate rendering (common in some PDFs)
                     let obj_key = match content_obj.as_ref() {
@@ -596,9 +1024,9 @@ impl Page {
                     }
                     seen_streams.insert(obj_key);
 
-                    match xref.fetch_if_ref(content_obj)? {
+                    match &*resolver.resolve_if_ref(content_obj)? {
                         PDFObject::Stream { dict, data } => {
-                            streams.push((dict, data));
+                            streams.push((dict.clone(), data.clone()));
                         }
                         _ => {
                             return Err(super::PDFError::Generic(
@@ -615,8 +1043,14 @@ impl Page {
             }
         };
 
-        // Set initial clip to the view box to prevent rendering outside page bounds
+        // Set initial CTM to map view_box [x0,y0,x1,y1] to device pixels [0,0,w,h].
+        // This handles non-zero MediaBox origins (e.g. [20,20,180,180]).
         let [x0, y0, x1, y1] = view_box;
+        let rotate = self.resolve_rotate_for_rendering(resolver);
+        let page_transform = page_initial_transform(view_box, rotate);
+        device.set_matrix(&page_transform);
+
+        // Set initial clip to the view box to prevent rendering outside page bounds
         device.begin_path();
         device.move_to(x0, y0);
         device.line_to(x1, y0);
@@ -627,16 +1061,16 @@ impl Page {
 
         // Resolve inheritable page resources once (fonts, XObjects, etc.)
         // Reference: pdf.js/src/core/document.js - #getInheritableProperty("Resources")
-        let page_resources = self.get_inheritable_resources(xref)?;
+        let page_resources = self.get_inheritable_resources(resolver)?;
 
-        // Process each content stream
-        let mut total_operations = 0;
+        // Concatenate decoded content streams, then parse once.
+        // Some PDFs split /Contents mid-operator (font_truetype_slow_post_lookup);
+        // parsing fragments independently loses trailing ops and can abort early.
+        // Matches ResolvedPage::resolve_contents / pdf.js Page.getOperatorList.
+        // Also preserves graphics state across stream boundaries (no per-stream
+        // save/restore of the page CTM).
+        let mut concatenated = Vec::new();
         for (stream_idx, (dict, data)) in content_streams.into_iter().enumerate() {
-            // Save device state before processing this stream
-            // This ensures each stream starts with the same CTM
-            device.save_state();
-
-            // Decode the stream if it has filters
             let decoded_data = if let Some(filter) = dict.get("Filter") {
                 match super::decode::apply_filters(&data, filter) {
                     Ok(decoded) => decoded,
@@ -645,79 +1079,84 @@ impl Page {
                             "Warning: Failed to decode content stream {}: {}",
                             stream_idx, e
                         );
-                        device.restore_state();
-                        continue; // Skip this stream if decoding fails
+                        continue;
                     }
                 }
             } else {
-                data.to_vec() // No filter, use raw data
+                data.to_vec()
             };
+            if !concatenated.is_empty() && !concatenated.ends_with(b"\n") {
+                concatenated.push(b'\n');
+            }
+            concatenated.extend(decoded_data);
+        }
 
+        // Resolve inheritable page resources once (fonts, XObjects, etc.)
+        // Reference: pdf.js/src/core/document.js - #getInheritableProperty("Resources")
+        // Note: page_resources was already resolved above the old loop; keep using it.
+
+        if !concatenated.is_empty() {
             eprintln!(
-                "Info: Processing content stream {} ({} bytes)",
-                stream_idx,
-                decoded_data.len()
+                "Info: Processing concatenated content ({} bytes)",
+                concatenated.len()
             );
 
-            // Create a stream from the (decoded) content data
-            let stream = Box::new(Stream::from_bytes(decoded_data)) as Box<dyn super::BaseStream>;
+            let stream = Box::new(Stream::from_bytes(concatenated)) as Box<dyn super::BaseStream>;
             let lexer = Lexer::new(stream)?;
             let parser = Parser::new(lexer)?;
             let mut evaluator = super::content_stream::ContentStreamEvaluator::new(parser);
 
-            // Merge any stream-level Resources with page-level Resources.
-            // Reference: pdf.js/src/core/document.js - #getMergedResources
-            let resources = self.merge_stream_resources(xref, dict.get("Resources"), &page_resources)?;
+            // Page-level resources (stream-level Resources on individual content
+            // streams are rare; ResolvedPage also uses page resources for the
+            // concatenated program).
+            // Arc<PDFObject> → owned PDFObject for the font-loader / XObject resource APIs.
+            let resources_owned: Option<PDFObject> = page_resources.as_ref().map(|r| (**r).clone());
 
-            // Load fonts from merged resources (for proper text rendering)
             #[cfg(feature = "rendering")]
-            self.load_fonts_for_rendering_with_resources(xref, device, resources.as_ref())?;
+            self.load_fonts_for_rendering_with_resources(
+                resolver.as_xref_mut(),
+                device,
+                resources_owned.as_ref(),
+            )?;
 
-            // Create a rendering context to process operations
             let mut ctx = RenderingContext::new(device);
+            ctx.current_state_mut().set_matrix(&page_transform);
+            ctx.set_root_ctm(page_transform);
 
-            // Set xref and resources for XObject (image) rendering
-            // Note: We need to extend the lifetime of the fetched resources
-            // by storing it and passing a reference to the context
-            if let Some(ref resources_obj) = resources {
-                ctx.set_xobject_resources(xref, resources_obj);
+            if let Some(ref resources_obj) = resources_owned {
+                ctx.set_xobject_resources(&mut *resolver, resources_obj);
             }
 
-            // Parse and process each operation in the content stream
-            let mut stream_operations = 0;
+            let mut total_operations = 0;
+            // C.3 render budget: same cap as the `interpret` loop so a
+            // pathological content stream cannot hang the legacy path.
+            const MAX_OPERATIONS: u64 = 20_000_000;
             loop {
                 match evaluator.read_operation() {
                     Ok(Some(op)) => {
-                        stream_operations += 1;
+                        total_operations += 1;
+                        if total_operations > MAX_OPERATIONS {
+                            return Err(super::PDFError::Generic(format!(
+                                "Operation budget exceeded: {} content-stream operations (max {})",
+                                total_operations, MAX_OPERATIONS
+                            )));
+                        }
                         if let Err(e) = ctx.process_operation(&op) {
-                            // Log but continue processing - one bad operator shouldn't stop entire rendering
                             eprintln!("Warning: Failed to process operator {:?}: {}", op.op, e);
                         }
                     }
-                    Ok(None) => break, // End of stream
+                    Ok(None) => break,
                     Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to read operation in stream {}, stopping: {}",
-                            stream_idx, e
-                        );
-                        break; // Can't continue after a read error
+                        eprintln!("Warning: Failed to read operation, stopping: {}", e);
+                        break;
                     }
                 }
             }
             eprintln!(
-                "Info: Processed {} operations in stream {}",
-                stream_operations, stream_idx
+                "Info: Total {} operations processed for page {}",
+                total_operations, self.page_index
             );
-            total_operations += stream_operations;
-
-            // Restore device state after processing this stream
-            // This resets the CTM to the state before this stream
-            device.restore_state();
         }
-        eprintln!(
-            "Info: Total {} operations processed for page {}",
-            total_operations, self.page_index
-        );
 
         Ok(())
     }
@@ -727,28 +1166,28 @@ impl Page {
     /// Gets all fonts from the page's Resources dictionary.
     ///
     /// Returns a mapping of font names (like "F1", "F2") to font dictionaries.
-    pub fn get_fonts(
+    pub fn get_fonts<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<(String, super::PDFObject)>> {
         use super::PDFObject;
 
         let resources = match self.resources() {
-            Some(r) => xref.fetch_if_ref(r)?,
+            Some(r) => resolver.resolve_if_ref(r)?,
             None => return Ok(Vec::new()),
         };
 
-        let resources_dict = match resources {
-            PDFObject::Dictionary(d) => d,
+        let resources_dict = match &*resources {
+            PDFObject::Dictionary(d) => d.clone(),
             _ => return Ok(Vec::new()),
         };
 
         let font_dict = match resources_dict.get("Font") {
-            Some(f) => xref.fetch_if_ref(f)?,
+            Some(f) => resolver.resolve_if_ref(f)?,
             None => return Ok(Vec::new()),
         };
 
-        match font_dict {
+        match &*font_dict {
             PDFObject::Dictionary(d) => {
                 let mut fonts = Vec::new();
                 for (name, font_ref) in d.iter() {
@@ -774,19 +1213,19 @@ impl Page {
     /// # Returns
     /// Ok(()) if successful, even if some fonts fail to load
     #[cfg(feature = "rendering")]
-    pub fn load_fonts_for_rendering<D: crate::rendering::Device>(
+    pub fn load_fonts_for_rendering<D: crate::rendering::Device, R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
         device: &mut D,
     ) -> PDFResult<()> {
-        let fonts = self.get_fonts(xref)?;
+        let fonts = self.get_fonts(resolver)?;
 
         for (font_name, font_ref) in fonts {
             // Try to fetch and load the font
-            match xref.fetch_if_ref(&font_ref) {
+            match resolver.resolve_if_ref(&font_ref) {
                 Ok(font_obj) => {
                     // Try to create a Font and extract embedded data
-                    match super::font::Font::new(font_obj, xref) {
+                    match super::font::Font::new((*font_obj).clone(), resolver) {
                         Ok(pdf_font) => {
                             // If we have embedded font data, load it
                             if let Some(embedded_data) = pdf_font.embedded_font {
@@ -836,75 +1275,92 @@ impl Page {
 
     /// Gets fallback font data for standard PDF fonts.
     ///
-    /// Returns font data for common PDF base fonts (Helvetica, Times, Courier, etc.)
-    /// by loading bundled Liberation fonts (which are metric-compatible with PDF standard fonts).
+    /// Returns Foxit Base14 CFF programs (same as pdf.js / hayro) so unembedded
+    /// standard fonts share outlines with those engines.
     #[cfg(feature = "rendering")]
     fn get_fallback_font_data(base_font: &str) -> Option<Vec<u8>> {
-        // Normalize font name (remove suffixes like -Bold, -Italic, etc.)
-        let font_name = base_font.split('-').next().unwrap_or(base_font);
-
-        // Map standard PDF fonts to bundled Liberation fonts
-        // Liberation fonts are metric-compatible with standard PDF fonts and are OFL licensed
-        let fallback_font = match font_name {
-            // Helvetica family -> Liberation Sans
-            "Helvetica" | "Arial" | "sans-serif" => "LiberationSans-Regular.ttf",
-            "Helvetica-Bold" | "Arial-Bold" => "LiberationSans-Bold.ttf",
+        let data = match base_font {
+            // Helvetica family -> Foxit Sans
+            "Helvetica" | "Arial" | "sans-serif" => {
+                include_bytes!("../../assets/fonts/FoxitSans.pfb").as_slice()
+            }
+            "Helvetica-Bold" | "Arial-Bold" => {
+                include_bytes!("../../assets/fonts/FoxitSansBold.pfb").as_slice()
+            }
             "Helvetica-Oblique" | "Helvetica-Italic" | "Arial-Italic" => {
-                "LiberationSans-Italic.ttf"
+                include_bytes!("../../assets/fonts/FoxitSansItalic.pfb").as_slice()
             }
             "Helvetica-BoldOblique" | "Helvetica-BoldItalic" | "Arial-BoldItalic" => {
-                "LiberationSans-BoldItalic.ttf"
+                include_bytes!("../../assets/fonts/FoxitSansBoldItalic.pfb").as_slice()
             }
 
-            // Times family -> Liberation Serif
-            "Times" | "Times-Roman" | "serif" => "LiberationSerif-Regular.ttf",
-            "Times-Bold" => "LiberationSerif-Bold.ttf",
-            "Times-Italic" | "Times-Roman-Italic" => "LiberationSerif-Italic.ttf",
-            "Times-BoldItalic" | "Times-Roman-BoldItalic" => "LiberationSerif-BoldItalic.ttf",
+            // Times family -> Foxit Serif
+            "Times" | "Times-Roman" | "serif" => {
+                include_bytes!("../../assets/fonts/FoxitSerif.pfb").as_slice()
+            }
+            "Times-Bold" => include_bytes!("../../assets/fonts/FoxitSerifBold.pfb").as_slice(),
+            "Times-Italic" | "Times-Roman-Italic" => {
+                include_bytes!("../../assets/fonts/FoxitSerifItalic.pfb").as_slice()
+            }
+            "Times-BoldItalic" | "Times-Roman-BoldItalic" => {
+                include_bytes!("../../assets/fonts/FoxitSerifBoldItalic.pfb").as_slice()
+            }
 
-            // Courier family -> Liberation Mono
-            "Courier" | "CourierNew" | "monospace" => "LiberationMono-Regular.ttf",
-            "Courier-Bold" | "CourierNew-Bold" => "LiberationMono-Bold.ttf",
+            // Courier family -> Foxit Fixed
+            "Courier" | "CourierNew" | "monospace" => {
+                include_bytes!("../../assets/fonts/FoxitFixed.pfb").as_slice()
+            }
+            "Courier-Bold" | "CourierNew-Bold" => {
+                include_bytes!("../../assets/fonts/FoxitFixedBold.pfb").as_slice()
+            }
             "Courier-Oblique" | "Courier-Italic" | "CourierNew-Italic" => {
-                "LiberationMono-Italic.ttf"
+                include_bytes!("../../assets/fonts/FoxitFixedItalic.pfb").as_slice()
             }
             "Courier-BoldOblique" | "Courier-BoldItalic" | "CourierNew-BoldItalic" => {
-                "LiberationMono-BoldItalic.ttf"
+                include_bytes!("../../assets/fonts/FoxitFixedBoldItalic.pfb").as_slice()
             }
 
-            // Symbol and ZapfDingbats don't have Liberation equivalents, return None
-            "Symbol" | "ZapfDingbats" => return None,
+            "Symbol" => include_bytes!("../../assets/fonts/FoxitSymbol.pfb").as_slice(),
+            "ZapfDingbats" => include_bytes!("../../assets/fonts/FoxitDingbats.pfb").as_slice(),
 
             _ => return None,
         };
 
-        // Load the font from bundled assets
-        let font_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("assets")
-            .join("fonts")
-            .join(fallback_font);
-
-        match std::fs::read(&font_path) {
-            Ok(data) => {
-                #[cfg(feature = "debug-logging")]
-                eprintln!(
-                    "DEBUG: Loaded fallback font '{}' for '{}' ({} bytes)",
-                    fallback_font,
-                    base_font,
-                    data.len()
-                );
-                Some(data)
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to load fallback font '{}': {}",
-                    font_path.display(),
-                    e
-                );
-                None
-            }
-        }
+        #[cfg(feature = "debug-logging")]
+        eprintln!(
+            "DEBUG: Loaded bundled fallback font for '{}' ({} bytes)",
+            base_font,
+            data.len()
+        );
+        Some(data.to_vec())
     }
+}
+
+pub(crate) fn page_initial_transform(view_box: [f64; 4], rotate: i32) -> [f64; 6] {
+    let [x0, y0, x1, y1] = view_box;
+    let center_x = (x0 + x1) * 0.5;
+    let center_y = (y0 + y1) * 0.5;
+    let (a, b, c, d) = match rotate.rem_euclid(360) {
+        90 => (0.0, 1.0, 1.0, 0.0),
+        180 => (-1.0, 0.0, 0.0, 1.0),
+        270 => (0.0, -1.0, -1.0, 0.0),
+        _ => (1.0, 0.0, 0.0, -1.0),
+    };
+
+    let (offset_x, offset_y) = if a == 0.0 {
+        ((center_y - y0).abs(), (center_x - x0).abs())
+    } else {
+        ((center_x - x0).abs(), (center_y - y0).abs())
+    };
+
+    [
+        a,
+        b,
+        c,
+        d,
+        offset_x - a * center_x - c * center_y,
+        offset_y - b * center_x - d * center_y,
+    ]
 }
 
 /// Page tree cache for efficient page lookups.
@@ -919,6 +1375,12 @@ impl Page {
 pub struct PageTreeCache {
     /// Cache of page dictionaries by page index
     pages: FxHashMap<usize, Page>,
+
+    /// Forward cache: page index → page ref (object number, generation).
+    /// Populated lazily; once `page_refs_fully_built` the entire tree has
+    /// been enumerated so no further traversal is needed.
+    page_refs: Vec<Option<(u32, u32)>>,
+    page_refs_fully_built: bool,
 }
 
 impl PageTreeCache {
@@ -926,6 +1388,8 @@ impl PageTreeCache {
     pub fn new() -> Self {
         PageTreeCache {
             pages: FxHashMap::default(),
+            page_refs: Vec::new(),
+            page_refs_fully_built: false,
         }
     }
 
@@ -944,9 +1408,34 @@ impl PageTreeCache {
         self.pages.contains_key(&page_index)
     }
 
+    /// Returns the cached page ref for an index, if known.
+    pub fn get_page_ref(&self, page_index: usize) -> Option<(u32, u32)> {
+        self.page_refs.get(page_index).copied().flatten()
+    }
+
+    /// Stores a page ref for a given index, ensuring the vec is large enough.
+    pub fn put_page_ref(&mut self, page_index: usize, page_ref: Option<(u32, u32)>) {
+        if page_index >= self.page_refs.len() {
+            self.page_refs.resize(page_index + 1, None);
+        }
+        self.page_refs[page_index] = page_ref;
+    }
+
+    /// Whether the full page tree has been walked at least once.
+    pub fn is_fully_built(&self) -> bool {
+        self.page_refs_fully_built
+    }
+
+    /// Marks the full page tree as enumerated.
+    pub fn set_fully_built(&mut self) {
+        self.page_refs_fully_built = true;
+    }
+
     /// Clears the cache.
     pub fn clear(&mut self) {
         self.pages.clear();
+        self.page_refs.clear();
+        self.page_refs_fully_built = false;
     }
 }
 
@@ -970,54 +1459,52 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
+    /// # let pdf_data = vec![];
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
-    /// let images = page.get_image_metadata(&mut doc.xref_mut()).unwrap();
+    /// let images = page.get_image_metadata(doc.doc_store_mut()).unwrap();
     ///
     /// for image in images {
-    ///     println!("Image: {} ({}x{}, {})",
+    ///     println!("Image: {} ({}x{}, {:?})",
     ///              image.name, image.width, image.height, image.format);
     /// }
     /// ```
-    pub fn get_image_metadata(
+    pub fn get_image_metadata<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<super::image::ImageMetadata>> {
         use super::image::{ImageDecoder, ImageFormat, ImageMetadata};
 
         let mut images = Vec::new();
 
-        // Get the Resources dictionary from the page
         let resources = match self.resources() {
-            Some(res) => self.fetch_if_ref(res, xref)?,
-            None => return Ok(images), // No resources
+            Some(res) => resolver.resolve_if_ref(res)?,
+            None => return Ok(images),
         };
 
-        let resources_dict = match resources {
+        let resources_dict = match &*resources {
             PDFObject::Dictionary(dict) => dict,
-            _ => return Ok(images), // Resources is not a dictionary
+            _ => return Ok(images),
         };
 
-        // Get XObject dictionary from Resources
         let xobject_entry = match resources_dict.get("XObject") {
             Some(entry) => entry,
-            None => return Ok(images), // No XObjects
+            None => return Ok(images),
         };
 
-        let xobject_dict = match self.fetch_if_ref(xobject_entry, xref)? {
+        let xobject_obj = resolver.resolve_if_ref(xobject_entry)?;
+        let xobject_dict = match &*xobject_obj {
             PDFObject::Dictionary(dict) => dict,
-            _ => return Ok(images), // XObject is not a dictionary
+            _ => return Ok(images),
         };
 
-        // Iterate through all XObjects
-        for (name, xobject_ref) in &xobject_dict {
-            // Resolve the XObject reference
-            let xobject = self.fetch_if_ref(xobject_ref, xref)?;
+        for (name, xobject_ref) in xobject_dict {
+            let xobject = resolver.resolve_if_ref(xobject_ref)?;
 
             // Check if it's an image (Subtype == /Image)
-            if let PDFObject::Stream { dict, data } = xobject {
+            if let PDFObject::Stream { dict, data } = &*xobject {
                 // Check Subtype
                 let is_image = dict
                     .get("Subtype")
@@ -1144,11 +1631,12 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
+    /// # let pdf_data = vec![];
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
-    /// let images = page.extract_images(&mut doc.xref_mut()).unwrap();
+    /// let images = page.extract_images(doc.doc_store_mut()).unwrap();
     ///
     /// for (i, image) in images.iter().enumerate() {
     ///     println!("Image {}: {}x{} pixels, {} bytes",
@@ -1156,44 +1644,41 @@ impl Page {
     ///     // Save or process image.data...
     /// }
     /// ```
-    pub fn extract_images(
+    pub fn extract_images<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<super::image::DecodedImage>> {
         use super::decode;
         use super::image::{ImageColorSpace, ImageDecoder};
 
         let mut decoded_images = Vec::new();
 
-        // Get the Resources dictionary from the page
         let resources = match self.resources() {
-            Some(res) => self.fetch_if_ref(res, xref)?,
-            None => return Ok(decoded_images), // No resources
+            Some(res) => resolver.resolve_if_ref(res)?,
+            None => return Ok(decoded_images),
         };
 
-        let resources_dict = match resources {
+        let resources_dict = match &*resources {
             PDFObject::Dictionary(dict) => dict,
-            _ => return Ok(decoded_images), // Resources is not a dictionary
+            _ => return Ok(decoded_images),
         };
 
-        // Get XObject dictionary from Resources
         let xobject_entry = match resources_dict.get("XObject") {
             Some(entry) => entry,
-            None => return Ok(decoded_images), // No XObjects
+            None => return Ok(decoded_images),
         };
 
-        let xobject_dict = match self.fetch_if_ref(xobject_entry, xref)? {
+        let xobject_obj = resolver.resolve_if_ref(xobject_entry)?;
+        let xobject_dict = match &*xobject_obj {
             PDFObject::Dictionary(dict) => dict,
-            _ => return Ok(decoded_images), // XObject is not a dictionary
+            _ => return Ok(decoded_images),
         };
 
-        // Iterate through all XObjects
-        for (name, xobject_ref) in &xobject_dict {
-            // Resolve the XObject reference
-            let xobject = self.fetch_if_ref(xobject_ref, xref)?;
+        for (name, xobject_ref) in xobject_dict {
+            let xobject = resolver.resolve_if_ref(xobject_ref)?;
 
             // Check if it's an image (Subtype == /Image)
-            if let PDFObject::Stream { dict, data } = xobject {
+            if let PDFObject::Stream { dict, data } = &*xobject {
                 // Check Subtype
                 let is_image = dict
                     .get("Subtype")
@@ -1389,36 +1874,19 @@ impl Page {
 
         Ok(decoded_images)
     }
-}
-
-impl Page {
-    /// Helper method to fetch an object, following references if needed.
-    /// This provides access to the document's xref table for resolving object references.
-    /// Note: This is a simplified implementation that requires document context.
-    pub fn fetch_if_ref(
-        &self,
-        obj: &PDFObject,
-        xref: &mut super::xref::XRef,
-    ) -> PDFResult<PDFObject> {
-        match obj {
-            PDFObject::Ref(ref_obj) => match xref.fetch(ref_obj.num, ref_obj.generation)? {
-                rc_obj => Ok((*rc_obj).clone()),
-            },
-            _ => Ok(obj.clone()),
-        }
-    }
 
     /// Helper method to get XObject data by name.
     /// This retrieves the actual image data from the page's XObject resources.
-    pub fn get_xobject_data(&self, name: &str, xref: &mut super::xref::XRef) -> PDFResult<Vec<u8>> {
-        // Get the Resources dictionary from the page
+    pub fn get_xobject_data<R: PageResolver>(
+        &self,
+        name: &str,
+        resolver: &mut R,
+    ) -> PDFResult<Vec<u8>> {
         if let Some(resources) = self.resources() {
-            // Look for XObject dictionary
             if let PDFObject::Dictionary(xobject_dict) = resources {
-                // Check if there's an XObject entry
                 if let Some(xobject_entry) = xobject_dict.get("XObject") {
-                    // Follow reference if needed
-                    let xobject_dict = match self.fetch_if_ref(xobject_entry, xref)? {
+                    let xobject_obj = resolver.resolve_if_ref(xobject_entry)?;
+                    let xobject_dict = match &*xobject_obj {
                         PDFObject::Dictionary(dict) => dict,
                         _ => {
                             return Err(PDFError::Generic(
@@ -1427,15 +1895,12 @@ impl Page {
                         }
                     };
 
-                    // Find the XObject with the given name
                     for (name_key, xobject_ref) in xobject_dict {
                         if name_key == name {
-                            // Follow the reference to get the actual XObject
-                            let xobject = self.fetch_if_ref(&xobject_ref, xref)?;
+                            let xobject = resolver.resolve_if_ref(xobject_ref)?;
 
-                            // Check if it's an image stream and return the data
-                            if let PDFObject::Stream { dict: _, data } = xobject {
-                                return Ok(data);
+                            if let PDFObject::Stream { dict: _, data } = &*xobject {
+                                return Ok(data.clone());
                             } else {
                                 return Err(PDFError::Generic(format!(
                                     "XObject '{}' is not a stream",
@@ -1478,11 +1943,12 @@ impl Page {
     ///
     /// # Example
     /// ```no_run
-    /// use pdf_x::core::PDFDocument;
+    /// use pdf_x_core::core::PDFDocument;
     ///
+    /// # let pdf_data = vec![];
     /// let mut doc = PDFDocument::open(pdf_data).unwrap();
     /// let page = doc.get_page(0).unwrap();
-    /// let annotations = page.extract_annotations(&mut doc.xref_mut()).unwrap();
+    /// let annotations = page.extract_annotations(doc.doc_store_mut()).unwrap();
     ///
     /// for annot in annotations {
     ///     println!("Annotation type: {:?}", annot.annotation_type);
@@ -1491,9 +1957,9 @@ impl Page {
     ///     }
     /// }
     /// ```
-    pub fn extract_annotations(
+    pub fn extract_annotations<R: PageResolver>(
         &self,
-        xref: &mut super::xref::XRef,
+        resolver: &mut R,
     ) -> PDFResult<Vec<super::annotation::Annotation>> {
         use super::annotation::parse_annotations;
 
@@ -1502,6 +1968,6 @@ impl Page {
             None => return Ok(Vec::new()),
         };
 
-        parse_annotations(annots, xref)
+        parse_annotations(annots, resolver)
     }
 }

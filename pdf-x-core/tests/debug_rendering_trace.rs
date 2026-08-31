@@ -1,11 +1,9 @@
+use pdf_x_core::PDFDocument;
 /// Comprehensive rendering debug trace
 ///
 /// This test renders a PDF page with full logging to diagnose rendering issues.
-
 use pdf_x_core::rendering::device::Device;
-use pdf_x_core::rendering::skia_device::SkiaDevice;
-use pdf_x_core::rendering::{Color, Paint};
-use pdf_x_core::{PDFDocument, Page};
+use pdf_x_device_tinyskia::SkiaDevice;
 use std::fs::File;
 use std::io::Write;
 use tiny_skia::Pixmap;
@@ -46,18 +44,19 @@ fn debug_rendering_trace() {
     };
 
     let mut doc = PDFDocument::open(pdf_data).expect("Failed to open PDF");
-    log!("✓ PDF opened, {} pages", doc.page_count());
+    log!(
+        "✓ PDF opened, {} pages",
+        doc.page_count().expect("Failed to count pages")
+    );
 
     let page_num = 0;
     log!("\n--- Rendering page {} ---", page_num);
 
-    let page = doc.page(page_num).expect("Failed to get page");
-    let page_obj = page.page_obj();
-
+    let page = doc.get_page(page_num).expect("Failed to get page");
     // Get MediaBox
-    let media_box = page_obj
+    let media_box = page
         .get("MediaBox")
-        .or_else(|| page_obj.get("CropBox"))
+        .or_else(|| page.get("CropBox"))
         .expect("No MediaBox");
 
     log!("MediaBox: {:?}", media_box);
@@ -66,10 +65,26 @@ fn debug_rendering_trace() {
     use pdf_x_core::core::parser::PDFObject;
     let (width, height) = match media_box {
         PDFObject::Array(arr) => {
-            let x0 = if let PDFObject::Number(n) = &**arr.get(0).unwrap() { *n } else { 0.0 };
-            let y0 = if let PDFObject::Number(n) = &**arr.get(1).unwrap() { *n } else { 0.0 };
-            let x1 = if let PDFObject::Number(n) = &**arr.get(2).unwrap() { *n } else { 612.0 };
-            let y1 = if let PDFObject::Number(n) = &**arr.get(3).unwrap() { *n } else { 792.0 };
+            let x0 = if let PDFObject::Number(n) = &**arr.get(0).unwrap() {
+                *n
+            } else {
+                0.0
+            };
+            let y0 = if let PDFObject::Number(n) = &**arr.get(1).unwrap() {
+                *n
+            } else {
+                0.0
+            };
+            let x1 = if let PDFObject::Number(n) = &**arr.get(2).unwrap() {
+                *n
+            } else {
+                612.0
+            };
+            let y1 = if let PDFObject::Number(n) = &**arr.get(3).unwrap() {
+                *n
+            } else {
+                792.0
+            };
             ((x1 - x0) as u32, (y1 - y0) as u32)
         }
         _ => (612, 792),
@@ -86,28 +101,29 @@ fn debug_rendering_trace() {
     log!("✓ Filled with white background");
 
     // Create device
-    let mut device = SkiaDevice::new(pixmap.as_mut());
+    let mut font_cache_device_1 = std::collections::HashMap::new();
+    let mut device = SkiaDevice::new(pixmap.as_mut(), &mut font_cache_device_1);
     log!("✓ Created SkiaDevice");
 
     // Set up coordinate transform
     let scale = 1.5;
-    let ctm = [
-        scale,
-        0.0,
-        0.0,
-        -scale,
-        0.0,
-        height as f64 * scale,
-    ];
+    let ctm = [scale, 0.0, 0.0, -scale, 0.0, height as f64 * scale];
     device.set_matrix(&ctm);
-    log!("✓ Set CTM: [{:.1}, {:.1}, {:.1}, {:.1}, {:.1}, {:.1}]",
-         ctm[0], ctm[1], ctm[2], ctm[3], ctm[4], ctm[5]);
+    log!(
+        "✓ Set CTM: [{:.1}, {:.1}, {:.1}, {:.1}, {:.1}, {:.1}]",
+        ctm[0],
+        ctm[1],
+        ctm[2],
+        ctm[3],
+        ctm[4],
+        ctm[5]
+    );
 
     // Render the page
     log!("\n--- Starting page rendering ---");
     let render_start = std::time::Instant::now();
 
-    match page.render(&mut device) {
+    match page.render(doc.doc_store_mut(), &mut device) {
         Ok(_) => {
             let elapsed = render_start.elapsed();
             log!("✓ Page rendered in {:.2}ms", elapsed.as_secs_f64() * 1000.0);
@@ -151,11 +167,31 @@ fn debug_rendering_trace() {
     let non_white = total_pixels - white_count;
 
     log!("Total pixels: {}", total_pixels);
-    log!("White pixels: {} ({:.2}%)", white_count, white_count as f64 / total_pixels as f64 * 100.0);
-    log!("Black pixels: {} ({:.2}%)", black_count, black_count as f64 / total_pixels as f64 * 100.0);
-    log!("Gray pixels: {} ({:.2}%)", gray_count, gray_count as f64 / total_pixels as f64 * 100.0);
-    log!("Color pixels: {} ({:.2}%)", color_count, color_count as f64 / total_pixels as f64 * 100.0);
-    log!("Non-white pixels: {} ({:.2}%)", non_white, non_white as f64 / total_pixels as f64 * 100.0);
+    log!(
+        "White pixels: {} ({:.2}%)",
+        white_count,
+        white_count as f64 / total_pixels as f64 * 100.0
+    );
+    log!(
+        "Black pixels: {} ({:.2}%)",
+        black_count,
+        black_count as f64 / total_pixels as f64 * 100.0
+    );
+    log!(
+        "Gray pixels: {} ({:.2}%)",
+        gray_count,
+        gray_count as f64 / total_pixels as f64 * 100.0
+    );
+    log!(
+        "Color pixels: {} ({:.2}%)",
+        color_count,
+        color_count as f64 / total_pixels as f64 * 100.0
+    );
+    log!(
+        "Non-white pixels: {} ({:.2}%)",
+        non_white,
+        non_white as f64 / total_pixels as f64 * 100.0
+    );
     log!("Unique colors: {}", unique_colors.len());
 
     // Show top 10 colors
@@ -163,8 +199,13 @@ fn debug_rendering_trace() {
     color_vec.sort_by(|a, b| b.1.cmp(a.1));
     log!("\nTop 10 colors:");
     for (i, (color, count)) in color_vec.iter().take(10).enumerate() {
-        log!("  {}: {} ({} pixels, {:.2}%)",
-             i + 1, color, count, *count as f64 / total_pixels as f64 * 100.0);
+        log!(
+            "  {}: {} ({} pixels, {:.2}%)",
+            i + 1,
+            color,
+            count,
+            **count as f64 / total_pixels as f64 * 100.0
+        );
     }
 
     // Save output
@@ -182,12 +223,19 @@ fn debug_rendering_trace() {
         log!("   4. Font glyphs are not being rendered");
         log!("\n   Check the debug logs above for clues.");
     } else {
-        log!("✓ SUCCESS: Page rendered with content ({} non-white pixels)", non_white);
+        log!(
+            "✓ SUCCESS: Page rendered with content ({} non-white pixels)",
+            non_white
+        );
     }
 
     log!("\nLog file saved to: {}", log_file_path);
     log!("Image saved to: {}", output_path);
 
     // Assert that we have content
-    assert!(non_white > 0, "Rendered page is completely white! Check logs at {}", log_file_path);
+    assert!(
+        non_white > 0,
+        "Rendered page is completely white! Check logs at {}",
+        log_file_path
+    );
 }

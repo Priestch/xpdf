@@ -47,12 +47,6 @@ pub fn load_test_pdf_bytes(name: &str) -> Result<Vec<u8>, std::io::Error> {
     fs::read(path)
 }
 
-/// Create a FileChunkedStream from a test PDF
-pub fn create_file_stream(name: &str) -> Result<FileChunkedStream, PDFError> {
-    let path = get_test_pdf_path(name);
-    FileChunkedStream::open(path, None, None)
-}
-
 /// Helper to assert that a PDF loads without errors
 pub fn assert_pdf_loads(name: &str) -> Result<PDFDocument, PDFError> {
     let bytes =

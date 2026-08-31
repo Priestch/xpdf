@@ -15,6 +15,11 @@ fn main() {
             commands::get_document_outline,
             commands::get_page_sizes,
             commands::render_page,
+            commands::add_highlight,
+            commands::undo_edit,
+            commands::redo_edit,
+            commands::get_editor_state,
+            commands::save_pdf_as,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
