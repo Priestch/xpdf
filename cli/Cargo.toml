@@ -7,12 +7,17 @@ license.workspace = true
 description = "CLI tool for inspecting PDF structure"
 
 [[bin]]
+name = "pdf-x"
+path = "src/main.rs"
+
+[[bin]]
 name = "pdf-inspect"
 path = "src/main.rs"
 
 [dependencies]
 pdf-x-source-file = { path = "../pdf-x-source-file" }
 pdf-x-core = { path = "../pdf-x-core", features = ["jpeg-decoding"] }
+serde_json.workspace = true
 
 [features]
 default = ["jpeg-decoding"]
