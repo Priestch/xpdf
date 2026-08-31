@@ -71,6 +71,8 @@ impl PDFWriter {
     }
 
     /// Write an incremental update while inheriting document trailer entries.
+    ///
+    /// `delta` provides both object changes and trailer overrides.
     pub fn write_incremental_update_with_trailer(
         delta: &DeltaLayer,
         original_size: usize,
@@ -129,6 +131,7 @@ impl PDFWriter {
             total_object_count,
             prev_xref_offset,
             original_trailer,
+            delta,
         )?;
 
         // Write EOF marker
@@ -403,6 +406,7 @@ impl PDFWriter {
         total_object_count: u32,
         prev_xref_offset: usize,
         original_trailer: Option<&PDFObject>,
+        delta: &DeltaLayer,
     ) -> PDFResult<()> {
         buffer
             .write_all(b"trailer\n")
@@ -421,12 +425,26 @@ impl PDFWriter {
 
         if let Some(PDFObject::Dictionary(dict)) = original_trailer {
             for key in ["Root", "Info", "ID", "Encrypt"] {
-                if let Some(value) = dict.get(key) {
+                // Trailer overrides from delta take precedence.
+                if let Some(override_val) = delta.get_trailer_override(key) {
+                    write!(buffer, " /{} ", key).map_err(|e| {
+                        PDFError::Generic(format!("Failed to write trailer /{}: {}", key, e))
+                    })?;
+                    Self::write_object(buffer, override_val)?;
+                } else if let Some(value) = dict.get(key) {
                     write!(buffer, " /{} ", key).map_err(|e| {
                         PDFError::Generic(format!("Failed to write trailer /{}: {}", key, e))
                     })?;
                     Self::write_object(buffer, value)?;
                 }
+            }
+        } else if !delta.iter_trailer_overrides().next().is_none() {
+            // No original trailer but we have overrides — write them.
+            for (key, value) in delta.iter_trailer_overrides() {
+                write!(buffer, " /{} ", key).map_err(|e| {
+                    PDFError::Generic(format!("Failed to write trailer /{}: {}", key, e))
+                })?;
+                Self::write_object(buffer, value)?;
             }
         }
 

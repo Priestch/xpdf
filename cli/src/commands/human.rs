@@ -20,6 +20,10 @@ pub fn print(command: &str, data: &Value) {
         "images" => print_images(data),
         "operators" => print_operators(data),
         "stream" => print_stream(data),
+        "rotate-page" => print_rotate_page(data),
+        "set-info" => print_set_info(data),
+        "save" => print_set_info(data),
+        "delete-page" => print_delete_page(data),
         // catalog / trailer / pages / object: raw object dumps
         _ => print_object_data(data),
     }
@@ -453,6 +457,22 @@ fn print_stream(data: &Value) {
             println!("Bytes (hex): {preview}");
         }
     }
+}
+
+fn print_rotate_page(data: &Value) {
+    let page = data["page"].as_u64().unwrap_or(0);
+    let angle = data["angle"].as_u64().unwrap_or(0);
+    println!("Page {page} rotated to {angle}°");
+}
+
+fn print_delete_page(data: &Value) {
+    let page = data["page"].as_u64().unwrap_or(0);
+    println!("Page {page} deleted");
+}
+
+fn print_set_info(data: &Value) {
+    let dirty = data["dirty"].as_bool().unwrap_or(false);
+    println!("Metadata updated (dirty: {dirty})");
 }
 
 fn print_object_data(data: &Value) {

@@ -38,6 +38,13 @@ pub struct DeltaLayer {
     /// Initial base PDF size (for clearing)
     base_pdf_size: u32,
 
+    /// Trailer-level overrides (e.g. /Info → new ref).
+    ///
+    /// Merged into the trailer by [`PDFWriter::write_trailer`] during
+    /// incremental save. This is the mechanism for commands that
+    /// modify trailer entries (like setting document metadata).
+    trailer_overrides: HashMap<String, PDFObject>,
+
     /// Monotonic document-state revision used to invalidate derived caches.
     revision: u64,
 }
@@ -48,6 +55,7 @@ impl std::fmt::Debug for DeltaLayer {
             .field("modified", &self.modified)
             .field("new_objects", &self.new_objects)
             .field("deleted", &self.deleted)
+            .field("trailer_overrides", &self.trailer_overrides)
             .field("next_obj_num", &self.next_obj_num)
             .field("base_pdf_size", &self.base_pdf_size)
             .field("revision", &self.revision)
@@ -196,6 +204,7 @@ impl DeltaLayer {
             deleted: HashSet::new(),
             next_obj_num: base_pdf_size,
             base_pdf_size,
+            trailer_overrides: HashMap::new(),
             revision: 0,
         }
     }
@@ -379,10 +388,12 @@ impl DeltaLayer {
         let changed = !self.modified.is_empty()
             || !self.new_objects.is_empty()
             || !self.deleted.is_empty()
+            || !self.trailer_overrides.is_empty()
             || self.next_obj_num != self.base_pdf_size;
         self.modified.clear();
         self.new_objects.clear();
         self.deleted.clear();
+        self.trailer_overrides.clear();
         self.next_obj_num = self.base_pdf_size;
         if changed {
             self.bump_revision();
@@ -400,7 +411,7 @@ impl DeltaLayer {
 
     /// Get the total count of changes (modifications + additions + deletions).
     pub fn change_count(&self) -> usize {
-        self.modified.len() + self.new_objects.len() + self.deleted.len()
+        self.modified.len() + self.new_objects.len() + self.deleted.len() + self.trailer_overrides.len()
     }
 
     /// Get the next object number that will be assigned.
@@ -421,6 +432,31 @@ impl DeltaLayer {
     /// Get iterator over deleted object references.
     pub fn iter_deleted(&self) -> impl Iterator<Item = &ObjectId> {
         self.deleted.iter()
+    }
+
+    /// Override a trailer entry (e.g. `/Info` → new object reference).
+    pub fn set_trailer_override(&mut self, key: String, value: PDFObject) {
+        if self.trailer_overrides.get(&key) != Some(&value) {
+            self.trailer_overrides.insert(key, value);
+            self.bump_revision();
+        }
+    }
+
+    /// Remove a trailer override.
+    pub fn remove_trailer_override(&mut self, key: &str) {
+        if self.trailer_overrides.remove(key).is_some() {
+            self.bump_revision();
+        }
+    }
+
+    /// Get a trailer override value.
+    pub fn get_trailer_override(&self, key: &str) -> Option<&PDFObject> {
+        self.trailer_overrides.get(key)
+    }
+
+    /// Iterator over trailer overrides.
+    pub fn iter_trailer_overrides(&self) -> impl Iterator<Item = (&String, &PDFObject)> {
+        self.trailer_overrides.iter()
     }
 }
 
@@ -448,6 +484,10 @@ pub struct RotatePageCommand {
 
     /// The original rotation value (for undo)
     original_rotation: Option<u16>,
+
+    /// Pre-fetched base page object, set via [`with_original_page`].
+    /// When present, `execute` uses this instead of calling `fetch_base`.
+    original_page: Option<PDFObject>,
 }
 
 impl RotatePageCommand {
@@ -472,7 +512,18 @@ impl RotatePageCommand {
             page_ref,
             degrees,
             original_rotation: None,
+            original_page: None,
         }
+    }
+
+    /// Supply a pre-fetched copy of the base page dictionary.
+    ///
+    /// When set, `execute` uses this object directly instead of requiring
+    /// a `fetch_base` callback. This is the preferred path when executing
+    /// through `PDFDocument::execute_command()` (which passes no fetcher).
+    pub fn with_original_page(mut self, page: PDFObject) -> Self {
+        self.original_page = Some(page);
+        self
     }
 }
 
@@ -482,24 +533,20 @@ impl Command for RotatePageCommand {
         delta: &mut DeltaLayer,
         fetch_base: Option<&'a BaseObjectFetcher<'a>>,
     ) -> PDFResult<()> {
-        // Get the current page object from delta or base PDF
-        let page_dict = match delta.get(&self.page_ref) {
-            Some(delta_obj) => {
-                // Page is already in delta (modified or new)
-                delta_obj.object.clone()
-            }
-            None => {
-                // Page not in delta - fetch from base PDF
-                let fetcher = fetch_base.ok_or_else(|| {
-                    PDFError::Generic(
-                        "Cannot fetch base page object - no fetch callback provided. \
-                        Execute commands through PDFDocument::execute_command() instead."
-                            .into(),
-                    )
-                })?;
-
-                fetcher(self.page_ref)?
-            }
+        // Get the current page object: pre-fetched original > delta > base fetch.
+        let page_dict = if let Some(ref page) = self.original_page {
+            page.clone()
+        } else if let Some(delta_obj) = delta.get(&self.page_ref) {
+            delta_obj.object.clone()
+        } else {
+            let fetcher = fetch_base.ok_or_else(|| {
+                PDFError::Generic(
+                    "Cannot fetch base page object - no fetch callback provided. \
+                    Use with_original_page() or execute through PDFDocument."
+                        .into(),
+                )
+            })?;
+            fetcher(self.page_ref)?
         };
 
         // Extract the current dictionary and rotation value
@@ -581,6 +628,393 @@ impl Command for RotatePageCommand {
 
         delta.modify_object(self.page_ref, PDFObject::Dictionary(dict));
         Ok(())
+    }
+}
+
+/// Reversible command that sets entries in the document /Info dictionary.
+///
+/// Each entry is `(key, Some(value))` to set, or `(key, None)` to remove.
+/// If the document has no /Info dictionary, one is created.
+///
+/// Non-ASCII string values are encoded as UTF-16BE with BOM per PDF spec §7.9.2.
+pub struct SetInfoCommand {
+    /// Pre-fetched original /Info dictionary (if it existed).
+    original_info: Option<(Ref, PDFObject)>,
+    /// Entries to apply: key → Some(value) means set, key → None means remove.
+    entries: Vec<(String, Option<PDFObject>)>,
+    /// State captured during execute for undo.
+    previous_info_ref: Option<Ref>,
+    previous_entries: Option<(Ref, PDFObject)>,
+    /// New info ref created during execute (if any).
+    new_info_ref: Option<Ref>,
+}
+
+impl SetInfoCommand {
+    /// Create a new SetInfoCommand.
+    ///
+    /// `original_info` should be `Some((ref, obj))` if the document currently
+    /// has an /Info dictionary, or `None` if it does not.
+    pub fn new(
+        original_info: Option<(Ref, PDFObject)>,
+        entries: Vec<(String, Option<PDFObject>)>,
+    ) -> Self {
+        Self {
+            original_info,
+            entries,
+            previous_info_ref: None,
+            previous_entries: None,
+            new_info_ref: None,
+        }
+    }
+
+    /// Encode a Rust string for a PDF /Info value.
+    ///
+    /// Per §7.9.2, strings containing non-ASCII characters should be
+    /// encoded as UTF-16BE with a leading BOM (\xFE\xFF).
+    pub fn encode_info_string(s: &str) -> PDFObject {
+        if s.is_ascii() {
+            PDFObject::String(s.as_bytes().to_vec())
+        } else {
+            let mut bytes = vec![0xFE, 0xFF]; // BOM
+            for ch in s.encode_utf16() {
+                bytes.push((ch >> 8) as u8);
+                bytes.push((ch & 0xFF) as u8);
+            }
+            PDFObject::HexString(bytes)
+        }
+    }
+
+    fn apply_entries(&self, dict: &mut HashMap<String, PDFObject>) {
+        for (key, value) in &self.entries {
+            match value {
+                Some(v) => {
+                    dict.insert(key.clone(), v.clone());
+                }
+                None => {
+                    dict.remove(key);
+                }
+            }
+        }
+    }
+}
+
+impl Command for SetInfoCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        // Capture previous state for undo.
+        self.previous_info_ref = self.original_info.as_ref().map(|(r, _)| *r);
+        self.previous_entries = self.original_info.clone();
+
+        let mut dict = match &self.original_info {
+            Some((_ref, PDFObject::Dictionary(d))) => d.clone(),
+            Some((_, other)) => {
+                return Err(PDFError::Generic(format!(
+                    "Existing /Info is not a dictionary: {:?}",
+                    other
+                )));
+            }
+            None => HashMap::new(),
+        };
+
+        self.apply_entries(&mut dict);
+
+        let info_obj = PDFObject::Dictionary(dict);
+
+        let info_ref = match &self.original_info {
+            Some((info_ref, _)) => {
+                // Modify existing /Info object.
+                delta.modify_object(*info_ref, info_obj.clone());
+                *info_ref
+            }
+            None => {
+                // Create new /Info object.
+                let r = delta.add_object(info_obj.clone());
+                self.new_info_ref = Some(r);
+                r
+            }
+        };
+
+        // Point trailer /Info to the (possibly new) reference.
+        delta.set_trailer_override("Info".into(), PDFObject::Ref(info_ref));
+        Ok(())
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        // Restore the original /Info state.
+        match &self.previous_entries {
+            Some((info_ref, obj)) => {
+                delta.modify_object(*info_ref, obj.clone());
+                delta.set_trailer_override(
+                    "Info".into(),
+                    PDFObject::Ref(*info_ref),
+                );
+            }
+            None => {
+                // Remove the /Info we created.
+                if let Some(info_ref) = self.new_info_ref {
+                    delta.remove_new_object(info_ref);
+                }
+                delta.remove_trailer_override("Info");
+            }
+        }
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        // Re-apply: rebuild the info dict and set trailer override.
+        let mut dict = match &self.previous_entries {
+            Some((_, PDFObject::Dictionary(d))) => d.clone(),
+            Some((_, other)) => {
+                return Err(PDFError::Generic(format!(
+                    "Original /Info is not a dictionary: {:?}",
+                    other
+                )));
+            }
+            None => HashMap::new(),
+        };
+
+        self.apply_entries(&mut dict);
+
+        let info_obj = PDFObject::Dictionary(dict);
+
+        match &self.previous_entries {
+            Some((info_ref, _)) => {
+                delta.modify_object(*info_ref, info_obj.clone());
+                delta.set_trailer_override(
+                    "Info".into(),
+                    PDFObject::Ref(*info_ref),
+                );
+            }
+            None => {
+                let r = self.new_info_ref.ok_or_else(|| {
+                    PDFError::Generic("Missing new info ref for redo".into())
+                })?;
+                delta.restore_new_object(r, info_obj.clone());
+                delta.set_trailer_override("Info".into(), PDFObject::Ref(r));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reversible command that deletes a page from the page tree.
+///
+/// Removes the page's reference from its parent's `/Kids` array and decrements
+/// `/Count` on every ancestor up to the root `/Pages` node. The page object
+/// itself is NOT deleted from the file (harmless orphan; simplifies undo).
+///
+/// Reference: pdf.js does not support page deletion at all. Dangling
+/// outline/GoTo destinations are tolerated by viewers (v1 limitation).
+pub struct DeletePageCommand {
+    /// Reference of the page to delete.
+    page_ref: Ref,
+
+    /// Reference of the parent `/Pages` node whose `/Kids` contains the page.
+    parent_ref: Ref,
+
+    /// Index of the page within the parent's `/Kids` array.
+    kid_index: usize,
+
+    /// Ancestor chain from parent up to root: `(ref, original_count)`.
+    ancestors: Vec<(Ref, u32)>,
+
+    /// Pre-fetched parent dictionary (contains `/Kids`).
+    original_parent: PDFObject,
+
+    /// Pre-fetched ancestor dictionaries (for `/Count` restoration).
+    original_ancestors: Vec<PDFObject>,
+}
+
+impl DeletePageCommand {
+    /// Create a new page-deletion command.
+    ///
+    /// All objects are pre-fetched so the command needs no `fetch_base` callback.
+    pub fn new(
+        page_ref: Ref,
+        parent_ref: Ref,
+        kid_index: usize,
+        ancestors: Vec<(Ref, u32)>,
+        original_parent: PDFObject,
+        original_ancestors: Vec<PDFObject>,
+    ) -> Self {
+        Self {
+            page_ref,
+            parent_ref,
+            kid_index,
+            ancestors,
+            original_parent,
+            original_ancestors,
+        }
+    }
+}
+
+impl Command for DeletePageCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        // 1. Remove page ref from parent's /Kids and decrement parent's /Count in a single write.
+        let parent_dict = match &self.original_parent {
+            PDFObject::Dictionary(d) => d.clone(),
+            _ => {
+                return Err(PDFError::Generic(format!(
+                    "Parent {} {} is not a dictionary",
+                    self.parent_ref.num, self.parent_ref.generation
+                )));
+            }
+        };
+
+        let kids = parent_dict
+            .get("Kids")
+            .and_then(|k| k.as_array())
+            .ok_or_else(|| {
+                PDFError::Generic(format!(
+                    "Parent {} {} has no Kids array",
+                    self.parent_ref.num, self.parent_ref.generation
+                ))
+            })?;
+
+        let mut new_kids: Vec<Box<PDFObject>> = kids.to_vec();
+        if self.kid_index >= new_kids.len() {
+            return Err(PDFError::Generic(format!(
+                "kid_index {} out of range (Kids len={})",
+                self.kid_index,
+                new_kids.len()
+            )));
+        }
+        new_kids.remove(self.kid_index);
+
+        // Decrement /Count on the parent too.
+        let parent_count = parent_dict
+            .get("Count")
+            .and_then(|c| c.as_number())
+            .unwrap_or(0.0) as u32;
+
+        let mut new_parent = parent_dict;
+        new_parent.insert(
+            "Kids".to_string(),
+            PDFObject::Array(new_kids.into()),
+        );
+        new_parent.insert(
+            "Count".to_string(),
+            PDFObject::Number((parent_count.saturating_sub(1)) as f64),
+        );
+        delta.modify_object(self.parent_ref, PDFObject::Dictionary(new_parent));
+
+        // 2. Decrement /Count on ancestors ABOVE the parent (excluding parent).
+        for ((ancestor_ref, _original_count), original_obj) in
+            self.ancestors.iter().zip(self.original_ancestors.iter())
+        {
+            // Skip the parent itself — already handled above.
+            if ancestor_ref.num == self.parent_ref.num
+                && ancestor_ref.generation == self.parent_ref.generation
+            {
+                continue;
+            }
+            let dict = match original_obj {
+                PDFObject::Dictionary(d) => d.clone(),
+                _ => continue,
+            };
+            let current_count = dict
+                .get("Count")
+                .and_then(|c| c.as_number())
+                .unwrap_or(0.0) as u32;
+            let mut new_dict = dict;
+            new_dict.insert(
+                "Count".to_string(),
+                PDFObject::Number((current_count.saturating_sub(1)) as f64),
+            );
+            delta.modify_object(*ancestor_ref, PDFObject::Dictionary(new_dict));
+        }
+
+        Ok(())
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        // 1. Re-insert page ref into parent's /Kids and restore parent's /Count.
+        let parent_delta = delta
+            .get(&self.parent_ref)
+            .ok_or_else(|| PDFError::Generic("Parent not in delta during undo".into()))?;
+
+        let mut parent_dict = match &parent_delta.object {
+            PDFObject::Dictionary(d) => d.clone(),
+            _ => {
+                return Err(PDFError::Generic(
+                    "Parent in delta is not a dictionary".into(),
+                ));
+            }
+        };
+
+        let kids = parent_dict
+            .get("Kids")
+            .and_then(|k| k.as_array())
+            .ok_or_else(|| PDFError::Generic("Parent has no Kids array in undo".into()))?
+            .to_vec();
+
+        let mut new_kids: Vec<Box<PDFObject>> = kids;
+        new_kids.insert(
+            self.kid_index,
+            Box::new(PDFObject::Ref(self.page_ref)),
+        );
+
+        // Restore parent's /Count from original.
+        let original_parent_count = match &self.original_parent {
+            PDFObject::Dictionary(d) => d
+                .get("Count")
+                .and_then(|c| c.as_number())
+                .unwrap_or(0.0) as u32,
+            _ => 0,
+        };
+        parent_dict.insert(
+            "Kids".to_string(),
+            PDFObject::Array(new_kids.into()),
+        );
+        parent_dict.insert(
+            "Count".to_string(),
+            PDFObject::Number(original_parent_count as f64),
+        );
+        delta.modify_object(self.parent_ref, PDFObject::Dictionary(parent_dict));
+
+        // 2. Restore /Count on ancestors above the parent.
+        for ((ancestor_ref, original_count), _original_obj) in
+            self.ancestors.iter().zip(self.original_ancestors.iter())
+        {
+            if ancestor_ref.num == self.parent_ref.num
+                && ancestor_ref.generation == self.parent_ref.generation
+            {
+                continue;
+            }
+            // Read the current ancestor from delta (it was modified in execute).
+            let ancestor_delta = delta
+                .get(ancestor_ref)
+                .ok_or_else(|| {
+                    PDFError::Generic(format!(
+                        "Ancestor {} {} not in delta during undo",
+                        ancestor_ref.num, ancestor_ref.generation
+                    ))
+                })?;
+
+            let mut dict = match &ancestor_delta.object {
+                PDFObject::Dictionary(d) => d.clone(),
+                _ => continue,
+            };
+            dict.insert(
+                "Count".to_string(),
+                PDFObject::Number(*original_count as f64),
+            );
+            delta.modify_object(*ancestor_ref, PDFObject::Dictionary(dict));
+        }
+
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        // redo is identical to execute: remove kid, decrement counts.
+        self.execute(delta, None)
     }
 }
 

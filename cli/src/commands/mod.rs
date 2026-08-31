@@ -1,6 +1,7 @@
 //! Command implementations.
 
 pub mod annotations;
+pub mod edit;
 pub mod fonts;
 pub mod images;
 pub mod info;
@@ -17,7 +18,9 @@ use serde_json::Value;
 pub struct Ctx<'a> {
     pub doc: &'a mut PDFDocument,
     pub path: &'a str,
+    pub original_bytes: &'a [u8],
     pub file_size: Option<u64>,
+    pub output_path: Option<String>,
     pub pages: Vec<usize>, // 0-based page indices
     pub output: OutputMode,
 }
@@ -87,6 +90,9 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
         Images => images::run(ctx),
         Operators { summary, max } => operators::run(ctx, *summary, *max),
         Stream(n) => structure::run_stream(ctx, *n),
+        RotatePage { page, angle } => edit::run_rotate_page(ctx, *page, *angle),
+        SetInfo { entries } => edit::run_set_info(ctx, entries.clone()),
+        DeletePage { page } => edit::run_delete_page(ctx, *page),        Save => edit::run_save(ctx),
     };
 
     let cmd_name = match command {
@@ -107,6 +113,10 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
         Images => "images",
         Operators { .. } => "operators",
         Stream(_) => "stream",
+        RotatePage { .. } => "rotate-page",
+        SetInfo { .. } => "set-info",
+        DeletePage { .. } => "delete-page",
+        Save => "save",
     };
 
     match result {

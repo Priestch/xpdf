@@ -1,4 +1,6 @@
-use super::delta::{AddHighlightCommand, CommandHistory, DeltaLayer};
+use super::delta::{
+    AddHighlightCommand, CommandHistory, DeletePageCommand, DeltaLayer, RotatePageCommand, SetInfoCommand,
+};
 use super::doc_store::DocStore;
 use super::document_loader::{DocumentLoader, OpenProgress};
 use super::encryption::{EncryptDict, EncryptionVersion};
@@ -336,6 +338,84 @@ impl PDFDocument {
         &mut self.doc_store
     }
 
+    /// Execute an edit command and invalidate caches.
+    fn execute_command(&mut self, cmd: Box<dyn super::delta::Command>) -> PDFResult<()> {
+        if self.is_encrypted() {
+            return Err(PDFError::Generic(
+                "Saving edits to encrypted PDFs is not supported".into(),
+            ));
+        }
+        self.command_history
+            .execute(self.doc_store.delta_mut(), cmd, None)?;
+        self.invalidate_edit_caches();
+        Ok(())
+    }
+
+    /// Rotate a page by the given number of degrees (absolute, not relative).
+    ///
+    /// `degrees` must be a multiple of 90 (0, 90, 180, 270). This sets the
+    /// `/Rotate` entry on the page dictionary to `degrees`.
+    pub fn rotate_page(&mut self, page_index: usize, degrees: u16) -> PDFResult<()> {
+        let page = self.get_page(page_index)?;
+        let (num, generation) = page.reference().ok_or_else(|| {
+            PDFError::Generic(
+                "Cannot rotate a page without an indirect object reference".into(),
+            )
+        })?;
+        let original_page = page.dict().clone();
+        let cmd =
+            RotatePageCommand::new(Ref::new(num, generation), degrees)
+                .with_original_page(original_page);
+        self.execute_command(Box::new(cmd))
+    }
+
+    /// Set entries in the document /Info dictionary.
+    ///
+    /// `entries` is a list of `(key, Some(value))` to set or `(key, None)` to remove.
+    /// If no /Info dictionary exists, one is created automatically.
+    ///
+    /// Non-ASCII string values should be passed through
+    /// [`SetInfoCommand::encode_info_string`] first.
+    pub fn set_info(
+        &mut self,
+        entries: Vec<(String, Option<PDFObject>)>,
+    ) -> PDFResult<()> {
+        // 1. Determine the /Info ref: check delta trailer override first, then base trailer.
+        let info_ref = self
+            .doc_store
+            .delta()
+            .get_trailer_override("Info")
+            .cloned()
+            .or_else(|| {
+                let trailer = self.xref().trailer();
+                trailer
+                    .as_ref()
+                    .and_then(|t| match t {
+                        PDFObject::Dictionary(d) => d.get("Info").cloned(),
+                        _ => None,
+                    })
+            })
+            .and_then(|v| match v {
+                PDFObject::Ref(r) => Some(r),
+                _ => None,
+            });
+
+        // 2. Resolve the /Info object (if the ref exists).
+        //    If the ref is stale (points to a missing object), treat as None.
+        let original_info = match info_ref {
+            Some(ref_) => {
+                match self.doc_store.resolve_ref(ref_.num, ref_.generation) {
+                    Ok(obj) => Some((ref_, (*obj).clone())),
+                    Err(_) => None, // stale /Info ref — create fresh
+                }
+            }
+            None => None,
+        };
+
+        let cmd = SetInfoCommand::new(original_info, entries);
+        self.execute_command(Box::new(cmd))
+    }
+
     /// Add a standard highlight annotation in PDF user-space coordinates.
     pub fn add_highlight(
         &mut self,
@@ -343,11 +423,6 @@ impl PDFDocument {
         rect: [f64; 4],
         color: [f64; 3],
     ) -> PDFResult<()> {
-        if self.is_encrypted() {
-            return Err(PDFError::Generic(
-                "Saving edits to encrypted PDFs is not supported".into(),
-            ));
-        }
         let page = self.get_page(page_index)?;
         let (num, generation) = page.reference().ok_or_else(|| {
             PDFError::Generic("Cannot edit a page without an indirect object reference".into())
@@ -368,10 +443,233 @@ impl PDFDocument {
         }
         let command =
             AddHighlightCommand::new(Ref::new(num, generation), page_object, rect, color)?;
-        self.command_history
-            .execute(self.doc_store.delta_mut(), Box::new(command), None)?;
-        self.invalidate_edit_caches();
-        Ok(())
+        self.execute_command(Box::new(command))
+    }
+
+    /// Delete a page from the document.
+    ///
+    /// Removes the page from its parent's `/Kids` array and decrements `/Count`
+    /// on every ancestor up to the root `/Pages` node. The page object itself
+    /// is NOT deleted from the file (harmless orphan; simplifies undo).
+    ///
+    /// Dangling outline/GoTo destinations are tolerated by viewers (v1 limitation).
+    pub fn delete_page(&mut self, page_index: usize) -> PDFResult<()> {
+        // 1. Resolve the page and its parent chain.
+        let page = self.get_page(page_index)?;
+        let page_ref = page.reference().ok_or_else(|| {
+            PDFError::Generic(
+                "Cannot delete a page without an indirect object reference".into(),
+            )
+        })?;
+        let page_ref = Ref::new(page_ref.0, page_ref.1);
+
+        let (parent_ref, kid_index, ancestors) = self.page_parent_chain(page_index)?;
+
+        // 2. Pre-fetch parent and ancestor dicts (avoid fetch_base in command).
+        let original_parent = {
+            let obj = self
+                .doc_store
+                .resolve_ref(parent_ref.num, parent_ref.generation)?;
+            (*obj).clone()
+        };
+
+        let mut original_ancestors = Vec::new();
+        for (ancestor_ref, _) in &ancestors {
+            let obj = self
+                .doc_store
+                .resolve_ref(ancestor_ref.num, ancestor_ref.generation)?;
+            original_ancestors.push((*obj).clone());
+        }
+
+        // 3. Validate the kid_index against the parent's Kids array.
+        if let PDFObject::Dictionary(ref dict) = original_parent {
+            if let Some(kids) = dict.get("Kids").and_then(|k| k.as_array()) {
+                if kid_index >= kids.len() {
+                    return Err(PDFError::Generic(format!(
+                        "Internal error: kid_index {} >= Kids len {}",
+                        kid_index,
+                        kids.len()
+                    )));
+                }
+            }
+        }
+
+        let cmd = DeletePageCommand::new(
+            page_ref,
+            parent_ref,
+            kid_index,
+            ancestors,
+            original_parent,
+            original_ancestors,
+        );
+        self.execute_command(Box::new(cmd))
+    }
+
+    /// Walk the page tree to find the parent of `page_index` and collect ancestors.
+    ///
+    /// Returns `(parent_ref, kid_index_within_parent, ancestors)` where `ancestors`
+    /// is a list of `(ref, current_count)` from the immediate parent up to root `/Pages`.
+    fn page_parent_chain(
+        &mut self,
+        page_index: usize,
+    ) -> PDFResult<(Ref, usize, Vec<(Ref, u32)>)> {
+        use crate::PDFObject;
+
+        // Get the root /Pages *ref* (not resolved), so the DFS can track it.
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| PDFError::Generic("No catalog".into()))?;
+        let pages_ref_obj = catalog
+            .as_dictionary()
+            .and_then(|d| d.get("Pages"))
+            .ok_or_else(|| PDFError::Generic("No /Pages in catalog".into()))?
+            .clone();
+        let root_pages_ref = match &pages_ref_obj {
+            PDFObject::Ref(r) => Ref::new(r.num, r.generation),
+            _ => return Err(PDFError::Generic("/Pages is not an indirect reference".into())),
+        };
+
+        let mut store = self.doc_store_mut();
+
+        // Push root as a Ref so the DFS resolves it and captures resolved_ref.
+        let root_as_ref = Arc::new(PDFObject::Ref(Ref::new(
+            root_pages_ref.num,
+            root_pages_ref.generation,
+        )));
+        // Stack: (node_obj, node_ref, parent_ref)
+        let mut stack: Vec<(Arc<PDFObject>, Option<Ref>, Option<Ref>)> =
+            vec![(root_as_ref, None, None)];
+        let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
+        let mut current_page_index = 0usize;
+
+        while let Some((current_node, node_ref, parent_ref)) = stack.pop() {
+            // Resolve indirect references with cycle detection.
+            let (node_obj, resolved_ref) = match &*current_node {
+                PDFObject::Ref(ref_obj) => {
+                    let ref_key = (ref_obj.num, ref_obj.generation);
+                    if visited_refs.contains(&ref_key) {
+                        return Err(PDFError::Generic(
+                            "Circular reference in page tree".into(),
+                        ));
+                    }
+                    visited_refs.insert(ref_key);
+                    let obj = store.resolve_ref(ref_obj.num, ref_obj.generation)?;
+                    (obj, Some(Ref::new(ref_obj.num, ref_obj.generation)))
+                }
+                _ => (current_node, node_ref),
+            };
+
+            let dict = match &*node_obj {
+                PDFObject::Dictionary(d) => d,
+                _ => continue,
+            };
+
+            let type_obj = dict.get("Type");
+            let is_page = match type_obj {
+                Some(PDFObject::Name(name)) => name == "Page",
+                _ => !dict.contains_key("Kids"),
+            };
+
+            if is_page {
+                if current_page_index == page_index {
+                    // Found it. Build ancestor chain: parent + grandparents up to root.
+                    let parent = parent_ref.ok_or_else(|| {
+                        PDFError::Generic("Page has no parent in page tree".into())
+                    })?;
+
+                    // Walk up from parent to root via /Parent refs, collecting counts.
+                    let mut ancestors: Vec<(Ref, u32)> = Vec::new();
+                    let mut current = parent;
+                    loop {
+                        let obj = store.resolve_ref(current.num, current.generation)?;
+                        let count = match &*obj {
+                            PDFObject::Dictionary(d) => d
+                                .get("Count")
+                                .and_then(|c| c.as_number())
+                                .unwrap_or(0.0) as u32,
+                            _ => 0,
+                        };
+                        ancestors.push((current, count));
+
+                        // Follow /Parent pointer.
+                        match &*obj {
+                            PDFObject::Dictionary(d) => {
+                                match d.get("Parent") {
+                                    Some(PDFObject::Ref(r)) => {
+                                        current = Ref::new(r.num, r.generation);
+                                    }
+                                    _ => break, // reached root
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    // Find kid_index: which slot in parent's /Kids contains this page?
+                    let target_ref = resolved_ref.unwrap();
+                    let parent_obj = store.resolve_ref(parent.num, parent.generation)?;
+                    let kid_index = match &*parent_obj {
+                        PDFObject::Dictionary(d) => d
+                            .get("Kids")
+                            .and_then(|k| k.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .position(|kid| {
+                                        matches!(kid.as_ref(), PDFObject::Ref(r) if r.num == target_ref.num && r.generation == target_ref.generation)
+                                    })
+                                    .unwrap_or(0)
+                            })
+                            .unwrap_or(0),
+                        _ => 0,
+                    };
+
+                    return Ok((parent, kid_index, ancestors));
+                }
+                current_page_index += 1;
+                continue;
+            }
+
+            // Pages node: descend into /Kids (reverse order to maintain index order).
+            let kids = dict
+                .get("Kids")
+                .ok_or_else(|| PDFError::Generic("Pages node missing Kids array".into()))?;
+
+            let kids_array = match kids {
+                PDFObject::Array(arr) => arr.clone(),
+                PDFObject::Ref(ref_obj) => {
+                    let fetched =
+                        store.resolve_ref(ref_obj.num, ref_obj.generation)?;
+                    match &*fetched {
+                        PDFObject::Array(arr) => arr.clone(),
+                        _ => {
+                            return Err(PDFError::Generic(
+                                "Kids reference doesn't point to array".into(),
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(PDFError::Generic(
+                        "Kids is not an array or reference".into(),
+                    ));
+                }
+            };
+
+            let parent_for_kids = resolved_ref;
+            for kid in kids_array.iter().rev() {
+                stack.push((
+                    Arc::new((**kid).clone()),
+                    None,
+                    parent_for_kids,
+                ));
+            }
+        }
+
+        Err(PDFError::Generic(format!(
+            "Page index {} not found in page tree",
+            page_index
+        )))
     }
 
     /// Undo the most recent edit command.
@@ -1357,22 +1655,24 @@ impl PDFDocument {
     /// # Returns
     /// `Some(PDFObject)` with the info dictionary, or `None` if not present.
     pub fn document_info(&mut self) -> PDFResult<Option<Arc<PDFObject>>> {
-        let info_ref = {
-            let trailer = self.xref().trailer();
-
-            let trailer_dict = match trailer {
-                Some(PDFObject::Dictionary(dict)) => dict,
-                _ => return Ok(None),
-            };
-
-            // Get /Info entry from trailer (clone to avoid borrow issues)
-            match trailer_dict.get("Info") {
-                Some(info_ref) => info_ref.clone(),
-                None => return Ok(None),
-            }
+        // Check delta trailer overrides first (e.g. after set_info).
+        let info_ref = self
+            .doc_store
+            .delta()
+            .get_trailer_override("Info")
+            .cloned()
+            .or_else(|| {
+                let trailer = self.xref().trailer();
+                let trailer_dict = match trailer {
+                    Some(PDFObject::Dictionary(dict)) => dict,
+                    _ => return None,
+                };
+                trailer_dict.get("Info").cloned()
+            });
+        let info_ref = match info_ref {
+            Some(r) => r,
+            None => return Ok(None),
         };
-
-        // Fetch the info object
         let info_obj = self.doc_store.resolve_if_ref(&info_ref)?;
         Ok(Some(info_obj))
     }
@@ -2340,5 +2640,346 @@ startxref
             panic!("Annots must be an array");
         };
         assert_eq!(annots.len(), 1);
+    }
+
+    #[test]
+    fn rotate_page_undo_redo_and_incremental_reopen() {
+        let original = create_minimal_pdf();
+        let mut doc = PDFDocument::open(original.clone()).expect("minimal PDF should open");
+
+        let page_before = doc.get_page(0).unwrap();
+        assert!(page_before.get("Rotate").is_none());
+
+        doc.rotate_page(0, 90).expect("rotate should succeed");
+        assert_eq!(doc.editor_state(), (true, true, false));
+        let page_90 = doc.get_page(0).unwrap();
+        match page_90.get("Rotate").unwrap() {
+            PDFObject::Number(n) => assert_eq!(*n, 90.0),
+            other => panic!("expected Rotate=90, got {other:?}"),
+        }
+
+        doc.undo().expect("rotate undo should succeed");
+        assert!(doc.get_page(0).unwrap().get("Rotate").is_none());
+
+        doc.redo().expect("rotate redo should succeed");
+        match doc.get_page(0).unwrap().get("Rotate").unwrap() {
+            PDFObject::Number(n) => assert_eq!(*n, 90.0),
+            other => panic!("expected Rotate=90 after redo, got {other:?}"),
+        }
+
+        let update = doc
+                .incremental_update(&original)
+                .expect("update should serialize");
+        let mut saved = original;
+        saved.extend_from_slice(&update);
+        let mut reopened = PDFDocument::open(saved).expect("saved PDF should reopen");
+        let page_reopened = reopened.get_page(0).expect("page should resolve");
+        match page_reopened.get("Rotate").unwrap() {
+            PDFObject::Number(n) => assert_eq!(*n, 90.0),
+            other => panic!("expected Rotate=90 after reopen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of 90")]
+    fn rotate_page_rejects_invalid_angle() {
+        let original = create_minimal_pdf();
+        let mut doc = PDFDocument::open(original).expect("minimal PDF should open");
+        let _ = doc.rotate_page(0, 45);
+    }
+
+    #[test]
+    fn set_info_creates_and_round_trips() {
+        let original = create_minimal_pdf();
+        assert!(PDFDocument::open(original.clone())
+            .unwrap()
+            .document_info()
+            .unwrap()
+            .is_none());
+
+        let mut doc = PDFDocument::open(original.clone()).expect("open");
+        let title_val = SetInfoCommand::encode_info_string("Test Title");
+        let author_val = SetInfoCommand::encode_info_string("pdf-x");
+        doc.set_info(vec![
+            ("Title".into(), Some(title_val)),
+            ("Author".into(), Some(author_val)),
+        ])
+        .expect("set_info should succeed");
+        assert_eq!(doc.editor_state(), (true, true, false));
+
+        let info = doc.document_info().expect("info should resolve").unwrap();
+        match info.as_ref() {
+            PDFObject::Dictionary(dict) => {
+                match &dict["Title"] {
+                    PDFObject::String(s) => assert_eq!(s.as_slice(), b"Test Title"),
+                    other => panic!("Title unexpected: {other:?}"),
+                }
+                match &dict["Author"] {
+                    PDFObject::String(s) => assert_eq!(s.as_slice(), b"pdf-x"),
+                    other => panic!("Author unexpected: {other:?}"),
+                }
+            }
+            _ => panic!("info must be a dict"),
+        }
+
+        doc.undo().expect("undo");
+        assert!(doc.document_info().unwrap().is_none());
+
+        doc.redo().expect("redo");
+        let info2 = doc.document_info().unwrap().unwrap();
+        match info2.as_ref() {
+            PDFObject::Dictionary(d) => assert_eq!(d.keys().len(), 2),
+            _ => panic!("info must be a dict after redo"),
+        }
+
+        let update = doc
+                .incremental_update(&original)
+                .expect("serialize");
+        let mut saved = original;
+        saved.extend_from_slice(&update);
+        let mut reopened = PDFDocument::open(saved).expect("reopen");
+        let info3 = reopened.document_info().expect("info").unwrap();
+        match info3.as_ref() {
+            PDFObject::Dictionary(d) => {
+                match &d["Title"] {
+                    PDFObject::String(s) => assert_eq!(s.as_slice(), b"Test Title"),
+                    other => panic!("Title after reopen: {other:?}"),
+                }
+            }
+            _ => panic!("info must be a dict after reopen"),
+        }
+    }
+
+    #[test]
+    fn set_info_non_ascii_uses_utf16be() {
+        let original = create_minimal_pdf();
+        let mut doc = PDFDocument::open(original).expect("open");
+        let val = SetInfoCommand::encode_info_string("中文标题");
+        doc.set_info(vec![("Title".into(), Some(val))]).expect("set_info");
+        let info = doc.document_info().unwrap().unwrap();
+        // document_info returns the whole /Info dict.
+        let PDFObject::Dictionary(d) = info.as_ref() else {
+            panic!("expected dict, got {info:?}");
+        };
+        let PDFObject::HexString(bytes) = &d["Title"] else {
+            panic!("Title should be HexString, got {:?}", &d["Title"]);
+        };
+        assert_eq!(bytes[0], 0xFE);
+        assert_eq!(bytes[1], 0xFF);
+        // 4 CJK chars x 2 bytes + 2 BOM = 10.
+        assert_eq!(bytes.len(), 10);
+    }
+
+    fn create_3page_flat_pdf() -> Vec<u8> {
+        // Flat page tree: root /Pages -> 3 page kids.
+        // Objects: 1=Catalog, 2=Pages, 3-5=Pages, 6=Font, 7-9=Contents streams.
+        b"%PDF-1.4\n\
+            1 0 obj\n\
+            << /Type /Catalog /Pages 2 0 R >>\n\
+            endobj\n\
+            2 0 obj\n\
+            << /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\n\
+            endobj\n\
+            3 0 obj\n\
+            << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >> /Contents 7 0 R >>\n\
+            endobj\n\
+            4 0 obj\n\
+            << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >> /Contents 8 0 R >>\n\
+            endobj\n\
+            5 0 obj\n\
+            << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >> /Contents 9 0 R >>\n\
+            endobj\n\
+            6 0 obj\n\
+            << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n\
+            endobj\n\
+            7 0 obj\n\
+            << /Length 21 >>\n\
+            stream\n\
+            BT /F1 12 Tf 100 700 Td (P1) Tj ET\n\
+            endstream\n\
+            endobj\n\
+            8 0 obj\n\
+            << /Length 21 >>\n\
+            stream\n\
+            BT /F1 12 Tf 100 700 Td (P2) Tj ET\n\
+            endstream\n\
+            endobj\n\
+            9 0 obj\n\
+            << /Length 21 >>\n\
+            stream\n\
+            BT /F1 12 Tf 100 700 Td (P3) Tj ET\n\
+            endstream\n\
+            endobj\n\
+            xref\n\
+            0 10\n\
+            0000000000 65535 f \n\
+            0000000009 00000 n \n\
+            0000000058 00000 n \n\
+            0000000121 00000 n \n\
+            0000000272 00000 n \n\
+            0000000423 00000 n \n\
+            0000000574 00000 n \n\
+            0000000651 00000 n \n\
+            0000000740 00000 n \n\
+            0000000829 00000 n \n\
+            trailer\n\
+            << /Size 10 /Root 1 0 R >>\n\
+            startxref\n\
+            918\n\
+            %%EOF\n\n\
+            "
+            .to_vec()
+    }
+
+    fn create_nested_tree_pdf() -> Vec<u8> {
+        // 2-level tree: root /Pages -> 2 intermediate nodes -> 2 pages each.
+        // Objects: 1=Catalog, 2=RootPages, 3,4=IntermediatePages, 5-8=Page.
+        b"%PDF-1.4\n\
+            1 0 obj\n\
+            << /Type /Catalog /Pages 2 0 R >>\n\
+            endobj\n\
+            2 0 obj\n\
+            << /Type /Pages /Kids [3 0 R 4 0 R] /Count 4 >>\n\
+            endobj\n\
+            3 0 obj\n\
+            << /Type /Pages /Kids [5 0 R 6 0 R] /Count 2 /Parent 2 0 R >>\n\
+            endobj\n\
+            4 0 obj\n\
+            << /Type /Pages /Kids [7 0 R 8 0 R] /Count 2 /Parent 2 0 R >>\n\
+            endobj\n\
+            5 0 obj\n\
+            << /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            6 0 obj\n\
+            << /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            7 0 obj\n\
+            << /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            8 0 obj\n\
+            << /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] >>\n\
+            endobj\n\
+            xref\n\
+            0 9\n\
+            0000000000 65535 f \n\
+            0000000009 00000 n \n\
+            0000000058 00000 n \n\
+            0000000121 00000 n \n\
+            0000000198 00000 n \n\
+            0000000275 00000 n \n\
+            0000000346 00000 n \n\
+            0000000417 00000 n \n\
+            0000000488 00000 n \n\
+            trailer\n\
+            << /Size 9 /Root 1 0 R >>\n\
+            startxref\n\
+            559\n\
+            %%EOF\n\n\
+            "
+            .to_vec()
+    }
+
+    #[test]
+    fn delete_page_flat_tree_first() {
+        let original = create_3page_flat_pdf();
+        let mut doc = PDFDocument::open(original.clone()).expect("open");
+        assert_eq!(doc.page_count().unwrap(), 3);
+
+        doc.delete_page(0).expect("delete");
+        assert_eq!(doc.page_count().unwrap(), 2);
+        assert_eq!(doc.editor_state(), (true, true, false));
+
+        // Page 1 (was page 2) should now be at index 0.
+        let p = doc.get_page(0).unwrap();
+        assert_eq!(p.index(), 0);
+
+        // Page 2 (was page 3) should now be at index 1.
+        let p = doc.get_page(1).unwrap();
+        assert_eq!(p.index(), 1);
+
+        // Out of bounds.
+        assert!(doc.get_page(2).is_err());
+
+        // Undo restores.
+        doc.undo().expect("undo");
+        assert_eq!(doc.page_count().unwrap(), 3);
+        doc.get_page(2).expect("page 2 restored");
+
+        // Redo.
+        doc.redo().expect("redo");
+        assert_eq!(doc.page_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn delete_page_flat_tree_middle() {
+        let original = create_3page_flat_pdf();
+        let mut doc = PDFDocument::open(original).expect("open");
+        doc.delete_page(1).expect("delete");
+        assert_eq!(doc.page_count().unwrap(), 2);
+
+        // Page 0 still accessible.
+        doc.get_page(0).expect("page 0");
+        // Page 1 (was page 2) accessible.
+        doc.get_page(1).expect("page 1");
+        assert!(doc.get_page(2).is_err());
+    }
+
+    #[test]
+    fn delete_page_flat_tree_last() {
+        let original = create_3page_flat_pdf();
+        let mut doc = PDFDocument::open(original).expect("open");
+        doc.delete_page(2).expect("delete");
+        assert_eq!(doc.page_count().unwrap(), 2);
+        doc.get_page(0).expect("page 0");
+        doc.get_page(1).expect("page 1");
+    }
+
+    #[test]
+    fn delete_page_nested_tree() {
+        let original = create_nested_tree_pdf();
+        let mut doc = PDFDocument::open(original.clone()).expect("open");
+        assert_eq!(doc.page_count().unwrap(), 4);
+
+        // Delete page 1 (second page, in first intermediate node).
+        doc.delete_page(1).expect("delete");
+        assert_eq!(doc.page_count().unwrap(), 3);
+
+        // Remaining pages accessible.
+        for i in 0..3 {
+            doc.get_page(i).unwrap_or_else(|_| {
+                panic!("page {i} should exist after delete");
+            });
+        }
+        assert!(doc.get_page(3).is_err());
+
+        // Undo.
+        doc.undo().expect("undo");
+        assert_eq!(doc.page_count().unwrap(), 4);
+
+        // Redo.
+        doc.redo().expect("redo");
+        assert_eq!(doc.page_count().unwrap(), 3);
+
+        // Round-trip: save and reopen.
+        let update = doc
+            .incremental_update(&original)
+            .expect("update should serialize");
+        let mut saved = original;
+        saved.extend_from_slice(&update);
+        let mut reopened =
+            PDFDocument::open(saved).expect("saved PDF should reopen");
+        assert_eq!(reopened.page_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn delete_page_nested_tree_cross_branch() {
+        let original = create_nested_tree_pdf();
+        let mut doc = PDFDocument::open(original).expect("open");
+
+        // Delete page 2 (first page of second intermediate node).
+        // This tests that /Count is decremented on both the intermediate
+        // node (4) and the root (2).
+        doc.delete_page(2).expect("delete");
+        assert_eq!(doc.page_count().unwrap(), 3);
     }
 }

@@ -30,6 +30,10 @@ pub enum Command {
     Images,
     Operators { summary: bool, max: Option<usize> },
     Stream(u32),
+    RotatePage { page: usize, angle: u16 },
+    SetInfo { entries: Vec<(String, Option<String>)> },
+    Save,
+ DeletePage { page: usize },
 }
 
 /// Parsed CLI arguments.
@@ -38,6 +42,7 @@ pub struct Args {
     pub command: Command,
     pub output: OutputMode,
     pub pages: Vec<usize>,
+    pub output_path: Option<String>,
 }
 
 impl Args {
@@ -51,12 +56,20 @@ impl Args {
         let mut output = OutputMode::Human;
         let mut pages: Vec<usize> = Vec::new();
         let mut command = Command::All;
+        let mut output_path: Option<String> = None;
 
         let mut i = 2;
         while i < raw.len() {
             match raw[i].as_str() {
                 "--json" => output = OutputMode::Json,
                 "--compact" => output = OutputMode::JsonCompact,
+                "--output" => {
+                    i += 1;
+                    if i >= raw.len() {
+                        return Err("--output requires a file path".into());
+                    }
+                    output_path = Some(raw[i].clone());
+                }
                 "--page" => {
                     i += 1;
                     if i >= raw.len() {
@@ -106,6 +119,81 @@ impl Args {
                     }
                     let n: u32 = raw[i].parse().map_err(|_| "invalid object number")?;
                     command = Command::Stream(n);
+                }
+                "rotate-page" => {
+                    i += 1;
+                    if i >= raw.len() {
+                        return Err("rotate-page requires a page number".into());
+                    }
+                    let p: usize = raw[i].parse().map_err(|_| "invalid page number")?;
+                    if p == 0 {
+                        return Err("page numbers are 1-based".into());
+                    }
+                    let angle = loop {
+                        i += 1;
+                        if i >= raw.len() {
+                            return Err("rotate-page requires --angle <degrees>".into());
+                        }
+                        if raw[i] == "--angle" {
+                            i += 1;
+                            if i >= raw.len() {
+                                return Err("--angle requires a degree value".into());
+                            }
+                            let a: u16 = raw[i].parse().map_err(|_| "invalid angle")?;
+                            if a % 90 != 0 {
+                                return Err("angle must be a multiple of 90".into());
+                            }
+                            break a;
+                        }
+                    };
+                    command = Command::RotatePage {
+                        page: p - 1,
+                        angle,
+                    };
+                }
+                "set-info" => {
+                    let mut entries = Vec::new();
+                    const KEYS: &[&str] = &[
+                        "title", "author", "subject", "keywords", "creator", "producer",
+                        "creation-date", "mod-date",
+                    ];
+                    while i + 1 < raw.len() {
+                        let flag = &raw[i + 1];
+                        if let Some(key) = flag.strip_prefix("--") {
+                            let canon = key.to_lowercase();
+                            if KEYS.contains(&canon.as_str()) {
+                                i += 2;
+                                let val = if i < raw.len() {
+                                    Some(raw[i].clone())
+                                } else {
+                                    return Err(format!("--{key} requires a value"));
+                                };
+                                let pdf_key = canon[..1].to_uppercase() + &canon[1..];
+                                let pdf_key = pdf_key.replace('-', " ");
+                                entries.push((pdf_key, val));
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if entries.is_empty() {
+                        return Err("set-info requires at least one --key value".into());
+                    }
+                    command = Command::SetInfo { entries };
+                }
+                "delete-page" => {
+                    i += 1;
+                    if i >= raw.len() {
+                        return Err("delete-page requires a page number".into());
+                    }
+                    let p: usize = raw[i].parse().map_err(|_| "invalid page number")?;
+                    if p == 0 {
+                        return Err("page numbers are 1-based".into());
+                    }
+                    command = Command::DeletePage { page: p - 1 };
+                }
+                "save" => {
+                    command = Command::Save;
                 }
                 "object" => {
                     i += 1;
@@ -168,12 +256,13 @@ impl Args {
             command,
             output,
             pages,
+            output_path,
         })
     }
 
     fn usage() -> String {
         [
-            "PDF Structure Inspector (pdf-x)",
+            "PDF Structure Inspector & Editor (pdf-x)",
             "",
             "Usage: pdf-x <file> <command> [options]",
             "",
@@ -193,10 +282,20 @@ impl Args {
             "  outline           Document outline (bookmarks)",
             "  annotations       Annotations",
             "  page-sizes        Page dimensions",
+            "  rotate-page <P> --angle <DEG>  Rotate page (90/180/270)",
+            "  set-info --title T --author A ...  Set document metadata",
+            "                                    (empty value removes the key)",
+            "  delete-page <P>                   Delete a page
+  save --output <path>               Save edits to file",
+            "",
+            "Edit commands accept --output to save in one step:",
+            "  pdf-x in.pdf rotate-page 1 --angle 90 --output out.pdf",
+            "  pdf-x in.pdf set-info --title 'X' --output out.pdf",
             "",
             "Options:",
             "  --json            JSON output",
             "  --compact         Single-line JSON",
+            "  --output <path>   Write output file (required for save/edit)",
             "  --page <N>        Filter to specific page(s) (1-based)",
             "",
             "Legacy flags still work: --all --catalog --xref --trailer --pages",
