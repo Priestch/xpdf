@@ -13,7 +13,7 @@ impl<'a> SkiaDevice<'a> {
         rgba: &[u8],
         width: u32,
         height: u32,
-        _image_to_device: &[f64; 6],
+        image_to_device: &[f64; 6],
         pattern_to_device: &[f64; 6],
         bbox: &[f64; 4],
         x_step: f64,
@@ -37,7 +37,7 @@ impl<'a> SkiaDevice<'a> {
             rgba,
             width,
             height,
-            _image_to_device,
+            image_to_device,
             path.bounds(),
             self.current_state().transform,
         );
@@ -67,6 +67,20 @@ impl<'a> SkiaDevice<'a> {
         let Some(pattern_pixmap) = PixmapRef::from_bytes(rgba, width, height) else {
             return Ok(false);
         };
+
+        // Build the transform that maps the cell bitmap (rendered with
+        // a simple scale+translate) into device space.  This carries the
+        // Y-flip and any rotation that `image_to_device` encodes.
+        // tiny_skia Transform fields: sx, ky, kx, sy, tx, ty.
+        let cell_transform = Transform::from_row(
+            image_to_device[0] as f32,
+            image_to_device[1] as f32,
+            image_to_device[2] as f32,
+            image_to_device[3] as f32,
+            image_to_device[4] as f32,
+            image_to_device[5] as f32,
+        );
+
         let (ix0, ix1, iy0, iy1) = tile_bounds;
         let mut tile_count = 0usize;
         for ix in ix0..=ix1 {
@@ -76,20 +90,24 @@ impl<'a> SkiaDevice<'a> {
                 }
                 tile_count += 1;
 
-                let original_x = pattern_to_device[0] * (ix as f64 * x_step) + pattern_to_device[4];
-                let original_y = pattern_to_device[3] * (iy as f64 * y_step) + pattern_to_device[5];
-                let draw_x = original_x + left_offset;
-                let draw_y = original_y + top_offset;
-                let int_x = draw_x.floor();
-                let int_y = draw_y.floor();
-                let transform =
-                    Transform::from_translate((draw_x - int_x) as f32, (draw_y - int_y) as f32);
+                // The per-tile offset is applied through the step-size
+                // component of pattern_to_device.  Since we already have
+                // image_to_device which includes the base transform, we
+                // only need to add the step-based translation.
+                let tile_tx = pattern_to_device[0] * (ix as f64 * x_step);
+                let tile_ty = pattern_to_device[3] * (iy as f64 * y_step);
+                let stamp_transform = Transform::from_translate(
+                    tile_tx as f32,
+                    tile_ty as f32,
+                );
+                let combined = cell_transform.pre_translate(stamp_transform.tx, stamp_transform.ty);
+
                 self.pixmap.draw_pixmap(
-                    int_x as i32,
-                    int_y as i32,
+                    0,
+                    0,
                     pattern_pixmap,
                     &pixmap_paint,
-                    transform,
+                    combined,
                     combined_mask.as_ref(),
                 );
             }

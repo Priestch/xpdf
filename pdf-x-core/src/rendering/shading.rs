@@ -302,8 +302,9 @@ impl ShadingFunction {
                 range,
             } => {
                 let program = std::str::from_utf8(program).unwrap_or("");
+                let num_out = range.len() / 2;
                 let clamped_inputs = clamp_function_values(inputs, domain);
-                let mut output = eval_postscript(program, &clamped_inputs);
+                let mut output = eval_postscript(program, &clamped_inputs, num_out);
                 clamp_function_values_in_place(&mut output, range);
                 output
             }
@@ -483,7 +484,14 @@ impl PsValue {
     }
 }
 
-fn eval_postscript(program: &str, inputs: &[f64]) -> Vec<f64> {
+/// Evaluate a PostScript calculator function (PDF Function Type 4).
+///
+/// `num_out` is the expected number of output values (number of Range
+/// pairs). Per the PDF spec and pdf.js, only the top `num_out` numeric
+/// values on the stack are returned — conditional programs that leave
+/// residue underneath are handled correctly.
+/// Source: pdf.js `pdf.js/src/core/function.js` `postScriptEval`.
+fn eval_postscript(program: &str, inputs: &[f64], num_out: usize) -> Vec<f64> {
     let mut tokens = PsTokenizer::new(program);
     let ops = if program.trim_start().starts_with('{') {
         match tokens.next() {
@@ -497,14 +505,21 @@ fn eval_postscript(program: &str, inputs: &[f64]) -> Vec<f64> {
 
     eval_ps_ops(&ops, &mut stack, 0);
 
-    stack
+    // Extract only the top `num_out` numeric values from the stack.
+    // pdf.js pops exactly `numOut` from the top; collecting in reverse
+    // and re-reversing is equivalent.
+    let mut numbers: Vec<f64> = stack
         .iter()
+        .rev()
         .filter_map(|v| match v {
             PsValue::Number(n) => Some(*n),
             PsValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             PsValue::Procedure(_) => None,
         })
-        .collect()
+        .take(num_out)
+        .collect();
+    numbers.reverse();
+    numbers
 }
 
 struct PsTokenizer<'a> {

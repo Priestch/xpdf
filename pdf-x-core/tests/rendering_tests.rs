@@ -488,6 +488,7 @@ fn test_draw_image() {
         data: pixel_data,
         has_alpha: true,
         bits_per_component: 8,
+        original_bits_per_component: 8,
         is_mask: false,
         mask_paint_one: true,
         mask_color: [0, 0, 0],

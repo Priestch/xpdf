@@ -69,8 +69,12 @@ pub struct ImageData {
     pub data: Vec<u8>,
     /// Whether the image has an alpha channel
     pub has_alpha: bool,
-    /// Bits per component
+    /// Bits per component (after expansion — may be 8 even for
+    /// images that were originally 1-bpc).
     pub bits_per_component: u8,
+    /// Original bits per component before any expansion (used to
+    /// preserve bilevel semantics for the device's resampling heuristics).
+    pub original_bits_per_component: u8,
     /// Whether this is a 1-bpp image mask (stencil).
     pub is_mask: bool,
     /// Image-mask polarity after applying the PDF /Decode array.

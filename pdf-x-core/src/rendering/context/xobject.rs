@@ -463,6 +463,10 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 )
             };
 
+        // Remember the original bpc before expansion so the device can
+        // skip bilinear filtering on bilevel images.
+        let original_bpc = decoded_bpc;
+
         // Expand 1-bpc sampled images to 8-bpc before color conversion. PDF image rows
         // are byte-aligned, so the padding bits at the end of each row must be skipped.
         let expand_1bpc_sampled = should_expand_1bpc_sampled_image(xobject_dict.get("Filter"));
@@ -616,6 +620,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             data: decoded_data,
             has_alpha: decoded_has_alpha,
             bits_per_component: decoded_bpc,
+            original_bits_per_component: original_bpc,
             is_mask: is_image_mask,
             mask_paint_one: image_mask_paint_one(xobject_dict),
             interpolate,
@@ -693,6 +698,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 .unwrap_or(8.0) as u8
         };
 
+        let original_bpc = bits_per_component;
+
         let decoded =
             decode_inline_image_data(data, dict, width, height).unwrap_or_else(|| data.clone());
 
@@ -733,14 +740,13 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             decoded
         };
 
-        let decoded = normalize_pdfium_default_ccitt_image_mask(decoded, is_image_mask, dict);
-
         let image = crate::rendering::ImageData {
             width,
             height,
             data: decoded,
             has_alpha: false,
             bits_per_component: bpc,
+            original_bits_per_component: original_bpc,
             is_mask: is_image_mask,
             mask_paint_one: image_mask_paint_one(dict),
             interpolate: matches!(dict.get("Interpolate"), Some(PDFObject::Boolean(true))),

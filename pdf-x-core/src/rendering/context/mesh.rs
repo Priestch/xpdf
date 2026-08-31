@@ -251,8 +251,15 @@ pub(super) fn parse_shading_function(
             if ft == 0 {
                 parse_sampled_function(dict, data)
             } else {
+                // Type 4 (PostScript calculator) — filter-decode the
+                // stream before storing the program, matching the Type 0
+                // path above and pdf.js behaviour.
+                let program = dict
+                    .get("Filter")
+                    .and_then(|filter| crate::core::decode::apply_filters(data, filter).ok())
+                    .unwrap_or_else(|| data.to_vec());
                 crate::rendering::shading::ShadingFunction::PostScript {
-                    program: data.clone(),
+                    program,
                     domain: number_array(dict.get("Domain")).unwrap_or_default(),
                     range: number_array(dict.get("Range")).unwrap_or_default(),
                 }

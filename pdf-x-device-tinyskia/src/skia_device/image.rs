@@ -207,12 +207,25 @@ impl<'a> SkiaDevice<'a> {
         // Nearest on 1bpp yields pure-black blocks under ~8× scale
         // (image_inline_4); hayro/mutool produce soft mid-gray coverage.
         // Source: hayro/hayro/src/renderer.rs draw_image resize path.
+        // Any 1-bpp mask that is being drawn much smaller than its
+        // native resolution needs area-averaged downsampling — nearest-
+        // neighbor point-sampling drops thin strokes entirely (e.g.
+        // a 2336×2857 CCITT mask drawn to ~150×190 device px).
+        // Catmull-Rom on 1bpp naturally produces coverage values in 0–255,
+        // which is exactly the alpha-coverage semantics masks need.
+        // Source: hayro/hayro/src/renderer.rs draw_image resize path.
         let type3_mask_downsample = image.is_mask
             && self.type3_glyph_depth > 0
             && glyph_image_padding == 0
             && should_prefilter_type3_mask(pixmap_width, pixmap_height, adjusted_transform);
 
-        if type3_mask_downsample {
+        // Non-Type3 image masks (XObject CCITT etc.) that are
+        // significantly downscaled also benefit from Catmull-Rom.
+        let xobject_mask_downsample = image.is_mask
+            && self.type3_glyph_depth == 0
+            && should_prefilter_type3_mask(pixmap_width, pixmap_height, adjusted_transform);
+
+        if type3_mask_downsample || xobject_mask_downsample {
             let dest_width = (adjusted_transform.sx.hypot(adjusted_transform.ky)
                 * pixmap_width as f32)
                 .abs()

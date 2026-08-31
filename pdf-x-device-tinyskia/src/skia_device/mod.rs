@@ -2593,7 +2593,11 @@ fn mupdf_subsample_rgba(
 }
 
 fn should_auto_bilinear(image: &ImageData, transform: Transform) -> bool {
-    if image.is_mask || image.bits_per_component == 1 || image.width == 0 || image.height == 0 {
+    if image.is_mask
+        || image.original_bits_per_component == 1
+        || image.width == 0
+        || image.height == 0
+    {
         return false;
     }
 
