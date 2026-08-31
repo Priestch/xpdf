@@ -112,6 +112,25 @@ pub fn run_page_sizes(ctx: &mut Ctx) -> Result<Value, String> {
     Ok(json!({ "pages": pages, "count": pages.len() }))
 }
 
+/// Decode PDF string bytes (literal or hex) to a displayable String.
+///
+/// Per PDF spec §7.9.2, string values in the /Info dictionary may be
+/// UTF-16BE with a BOM (\xfe\xff). Hex strings with that BOM are decoded
+/// as UTF-16BE; everything else falls back to lossy UTF-8.
+fn decode_pdf_string_bytes(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xfe && bytes[1] == 0xff {
+        // UTF-16BE BOM — decode 16-bit code units, dropping unpaired surrogates.
+        let u16_iter = bytes[2..].chunks_exact(2).filter_map(|chunk| {
+            Some(u16::from_be_bytes([chunk[0], chunk[1]]))
+        });
+        char::decode_utf16(u16_iter)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
 /// Flatten an /Info dictionary into plain JSON strings.
 fn info_dict_to_value(info: &PDFObject) -> Value {
     match info {
@@ -122,9 +141,9 @@ fn info_dict_to_value(info: &PDFObject) -> Value {
             for key in keys {
                 let value = &dict[key];
                 let rendered = match value {
-                    PDFObject::String(s) => Value::String(String::from_utf8_lossy(s).into_owned()),
+                    PDFObject::String(s) => Value::String(decode_pdf_string_bytes(s)),
                     PDFObject::HexString(s) => {
-                        Value::String(s.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                        Value::String(decode_pdf_string_bytes(s))
                     }
                     PDFObject::Name(n) => Value::String(format!("/{n}")),
                     other => crate::jsonutil::pdf_object_to_value(other),
