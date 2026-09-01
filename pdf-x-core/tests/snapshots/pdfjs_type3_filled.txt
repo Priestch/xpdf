@@ -1,0 +1,55 @@
+save
+transform 1.000000 0.000000 0.000000 -1.000000 0.000000 200.000000
+setGState [[ca, 0.500000]]
+setFillRGBColor #ff0000
+beginText
+setTextRenderingMode 0.000000
+dependency g_d0_f1
+setFont g_d0_f1 20.000000
+setTextMatrix {0=1.000000, 1=0.000000, 2=0.000000, 3=-1.000000, 4=0.000000, 5=80.000000}
+showText glyphs=19
+endText
+restore
+save
+transform 1.000000 0.000000 0.000000 -1.000000 0.000000 200.000000
+setGState [[ca, 0.800000]]
+setFillRGBColor #0000ff
+beginText
+setTextRenderingMode 0.000000
+setFont g_d0_f1 20.000000
+setTextMatrix {0=1.000000, 1=0.000000, 2=0.000000, 3=-1.000000, 4=0.000000, 5=100.000000}
+showText glyphs=19
+endText
+restore
+save
+transform 1.000000 0.000000 0.000000 -1.000000 0.000000 200.000000
+setFillColorN Shading pattern_p0_1 [1.000000, 0.000000, 0.000000, -1.000000, 0.000000, 200.000000]
+beginText
+setTextRenderingMode 0.000000
+setFont g_d0_f1 20.000000
+setTextMatrix {0=1.000000, 1=0.000000, 2=0.000000, 3=-1.000000, 4=0.000000, 5=120.000000}
+showText glyphs=15
+endText
+restore
+save
+transform 1.000000 0.000000 0.000000 -1.000000 0.000000 200.000000
+setGState [[ca, 0.800000]]
+setFillRGBColor #0000ff
+beginText
+setTextRenderingMode 0.000000
+dependency g_d0_f2
+setFont g_d0_f2 20.000000
+setTextMatrix {0=1.000000, 1=0.000000, 2=0.000000, 3=-1.000000, 4=0.000000, 5=140.000000}
+showText glyphs=3
+endText
+restore
+save
+transform 1.000000 0.000000 0.000000 -1.000000 0.000000 200.000000
+setFillColorN Shading pattern_p0_2 [1.000000, 0.000000, 0.000000, -1.000000, 0.000000, 200.000000]
+beginText
+setTextRenderingMode 0.000000
+setFont g_d0_f1 20.000000
+setTextMatrix {0=1.000000, 1=0.000000, 2=0.000000, 3=-1.000000, 4=0.000000, 5=160.000000}
+showText glyphs=35
+endText
+restore

@@ -1,0 +1,130 @@
+save
+transform 1.000000 0.000000 0.000000 1.000000 72.000000 -49.750000
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #e6e6e6
+setFillRGBColor #e6e6e6
+save
+setLineWidth 0.996000
+constructPath ops=[20] coords=[0,-69.86000061035156,60.97999954223633,1,-13.170000076293945,60.97999954223633]
+restore
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #ffffff
+setFillRGBColor #ffffff
+setStrokeRGBColor #808080
+setFillRGBColor #808080
+save
+constructPath ops=[28] coords=[null]
+setLineJoin 1.000000
+setLineCap 1.000000
+restore
+beginText
+dependency g_d0_f1
+setFont g_d0_f1 24.787000
+moveText -13.170000 54.000000
+showText glyphs=1
+endText
+constructPath ops=[20] coords=[0,-13.170000076293945,54]
+setStrokeRGBColor #ffffff
+setFillRGBColor #ffffff
+beginText
+setFont g_d0_f1 24.787000
+moveText -13.170000 54.000000
+showText glyphs=1
+endText
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #c43119
+setFillRGBColor #c43119
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+save
+constructPath ops=[28] coords=[null]
+setLineJoin 1.000000
+setLineCap 1.000000
+restore
+beginText
+setFont g_d0_f1 24.787000
+moveText -1.520000 54.000000
+showText glyphs=1
+setFont g_d0_f1 20.663000
+moveText 6.400000 2.740000
+showText glyphs=1
+setFont g_d0_f1 24.787000
+moveText 11.450000 -2.740000
+showText glyphs=1
+moveText 13.490000 -4.100000
+showText glyphs=1
+moveText 13.040000 4.100000
+showText glyphs=8
+endText
+constructPath ops=[20] coords=[0,-1.5199999809265137,54]
+setStrokeRGBColor #c43119
+setFillRGBColor #c43119
+beginText
+setFont g_d0_f1 24.787000
+moveText -1.520000 54.000000
+showText glyphs=1
+setFont g_d0_f1 20.663000
+moveText 6.400000 2.740000
+showText glyphs=1
+setFont g_d0_f1 24.787000
+moveText 11.450000 -2.740000
+showText glyphs=1
+moveText 13.490000 -4.100000
+showText glyphs=1
+moveText 13.040000 4.100000
+showText glyphs=8
+endText
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #ffffff
+setFillRGBColor #ffffff
+setStrokeRGBColor #808080
+setFillRGBColor #808080
+save
+constructPath ops=[28] coords=[null]
+setLineJoin 1.000000
+setLineCap 1.000000
+restore
+beginText
+setFont g_d0_f1 24.787000
+moveText 141.440000 54.000000
+showText glyphs=1
+endText
+constructPath ops=[20] coords=[0,141.44000244140625,54]
+setStrokeRGBColor #ffffff
+setFillRGBColor #ffffff
+beginText
+setFont g_d0_f1 24.787000
+moveText 141.440000 54.000000
+showText glyphs=1
+endText
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #e6e6e6
+setFillRGBColor #e6e6e6
+save
+setLineWidth 0.996000
+constructPath ops=[20] coords=[0,147.75999450683594,60.97999954223633,1,204.4499969482422,60.97999954223633]
+restore
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+setStrokeRGBColor #000000
+setFillRGBColor #000000
+restore

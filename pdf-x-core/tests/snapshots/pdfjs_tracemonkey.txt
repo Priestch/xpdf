@@ -1,0 +1,401 @@
+beginText
+dependency g_d0_f1
+setFont g_d0_f1 17.932800
+moveText 80.515900 700.670600
+showText glyphs=61
+moveText 183.190100 -19.925300
+showText glyphs=9
+dependency g_d0_f2
+setFont g_d0_f2 10.958900
+moveText -143.383600 -35.865500
+showText glyphs=11
+dependency g_d0_f3
+setFont g_d0_f3 7.970100
+moveText 55.078900 3.958800
+showText glyphs=1
+dependency g_d0_f4
+setFont g_d0_f4 7.970100
+moveText 4.732300 0.000000
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 7.084600 -3.958800
+showText glyphs=14
+setFont g_d0_f3 7.970100
+moveText 65.435100 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732300 -3.958800
+showText glyphs=16
+setFont g_d0_f3 7.970100
+moveText 61.292800 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732300 -3.958800
+showText glyphs=17
+setFont g_d0_f3 7.970100
+moveText 77.391300 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732300 -3.958800
+showText glyphs=17
+setFont g_d0_f3 7.970100
+moveText 76.788400 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732300 -3.958800
+showText glyphs=1
+moveText -393.513400 -12.951400
+showText glyphs=21
+setFont g_d0_f4 7.970100
+moveText 114.147000 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732300 -3.958800
+showText glyphs=15
+setFont g_d0_f3 7.970100
+moveText 65.325400 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732300 -3.958800
+showText glyphs=15
+setFont g_d0_f3 7.970100
+moveText 73.336600 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732300 -3.958800
+showText glyphs=16
+setFont g_d0_f3 7.970100
+moveText 67.714500 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732400 -3.958800
+showText glyphs=18
+setFont g_d0_f3 7.970100
+moveText 76.108900 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732300 -3.958800
+showText glyphs=1
+moveText -445.560700 -12.951400
+showText glyphs=14
+setFont g_d0_f3 7.970100
+moveText 70.914200 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 4.732300 -3.958800
+showText glyphs=13
+setFont g_d0_f4 7.970100
+moveText 63.024100 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 7.555100 -3.958800
+showText glyphs=16
+setFont g_d0_f4 7.970100
+moveText 72.141400 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 7.555100 -3.958800
+showText glyphs=18
+setFont g_d0_f4 7.970100
+moveText 83.089300 3.958800
+showText glyphs=1
+setFont g_d0_f2 10.958900
+moveText 7.084700 -3.958800
+showText glyphs=13
+setFont g_d0_f4 7.970100
+moveText 66.662500 3.958800
+showText glyphs=3
+setFont g_d0_f2 10.958900
+moveText 14.639800 -3.958800
+showText glyphs=15
+setFont g_d0_f4 7.970100
+moveText 69.084100 3.958800
+showText glyphs=1
+setFont g_d0_f2 8.966400
+moveText -268.592400 -18.902800
+showText glyphs=19
+dependency g_d0_f5
+setFont g_d0_f5 5.977600
+moveText 73.469600 3.809000
+showText glyphs=1
+dependency g_d0_f6
+setFont g_d0_f6 8.966400
+moveText -248.658400 -13.771600
+showText glyphs=1
+dependency g_d0_f7
+setFont g_d0_f7 8.966400
+moveText 4.607700 0.000000
+showText glyphs=78
+setFont g_d0_f6 8.966400
+moveText 362.461500 0.000000
+showText glyphs=1
+setFont g_d0_f7 8.966400
+moveText 4.607700 0.000000
+showText glyphs=12
+setFont g_d0_f2 8.966400
+moveText -195.572500 -16.179300
+showText glyphs=17
+dependency g_d0_f8
+setFont g_d0_f8 5.977600
+moveText 69.480000 3.809000
+showText glyphs=1
+setFont g_d0_f6 8.966400
+moveText -99.658300 -13.771600
+showText glyphs=1
+setFont g_d0_f7 8.966400
+moveText 4.607700 0.000000
+showText glyphs=17
+setFont g_d0_f6 8.966400
+moveText 80.024000 0.000000
+showText glyphs=1
+setFont g_d0_f7 8.966400
+moveText 4.607700 0.000000
+showText glyphs=10
+setFont g_d0_f2 8.966400
+moveText -54.164200 -16.511400
+showText glyphs=17
+setFont g_d0_f8 5.977600
+moveText 62.010800 3.809000
+showText glyphs=1
+setFont g_d0_f6 8.966400
+moveText -104.146900 -13.771600
+showText glyphs=1
+setFont g_d0_f7 8.966400
+moveText 4.607700 0.000000
+showText glyphs=20
+setFont g_d0_f6 8.966400
+moveText 94.145800 0.000000
+showText glyphs=1
+setFont g_d0_f7 8.966400
+moveText 4.607700 0.000000
+showText glyphs=10
+setFont g_d0_f2 8.966400
+moveText -87.039200 -15.847200
+showText glyphs=34
+setFont g_d0_f8 5.977600
+moveText 111.701900 3.809000
+showText glyphs=1
+setFont g_d0_f6 8.966400
+moveText -125.670300 -13.771600
+showText glyphs=1
+setFont g_d0_f7 8.966400
+moveText 4.607700 0.000000
+showText glyphs=21
+setFont g_d0_f6 8.966400
+moveText 98.853100 0.000000
+showText glyphs=1
+setFont g_d0_f7 8.966400
+moveText 4.607700 0.000000
+showText glyphs=8
+setFont g_d0_f1 10.958900
+moveText -286.263600 -67.746000
+showText glyphs=8
+setFont g_d0_f2 8.966400
+moveText 0.000000 -13.947700
+showText glyphs=65
+moveText 0.000000 -9.962600
+showText glyphs=67
+moveText 0.000000 -9.962700
+showText glyphs=72
+moveText 0.000000 -9.962600
+showText glyphs=68
+moveText 0.000000 -9.962600
+showText glyphs=66
+moveText 0.000000 -9.962700
+showText glyphs=69
+moveText 0.000000 -9.962600
+showText glyphs=64
+moveText 0.000000 -9.962700
+showText glyphs=63
+moveText 0.000000 -9.962600
+showText glyphs=69
+moveText 0.000000 -9.962600
+showText glyphs=71
+moveText 0.000000 -9.962700
+showText glyphs=69
+moveText 0.000000 -9.962600
+showText glyphs=65
+moveText 0.000000 -9.962700
+showText glyphs=62
+moveText 0.000000 -9.962600
+showText glyphs=9
+dependency g_d0_f9
+setFont g_d0_f9 8.966400
+moveText 0.000000 -15.604100
+showText glyphs=34
+setFont g_d0_f2 8.966400
+moveText 142.548800 0.000000
+showText glyphs=7
+dependency g_d0_f10
+setFont g_d0_f10 8.966400
+moveText 26.421900 0.000000
+showText glyphs=19
+moveText -168.970700 -9.962600
+showText glyphs=8
+setFont g_d0_f2 8.966400
+moveText 25.222300 0.000000
+showText glyphs=15
+setFont g_d0_f10 8.966400
+moveText 59.518100 0.000000
+showText glyphs=42
+setFont g_d0_f2 8.966400
+moveText 142.788000 0.000000
+showText glyphs=1
+setFont g_d0_f9 8.966400
+moveText -227.528400 -15.604100
+showText glyphs=14
+setFont g_d0_f2 8.966400
+moveText 64.375500 0.000000
+showText glyphs=46
+moveText -64.375500 -9.962700
+showText glyphs=6
+setFont g_d0_f9 8.966400
+moveText 0.000000 -15.604100
+showText glyphs=10
+setFont g_d0_f2 8.966400
+moveText 44.472800 0.000000
+showText glyphs=52
+setFont g_d0_f1 10.958900
+moveText -44.472800 -22.577900
+showText glyphs=16
+setFont g_d0_f10 8.966400
+moveText 0.000000 -13.947700
+showText glyphs=19
+setFont g_d0_f2 8.966400
+moveText 73.024400 0.000000
+showText glyphs=49
+moveText -73.024400 -9.962600
+showText glyphs=74
+moveText 0.000000 -9.962700
+showText glyphs=69
+moveText 0.000000 -9.962600
+showText glyphs=69
+moveText 0.000000 -9.962700
+showText glyphs=67
+setFont g_d0_f2 6.973800
+moveText 0.000000 -41.556500
+showText glyphs=87
+moveText 0.000000 -7.970100
+showText glyphs=87
+moveText 0.000000 -7.970100
+showText glyphs=89
+moveText 0.000000 -7.970100
+showText glyphs=92
+moveText 0.000000 -7.970100
+showText glyphs=57
+dependency g_d0_f11
+setFont g_d0_f11 6.973800
+moveText 0.000000 -9.962600
+showText glyphs=8
+setFont g_d0_f2 6.973800
+moveText 33.627700 0.000000
+showText glyphs=34
+moveText -33.627700 -7.970100
+showText glyphs=10
+moveText 32.382500 0.210200
+showText glyphs=1
+dependency g_d0_f12
+setFont g_d0_f12 6.973800
+moveText -2.423100 -0.210200
+showText glyphs=1
+setFont g_d0_f2 6.973800
+moveText 9.685900 0.000000
+showText glyphs=44
+setFont g_d0_f2 8.966400
+moveText 223.368400 377.945500
+showText glyphs=70
+moveText 0.000000 -9.962700
+showText glyphs=61
+moveText 0.000000 -9.962600
+showText glyphs=66
+moveText 0.000000 -9.962600
+showText glyphs=69
+moveText 0.000000 -9.962700
+showText glyphs=62
+moveText 11.955200 -9.962600
+showText glyphs=62
+moveText -11.955200 -9.962700
+showText glyphs=68
+moveText 0.000000 -9.962600
+showText glyphs=65
+moveText 0.000000 -9.962600
+showText glyphs=64
+moveText 0.000000 -9.962700
+showText glyphs=66
+moveText 0.000000 -9.962600
+showText glyphs=68
+moveText 0.000000 -9.962700
+showText glyphs=65
+moveText 0.000000 -9.962600
+showText glyphs=67
+moveText 0.000000 -9.962600
+showText glyphs=65
+moveText 0.000000 -9.962700
+showText glyphs=69
+moveText 0.000000 -9.962600
+showText glyphs=71
+moveText 0.000000 -9.962700
+showText glyphs=16
+moveText 11.955200 -9.962600
+showText glyphs=59
+moveText -11.955200 -9.962600
+showText glyphs=68
+moveText 0.000000 -9.962700
+showText glyphs=65
+moveText 0.000000 -9.962600
+showText glyphs=70
+moveText 0.000000 -9.962700
+showText glyphs=70
+moveText 0.000000 -9.962600
+showText glyphs=9
+setFont g_d0_f10 8.966400
+moveText 36.685300 0.000000
+showText glyphs=3
+setFont g_d0_f2 8.966400
+moveText 15.426300 0.000000
+showText glyphs=51
+moveText -52.111600 -9.962600
+showText glyphs=68
+moveText 0.000000 -9.962700
+showText glyphs=24
+setFont g_d0_f10 8.966400
+moveText 87.654400 0.000000
+showText glyphs=6
+setFont g_d0_f2 8.966400
+moveText 18.291100 0.000000
+showText glyphs=1
+moveText -93.990300 -9.962600
+showText glyphs=56
+moveText -11.955200 -9.962700
+showText glyphs=67
+moveText 0.000000 -9.962600
+showText glyphs=63
+moveText 0.000000 -9.962600
+showText glyphs=65
+moveText 0.000000 -9.962700
+showText glyphs=31
+setFont g_d0_f10 8.966400
+moveText 105.915300 0.000000
+showText glyphs=11
+setFont g_d0_f2 8.966400
+moveText 39.343900 0.000000
+showText glyphs=28
+moveText -145.259200 -9.962600
+showText glyphs=73
+moveText 0.000000 -9.962700
+showText glyphs=73
+moveText 0.000000 -9.962600
+showText glyphs=68
+moveText 0.000000 -9.962600
+showText glyphs=68
+moveText 0.000000 -9.962700
+showText glyphs=25
+moveText 11.955200 -9.962600
+showText glyphs=62
+moveText -11.955200 -9.962700
+showText glyphs=66
+moveText 0.000000 -9.962600
+showText glyphs=63
+moveText 0.000000 -9.962600
+showText glyphs=64
+endText

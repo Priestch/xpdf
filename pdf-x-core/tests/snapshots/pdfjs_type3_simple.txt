@@ -1,0 +1,6 @@
+dependency g_d0_f1
+setFont g_d0_f1 12.000000
+beginText
+moveText 100.000000 700.000000
+showText glyphs=6
+endText

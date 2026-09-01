@@ -1,0 +1,9 @@
+save
+transform 0.100000 0.000000 0.000000 0.100000 0.000000 0.000000
+save
+transform 331.200000 0.000000 0.000000 312.000000 4.403990 3.996120
+dependency img_p0_1
+paintImageXObject img_p0_1 138.000000 130.000000
+restore
+setFillRGBColor #000000
+restore

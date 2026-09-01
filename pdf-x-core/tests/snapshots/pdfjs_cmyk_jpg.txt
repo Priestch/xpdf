@@ -1,0 +1,5 @@
+save
+transform 200.000000 0.000000 0.000000 200.000000 0.000000 0.000000
+dependency img_p0_1
+paintImageXObject img_p0_1 200.000000 200.000000
+restore
