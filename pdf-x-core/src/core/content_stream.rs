@@ -427,6 +427,103 @@ impl fmt::Display for Operation {
     }
 }
 
+impl Operation {
+    /// Deterministic one-line serialization for snapshot testing.
+    ///
+    /// Uses `{:.6}` for floats (cross-platform), hex-escapes non-ASCII bytes in
+    /// strings, and summarizes inline image data (metadata only, no raw bytes).
+    /// One operation per line — designed for diff-friendly snapshot files.
+    pub fn format_snapshot(&self) -> String {
+        use std::fmt::Write;
+
+        let mut line = String::new();
+        let _ = write!(line, "{}", self.op.to_command());
+        for arg in &self.args {
+            let _ = write!(line, " {}", format_pdf_object(arg));
+        }
+        line
+    }
+}
+
+/// Deterministic PDFObject formatting for operator dump snapshots.
+///
+/// - Numbers: `{:.6}` (6 decimal places) — cross-platform determinism
+/// - Names: `/Name`
+/// - Strings: `(hex_escaped_bytes)` — printable ASCII as-is, others as `\xHH`
+/// - HexStrings: `<hex>`
+/// - Arrays: `[items...]`
+/// - Dictionaries: `<<key=val ...>>`
+/// - Streams (inline images): `stream(W=H,BPC=b,CS=name,F=filter,data_len=N)`
+/// - Refs: `N G R`
+/// - Boolean: `true`/`false`
+/// - Null: `null`
+fn format_pdf_object(obj: &PDFObject) -> String {
+    match obj {
+        PDFObject::Number(n) => format!("{:.6}", n),
+        PDFObject::Name(name) => format!("/{}", name),
+        PDFObject::String(bytes) => format_string_snapshot(bytes),
+        PDFObject::HexString(bytes) => {
+            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            format!("<{}>", hex)
+        }
+        PDFObject::Array(items) => {
+            let inner: Vec<String> = items.iter().map(|i| format_pdf_object(i)).collect();
+            format!("[{}]", inner.join(" "))
+        }
+        PDFObject::Dictionary(dict) => {
+            let mut pairs: Vec<String> = dict
+                .iter()
+                .map(|(k, v)| format!("/{}={}", k, format_pdf_object(v)))
+                .collect();
+            pairs.sort();
+            format!("<<{}>>", pairs.join(" "))
+        }
+        PDFObject::Stream { dict, data } => {
+            // Inline image: summarize metadata, don't dump raw pixel data
+            let mut meta = Vec::new();
+            if let Some(PDFObject::Number(w)) = dict.get("Width") {
+                meta.push(format!("W={:.0}", w));
+            }
+            if let Some(PDFObject::Number(h)) = dict.get("Height") {
+                meta.push(format!("H={:.0}", h));
+            }
+            if let Some(PDFObject::Number(bpc)) = dict.get("BitsPerComponent") {
+                meta.push(format!("BPC={:.0}", bpc));
+            }
+            if let Some(cs) = dict.get("ColorSpace") {
+                meta.push(format!("CS={}", format_pdf_object(cs)));
+            }
+            if let Some(f) = dict.get("Filter") {
+                meta.push(format!("F={}", format_pdf_object(f)));
+            }
+            meta.push(format!("data_len={}", data.len()));
+            format!("stream({})", meta.join(","))
+        }
+        PDFObject::Ref(r) => format!("{} {} R", r.num, r.generation),
+        PDFObject::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
+        PDFObject::Null => "null".to_string(),
+        PDFObject::InlineImageData(data) => format!("inline_data(len={})", data.len()),
+        PDFObject::EOF => "EOF".to_string(),
+        PDFObject::Command(cmd) => format!("CMD({})", cmd),
+    }
+}
+
+/// Format a byte string for snapshot output.
+/// Printable ASCII (0x20–0x7E) is emitted as-is; everything else is `\xHH`.
+fn format_string_snapshot(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() + 2);
+    s.push('(');
+    for &b in bytes {
+        if (0x20..=0x7e).contains(&b) && b != b'\'' && b != b')' && b != b'\\' {
+            s.push(b as char);
+        } else {
+            s.push_str(&format!("\\x{:02x}", b));
+        }
+    }
+    s.push(')');
+    s
+}
+
 fn normalize_inline_image_dict(
     dict: std::collections::HashMap<String, PDFObject>,
 ) -> std::collections::HashMap<String, PDFObject> {

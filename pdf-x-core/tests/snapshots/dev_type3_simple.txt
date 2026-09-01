@@ -1,0 +1,63 @@
+set_matrix([1.000000,0.000000,0.000000,-1.000000,0.000000,792.000000])
+begin_path
+move_to(0.000000,0.000000)
+line_to(612.000000,0.000000)
+line_to(612.000000,792.000000)
+line_to(0.000000,792.000000)
+close_path
+clip_path(NonZero)
+save_state
+set_matrix([0.012000,0.000000,0.000000,-0.012000,100.000000,92.000000])
+begin_type3_glyph
+rect(0.000000,0.000000,750.000000,750.000000)
+set_opacity(1.000000)
+draw_path(fill(NonZero), paint=Gray(0.000000), stroke=lw=1.000000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+end_type3_glyph
+restore_state
+save_state
+set_matrix([0.012000,0.000000,0.000000,-0.012000,112.000000,92.000000])
+begin_type3_glyph
+move_to(0.000000,0.000000)
+line_to(375.000000,750.000000)
+line_to(750.000000,0.000000)
+set_opacity(1.000000)
+draw_path(fill(NonZero), paint=Gray(0.000000), stroke=lw=1.000000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+end_type3_glyph
+restore_state
+save_state
+set_matrix([0.012000,0.000000,0.000000,-0.012000,124.000000,92.000000])
+begin_type3_glyph
+rect(0.000000,0.000000,750.000000,750.000000)
+set_opacity(1.000000)
+draw_path(fill(NonZero), paint=Gray(0.000000), stroke=lw=1.000000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+end_type3_glyph
+restore_state
+save_state
+set_matrix([0.012000,0.000000,0.000000,-0.012000,136.000000,92.000000])
+begin_type3_glyph
+move_to(0.000000,0.000000)
+line_to(375.000000,750.000000)
+line_to(750.000000,0.000000)
+set_opacity(1.000000)
+draw_path(fill(NonZero), paint=Gray(0.000000), stroke=lw=1.000000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+end_type3_glyph
+restore_state
+save_state
+set_matrix([0.012000,0.000000,0.000000,-0.012000,148.000000,92.000000])
+begin_type3_glyph
+rect(0.000000,0.000000,750.000000,750.000000)
+set_opacity(1.000000)
+draw_path(fill(NonZero), paint=Gray(0.000000), stroke=lw=1.000000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+end_type3_glyph
+restore_state
+save_state
+set_matrix([0.012000,0.000000,0.000000,-0.012000,160.000000,92.000000])
+begin_type3_glyph
+move_to(0.000000,0.000000)
+line_to(375.000000,750.000000)
+line_to(750.000000,0.000000)
+set_opacity(1.000000)
+draw_path(fill(NonZero), paint=Gray(0.000000), stroke=lw=1.000000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+end_type3_glyph
+restore_state
+flush_text_clip

@@ -1,0 +1,70 @@
+set_matrix([1.000000,0.000000,0.000000,-1.000000,0.000000,22.250000])
+begin_path
+move_to(0.000000,0.000000)
+line_to(276.450000,0.000000)
+line_to(276.450000,22.250000)
+line_to(0.000000,22.250000)
+close_path
+clip_path(NonZero)
+save_state
+concat_matrix([1.000000,0.000000,0.000000,1.000000,72.000000,-49.750000])
+save_state
+move_to(-69.860000,60.980000)
+line_to(-13.170000,60.980000)
+set_opacity(1.000000)
+draw_path(stroke, paint=Gray(0.900000), stroke=lw=0.996000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+set_opacity(1.000000)
+restore_state
+save_state
+begin_path
+restore_state
+load_font_data(name=F1, bytes=2447)
+set_font_raw_cid_codes(name=F1, enabled=true)
+draw_text(font=F1, size=24.787000, paint=Gray(0.500000), tm=[1.000000,0.000000,0.000000,1.000000,-13.170000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+flush_text_clip
+move_to(-13.170000,54.000000)
+set_opacity(1.000000)
+draw_path(stroke, paint=Gray(0.500000), stroke=lw=1.000000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+set_opacity(1.000000)
+draw_text(font=F1, size=24.787000, paint=Gray(1.000000), tm=[1.000000,0.000000,0.000000,1.000000,-13.170000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+flush_text_clip
+save_state
+begin_path
+restore_state
+draw_text(font=F1, size=24.787000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,-1.520000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=20.663000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,4.880000,56.740000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=24.787000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,16.330000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=24.787000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,29.820000,49.900000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=24.787000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,42.860000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=24.787000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,72.951418,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=12)
+flush_text_clip
+move_to(-1.520000,54.000000)
+set_opacity(1.000000)
+draw_path(stroke, paint=Gray(0.000000), stroke=lw=1.000000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+set_opacity(1.000000)
+draw_text(font=F1, size=24.787000, paint=CMYK(0.000000,0.890000,0.940000,0.280000), tm=[1.000000,0.000000,0.000000,1.000000,-1.520000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=20.663000, paint=CMYK(0.000000,0.890000,0.940000,0.280000), tm=[1.000000,0.000000,0.000000,1.000000,4.880000,56.740000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=24.787000, paint=CMYK(0.000000,0.890000,0.940000,0.280000), tm=[1.000000,0.000000,0.000000,1.000000,16.330000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=24.787000, paint=CMYK(0.000000,0.890000,0.940000,0.280000), tm=[1.000000,0.000000,0.000000,1.000000,29.820000,49.900000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=24.787000, paint=CMYK(0.000000,0.890000,0.940000,0.280000), tm=[1.000000,0.000000,0.000000,1.000000,42.860000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+draw_text(font=F1, size=24.787000, paint=CMYK(0.000000,0.890000,0.940000,0.280000), tm=[1.000000,0.000000,0.000000,1.000000,72.951418,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=12)
+flush_text_clip
+save_state
+begin_path
+restore_state
+draw_text(font=F1, size=24.787000, paint=Gray(0.500000), tm=[1.000000,0.000000,0.000000,1.000000,141.440000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+flush_text_clip
+move_to(141.440000,54.000000)
+set_opacity(1.000000)
+draw_path(stroke, paint=Gray(0.500000), stroke=lw=1.000000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+set_opacity(1.000000)
+draw_text(font=F1, size=24.787000, paint=Gray(1.000000), tm=[1.000000,0.000000,0.000000,1.000000,141.440000,54.000000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=2)
+flush_text_clip
+save_state
+move_to(147.760000,60.980000)
+line_to(204.450000,60.980000)
+set_opacity(1.000000)
+draw_path(stroke, paint=Gray(0.900000), stroke=lw=0.996000,cap=Butt,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+set_opacity(1.000000)
+restore_state
+restore_state

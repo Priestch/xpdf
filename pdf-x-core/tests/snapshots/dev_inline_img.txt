@@ -1,0 +1,15 @@
+set_matrix([1.000000,0.000000,0.000000,-1.000000,0.000000,32.000000])
+begin_path
+move_to(0.000000,0.000000)
+line_to(34.000000,0.000000)
+line_to(34.000000,32.000000)
+line_to(0.000000,32.000000)
+close_path
+clip_path(NonZero)
+save_state
+concat_matrix([0.100000,0.000000,0.000000,0.100000,0.000000,0.000000])
+save_state
+concat_matrix([331.200000,0.000000,0.000000,312.000000,4.403990,3.996120])
+draw_image(138x130, bpc=8, alpha=false, mask=false, tm=[1.000000,0.000000,0.000000,1.000000,0.000000,0.000000])
+restore_state
+restore_state
