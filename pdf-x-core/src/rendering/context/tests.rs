@@ -595,3 +595,38 @@ fn test_pick_fallback_standard_font_respects_style() {
         "Courier-Bold"
     );
 }
+
+// ==========================================================================
+// Lab -> RGB conversion tests (reference values from pdf.js formula)
+// ==========================================================================
+
+/// Lab tests that work regardless of whether the ICC path is active.
+/// Black/white are exact; achromatic symmetry holds for either path.
+
+#[test]
+fn lab_black_is_zero() {
+    let (r, g, b) = lab_components_to_rgb_u8(0.0, 0.0, 0.0, 0.9505, 1.0, 1.0890, -128.0, 127.0, -128.0, 127.0);
+    assert_eq!((r, g, b), (0, 0, 0));
+}
+
+#[test]
+fn lab_white_is_255() {
+    let (r, g, b) = lab_components_to_rgb_u8(100.0, 0.0, 0.0, 0.9505, 1.0, 1.0890, -128.0, 127.0, -128.0, 127.0);
+    assert_eq!((r, g, b), (255, 255, 255));
+}
+
+#[test]
+fn lab_mid_gray_is_achromatic() {
+    let (r, g, b) = lab_components_to_rgb_u8(50.0, 0.0, 0.0, 0.9505, 1.0, 1.0890, -128.0, 127.0, -128.0, 127.0);
+    assert_eq!(r, g, "achromatic: R == G");
+    assert_eq!(g, b, "achromatic: G == B");
+}
+
+#[test]
+fn lab_achromatic_is_gray() {
+    // a*=0, b*=0 must produce equal R, G, B regardless of ICC vs analytical.
+    let (r, g, b) = lab_components_to_rgb_u8(75.0, 0.0, 0.0, 0.9505, 1.0, 1.0890, -128.0, 127.0, -128.0, 127.0);
+    // Allow small ICC rounding differences
+    assert!((r as i16 - g as i16).unsigned_abs() < 3, "R≈G: ({},{})", r, g);
+    assert!((g as i16 - b as i16).unsigned_abs() < 3, "G≈B: ({},{})", g, b);
+}

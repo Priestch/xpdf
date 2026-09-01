@@ -18,6 +18,8 @@ pub mod cmyk_icc;
 #[cfg(feature = "rendering")]
 pub mod lab_icc;
 
+pub mod recording_device;
+
 pub mod shading;
 
 // Re-export key types

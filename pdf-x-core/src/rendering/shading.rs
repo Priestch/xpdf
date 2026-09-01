@@ -989,7 +989,7 @@ impl Shading {
     }
 }
 
-fn calrgb_to_rgb(
+pub(super) fn calrgb_to_rgb(
     components: &[f64],
     white_point: &[f64; 3],
     black_point: &[f64; 3],
@@ -1115,7 +1115,7 @@ fn decode_l(l: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::ShadingFunction;
+    use super::{calrgb_to_rgb, ShadingFunction};
 
     fn reflected_gray_function() -> ShadingFunction {
         ShadingFunction::PostScript {
@@ -1163,5 +1163,53 @@ dup dup 0 gt exch 1 le and {
 
         assert_eq!(output.len(), 1);
         assert!((output[0] - 15.0).abs() < 1e-6);
+    }
+
+    /// CalRGB: black input always produces near-zero output.
+    #[test]
+    fn calrgb_black_is_near_zero() {
+        let wp = [1.0, 1.0, 1.0];
+        let bp = [0.0, 0.0, 0.0];
+        let gamma = [1.0, 1.0, 1.0];
+        let matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+        let black = calrgb_to_rgb(&[0.0, 0.0, 0.0], &wp, &bp, &gamma, &matrix);
+        assert!(
+            black.iter().all(|&v| v < 0.01),
+            "CalRGB black should be near-zero: {:?}",
+            black
+        );
+    }
+
+    /// CalRGB: higher input produces higher output (monotonicity).
+    #[test]
+    fn calrgb_monotonicity() {
+        let wp = [1.0, 1.0, 1.0];
+        let bp = [0.0, 0.0, 0.0];
+        let gamma = [1.0, 1.0, 1.0];
+        let matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+        let lo = calrgb_to_rgb(&[0.25, 0.25, 0.25], &wp, &bp, &gamma, &matrix);
+        let hi = calrgb_to_rgb(&[0.75, 0.75, 0.75], &wp, &bp, &gamma, &matrix);
+        // With identity matrix the Bradford normalization to D65 produces
+        // values < 1 for achromatic inputs, so hi > lo.
+        assert!(hi[0] > lo[0], "CalRGB should be monotonic: lo={:?} hi={:?}", lo, hi);
+        assert!(hi[1] > lo[1], "CalRGB should be monotonic");
+        assert!(hi[2] > lo[2], "CalRGB should be monotonic");
+    }
+
+    /// CalRGB with [1,1,1] white point and non-unity gamma.
+    /// Gamma < 1 brightens; gamma > 1 darkens.
+    #[test]
+    fn calrgb_gamma_darkens() {
+        let wp = [1.0, 1.0, 1.0];
+        let bp = [0.0, 0.0, 0.0];
+        let gamma = [2.0, 2.0, 2.0]; // square -> darkens mid-tones
+        let matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+        let mid_linear = calrgb_to_rgb(&[0.5, 0.5, 0.5], &wp, &bp, &gamma, &matrix);
+        let mid_gamma1 = calrgb_to_rgb(&[0.5, 0.5, 0.5], &wp, &bp, &[1.0, 1.0, 1.0], &matrix);
+        // gamma=2 makes 0.5^2=0.25 which is darker than gamma=1's 0.5
+        assert!(mid_linear[0] < mid_gamma1[0], "gamma=2 should darken vs gamma=1");
     }
 }

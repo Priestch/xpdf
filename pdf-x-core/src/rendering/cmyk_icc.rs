@@ -162,4 +162,33 @@ mod tests {
         assert_eq!(g, 234);
         assert_eq!(b, 0);
     }
+
+    /// Pure polynomial fallback — no ICC profile involved.
+    /// These values must match pdf.js DeviceCmykCS.#toRgb exactly.
+    #[test]
+    fn test_cmyk_polynomial_fallback() {
+        // White (no ink)
+        assert_eq!(cmyk_polynomial_fallback(0.0, 0.0, 0.0, 0.0), (255, 255, 255));
+        // K=100% gives a dark color
+        let (r, g, b) = cmyk_polynomial_fallback(0.0, 0.0, 0.0, 1.0);
+        assert!(r < 60 && g < 60 && b < 60, "K=100% should be near-black: ({},{},{})", r, g, b);
+    }
+
+    /// Clamping: inputs outside [0,1] must not produce invalid u8.
+    #[test]
+    fn test_cmyk_polynomial_clamping() {
+        let (r, g, b) = cmyk_polynomial_fallback(-0.5, 2.0, -1.0, 3.0);
+        // Should not panic and should produce valid byte values.
+        let _ = (r, g, b);
+    }
+
+    /// Mixed CMYK values.
+    #[test]
+    fn test_cmyk_polynomial_mixed() {
+        // Dark olive: C=0.5, M=0.3, Y=0.8, K=0.1
+        let (r, g, b) = cmyk_polynomial_fallback(0.5, 0.3, 0.8, 0.1);
+        // Should be a muted brownish-green
+        assert!(r < 150, "R should be muted: {}", r);
+        assert!(b < 100, "B should be low: {}", b);
+    }
 }

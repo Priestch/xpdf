@@ -557,4 +557,24 @@ mod tests {
         assert_eq!(Color::CMYK(0.0, 1.0, 0.0, 0.0).rgba(), (251, 48, 153, 255));
         assert_eq!(Color::CMYK(0.0, 0.0, 1.0, 0.0).rgba(), (255, 234, 61, 255));
     }
+
+    #[test]
+    fn test_gray_rgba_edge_cases() {
+        assert_eq!(Color::Gray(0.0).rgba(), (0, 0, 0, 255));
+        assert_eq!(Color::Gray(1.0).rgba(), (255, 255, 255, 255));
+        assert_eq!(Color::Gray(0.5).rgba(), (127, 127, 127, 255));
+        // Clamping: values outside [0,1]
+        assert_eq!(Color::Gray(-1.0).rgba(), (0, 0, 0, 255));
+        assert_eq!(Color::Gray(2.0).rgba(), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn test_rgb_rgba_edge_cases() {
+        assert_eq!(Color::RGB(0.0, 0.0, 0.0).rgba(), (0, 0, 0, 255));
+        assert_eq!(Color::RGB(1.0, 1.0, 1.0).rgba(), (255, 255, 255, 255));
+        // Alpha is always 255
+        assert_eq!(Color::RGB(0.5, 0.0, 0.0).rgba().3, 255);
+        // Clamping: out-of-range components are clamped
+        assert_eq!(Color::RGB(-0.5, 1.5, 0.0).rgba(), (0, 255, 0, 255));
+    }
 }
