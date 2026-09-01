@@ -1173,6 +1173,56 @@ impl Command for AddHighlightCommand {
     }
 }
 
+// ── ReplaceTextCommand ─────────────────────────────────────────────
+
+/// Pre-computed text replacement for one or more content-stream fragments.
+///
+/// All encoding work (inverse map, code generation, serialization) is
+/// done in [`ReplaceTextCommand::new`] so that `execute`/`undo`/`redo`
+/// are simple `modify_object` calls.
+pub struct ReplaceTextCommand {
+    /// (stream ref, original stream object, replacement stream object).
+    /// execute writes `replacement`; undo writes `original`.
+    fragments: Vec<(Ref, PDFObject, PDFObject)>,
+}
+
+impl ReplaceTextCommand {
+    /// Create a new command from pre-built stream objects.
+    ///
+    /// Each entry is `(stream_ref, original_stream, replacement_stream)`.
+    /// Both stream objects must be `PDFObject::Stream` with proper `/Length`.
+    pub fn new(fragments: Vec<(Ref, PDFObject, PDFObject)>) -> Self {
+        Self { fragments }
+    }
+}
+
+impl Command for ReplaceTextCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        for (ref_, _original, replacement) in &self.fragments {
+            delta.modify_object(*ref_, replacement.clone());
+        }
+        Ok(())
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        for (ref_, original, _replacement) in &self.fragments {
+            delta.modify_object(*ref_, original.clone());
+        }
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        for (ref_, _original, replacement) in &self.fragments {
+            delta.modify_object(*ref_, replacement.clone());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

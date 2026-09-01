@@ -405,6 +405,36 @@ impl Font {
     pub fn has_embedded_font(&self) -> bool {
         self.embedded_font.is_some()
     }
+
+    // ── Inverse encoding (for text replacement) ─────────────────────────
+
+    /// Build a char → glyph-code inverse map.
+    ///
+    /// For simple fonts: iterates codes 0..=255, skips entries whose
+    /// `char_code_to_unicode` yields `\u{FFFD}` (unmapped).  When multiple
+    /// codes map to the same char the lowest code wins.
+    ///
+    /// Returns `None` for CID fonts (v1 — core Font lacks /W widths).
+    pub fn build_inverse_map(&self) -> Option<FxHashMap<char, u16>> {
+        if self.dict.font_type.is_cid_font() {
+            return None;
+        }
+        let mut map = FxHashMap::default();
+        for code in 0u16..=255 {
+            let ch = self.char_code_to_unicode(code);
+            if ch == '\u{FFFD}' {
+                continue;
+            }
+            // Keep the lowest code for each char.
+            map.entry(ch).or_insert(code);
+        }
+        Some(map)
+    }
+
+    /// Check whether every character in `text` has an entry in the inverse map.
+    pub fn can_encode(&self, inverse: &FxHashMap<char, u16>, text: &str) -> bool {
+        text.chars().all(|ch| inverse.contains_key(&ch))
+    }
 }
 
 #[cfg(test)]

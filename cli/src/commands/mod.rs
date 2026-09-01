@@ -92,7 +92,11 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
         Stream(n) => structure::run_stream(ctx, *n),
         RotatePage { page, angle } => edit::run_rotate_page(ctx, *page, *angle),
         SetInfo { entries } => edit::run_set_info(ctx, entries.clone()),
-        DeletePage { page } => edit::run_delete_page(ctx, *page),        Save => edit::run_save(ctx),
+        DeletePage { page } => edit::run_delete_page(ctx, *page),
+        ReplaceText { page, find, replace } => {
+            edit::run_replace_text(ctx, *page, find, replace)
+        }
+        Save => edit::run_save(ctx),
     };
 
     let cmd_name = match command {
@@ -116,6 +120,7 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
         RotatePage { .. } => "rotate-page",
         SetInfo { .. } => "set-info",
         DeletePage { .. } => "delete-page",
+        ReplaceText { .. } => "replace-text",
         Save => "save",
     };
 

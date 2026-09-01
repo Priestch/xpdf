@@ -212,6 +212,21 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// Byte offset of the next unread token (delegates to Lexer).
+    pub fn position(&self) -> usize {
+        self.lexer.get_position()
+    }
+
+    /// Copy raw bytes [begin, end) from the underlying stream.
+    pub fn byte_range(&self, begin: usize, end: usize) -> PDFResult<Vec<u8>> {
+        self.lexer.get_byte_range(begin, end)
+    }
+
+    /// Total stream length in the Lexer's coordinate system.
+    pub fn stream_len(&self) -> usize {
+        self.lexer.stream_end_pos()
+    }
+
     /// Creates a new Parser from a Lexer.
     pub fn new(mut lexer: Lexer) -> PDFResult<Self> {
         // Fill the lookahead buffer

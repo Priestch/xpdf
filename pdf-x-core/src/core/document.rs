@@ -1,5 +1,6 @@
 use super::delta::{
-    AddHighlightCommand, CommandHistory, DeletePageCommand, DeltaLayer, RotatePageCommand, SetInfoCommand,
+    AddHighlightCommand, CommandHistory, DeletePageCommand, DeltaLayer, ReplaceTextCommand,
+    RotatePageCommand, SetInfoCommand,
 };
 use super::doc_store::DocStore;
 use super::document_loader::{DocumentLoader, OpenProgress};
@@ -1208,6 +1209,335 @@ impl PDFDocument {
     pub fn extract_text_from_page_as_string(&mut self, page_index: usize) -> PDFResult<String> {
         let page = self.get_page(page_index)?;
         page.extract_text_as_string(self.doc_store_mut())
+    }
+
+    /// Find `needle` as an exact Unicode substring on a page.
+    ///
+    /// Returns the first match (or the N-th if `opts.occurrence` is set).
+    /// v1 scope: matches within a single Tj/TJ operation only.
+    pub fn find_text_on_page(
+        &mut self,
+        page_index: usize,
+        needle: &str,
+        opts: &super::content_edit::FindOptions,
+    ) -> PDFResult<Option<super::content_edit::TextMatch>> {
+        use super::content_edit::{ContentFragment, EditableContentStream, TextRunLocator};
+        use super::content_stream::load_fonts_from_resources;
+        use super::decode;
+
+        let page = self.get_page(page_index)?;
+        let store = self.doc_store_mut();
+
+        // Resolve /Contents (single stream or array).
+        let contents_obj = match page.contents() {
+            Some(c) => store.resolve_if_ref(c)?,
+            None => return Ok(None),
+        };
+
+        let content_streams: Vec<(std::collections::HashMap<String, PDFObject>, Vec<u8>)> = match &*contents_obj {
+            PDFObject::Stream { dict, data } => vec![(dict.clone(), data.clone())],
+            PDFObject::Array(arr) => {
+                let mut out = Vec::new();
+                for item in arr.iter() {
+                    match &*store.resolve_if_ref(item)? {
+                        PDFObject::Stream { dict, data } => {
+                            out.push((dict.clone(), data.clone()));
+                        }
+                        _ => return Err(PDFError::Generic(
+                            "Contents array contains non-stream object".into(),
+                        )),
+                    }
+                }
+                out
+            }
+            _ => return Ok(None),
+        };
+
+        // Decode each fragment and build ContentFragment metadata.
+        let mut fragment_pairs: Vec<(Vec<u8>, ContentFragment)> = Vec::new();
+        let mut decoded_offset = 0usize;
+        for (dict, raw_data) in &content_streams {
+            let (decoded, filter_name) = if let Some(filter) = dict.get("Filter") {
+                let name = match filter {
+                    PDFObject::Name(n) => Some(n.clone()),
+                    _ => None,
+                };
+                let decoded = decode::apply_filters(raw_data, filter)
+                    .map_err(|_| PDFError::Generic("failed to decode content stream".into()))?;
+                (decoded, name)
+            } else {
+                (raw_data.to_vec(), None)
+            };
+            let has_decode_parms = dict.get("DecodeParms").is_some();
+            let frag = ContentFragment {
+                filter_name,
+                has_decode_parms,
+                raw: raw_data.clone(),
+                decoded_offset,
+                decoded_len: decoded.len(),
+            };
+            decoded_offset += decoded.len();
+            fragment_pairs.push((decoded, frag));
+        }
+
+        let ecs = EditableContentStream::build(&fragment_pairs)?;
+
+        // Load fonts from page resources.
+        let page_resources = page.get_inheritable_resources(store)?;
+        let fonts: FxHashMap<String, super::font::Font> = match page_resources {
+            Some(ref res) => load_fonts_from_resources(&**res, store),
+            None => FxHashMap::default(),
+        };
+
+        let locator = TextRunLocator::new(&ecs, &fonts);
+        Ok(locator.find_text(needle, opts))
+    }
+
+    /// Replace `find` with `replace` on `page_index`.
+    ///
+    /// Only the first match is replaced (use `FindOptions::occurrence` for
+    /// subsequent ones).  v1 constraints:
+    /// - Single-op match only (no cross-Tj/TJ replacement).
+    /// - CID fonts are rejected.
+    /// - `'` / `"` operators are rejected.
+    /// - Only bare /FlateDecode or no filter supported.
+    pub fn replace_text(
+        &mut self,
+        page_index: usize,
+        find: &str,
+        replace: &str,
+        opts: &super::content_edit::FindOptions,
+    ) -> PDFResult<()> {
+        use super::content_edit::{
+            ContentFragment, EditableContentStream, TextRunLocator,
+            serialize_hex_string, serialize_operation,
+        };
+        use super::content_stream::{load_fonts_from_resources, OpCode};
+        use super::decode;
+
+        let page = self.get_page(page_index)?;
+        let store = self.doc_store_mut();
+
+        // ── 1. Resolve /Contents with refs ────────────────────────────
+        let contents_raw = match page.contents() {
+            Some(c) => c.clone(),
+            None => return Ok(()), // nothing to replace
+        };
+
+        let contents_obj = store.resolve_if_ref(&contents_raw)?;
+
+        // (ref, stream_dict, raw_data) per fragment.
+        // ref is None for direct objects (cannot be delta-modified).
+        let mut stream_info: Vec<(Option<Ref>, std::collections::HashMap<String, PDFObject>, Vec<u8>)> =
+            Vec::new();
+
+        match &*contents_obj {
+            PDFObject::Stream { dict, data } => {
+                let ref_ = Self::obj_ref(&contents_raw);
+                stream_info.push((ref_, dict.clone(), data.clone()));
+            }
+            PDFObject::Array(arr) => {
+                for item in arr.iter() {
+                    let ref_ = Self::obj_ref(item);
+                    match &*store.resolve_if_ref(item)? {
+                        PDFObject::Stream { dict, data } => {
+                            stream_info.push((ref_, dict.clone(), data.clone()));
+                        }
+                        _ => {
+                            return Err(PDFError::Generic(
+                                "Contents array contains non-stream object".into(),
+                            ))
+                        }
+                    }
+                }
+            }
+            _ => return Ok(()),
+        }
+
+        // ── 2. Build EditableContentStream ────────────────────────────
+        let mut fragment_pairs: Vec<(Vec<u8>, ContentFragment)> = Vec::new();
+        let mut decoded_offset = 0usize;
+        for (_ref, dict, raw_data) in &stream_info {
+            let (decoded, filter_name) = if let Some(filter) = dict.get("Filter") {
+                let name = match filter {
+                    PDFObject::Name(n) => Some(n.clone()),
+                    _ => None,
+                };
+                let decoded = decode::apply_filters(raw_data, filter)
+                    .map_err(|_| PDFError::Generic("failed to decode content stream".into()))?;
+                (decoded, name)
+            } else {
+                (raw_data.to_vec(), None)
+            };
+            let has_decode_parms = dict.get("DecodeParms").is_some();
+            let frag = ContentFragment {
+                filter_name,
+                has_decode_parms,
+                raw: raw_data.clone(),
+                decoded_offset,
+                decoded_len: decoded.len(),
+            };
+            decoded_offset += decoded.len();
+            fragment_pairs.push((decoded, frag));
+        }
+        let mut ecs = EditableContentStream::build(&fragment_pairs)?;
+
+        // ── 3. Load fonts ─────────────────────────────────────────────
+        let page_resources = page.get_inheritable_resources(store)?;
+        let fonts: FxHashMap<String, super::font::Font> = match page_resources {
+            Some(ref res) => load_fonts_from_resources(&**res, store),
+            None => FxHashMap::default(),
+        };
+
+        // ── 4. Find the match ─────────────────────────────────────────
+        let locator = TextRunLocator::new(&ecs, &fonts);
+        let m = match locator.find_text(find, opts) {
+            Some(m) => m,
+            None => return Ok(()), // nothing found — no-op
+        };
+
+        // ── 5. Get the font for this op and build inverse map ─────────
+        let op = &ecs.ops[m.op_index];
+        let op_code = op.op.as_ref().ok_or_else(|| {
+            PDFError::Generic("matched operation has no operator".into())
+        })?;
+        match op_code {
+            OpCode::ShowText => {}
+            _ => {
+                return Err(PDFError::Generic(
+                    "v1 only supports replacing Tj operators".into(),
+                ))
+            }
+        }
+
+        // Find the font by scanning backward from the matched op.
+        let font_name = Self::find_font_name_for_op(&ecs, m.op_index).ok_or_else(|| {
+            PDFError::Generic("no font found for matched text operation".into())
+        })?;
+        let font = fonts.get(&font_name).ok_or_else(|| {
+            PDFError::Generic(format!("font \"{font_name}\" not found in page resources"))
+        })?;
+
+        if font.font_type().is_cid_font() {
+            return Err(PDFError::Generic(
+                "v1 does not support text replacement in CID fonts".into(),
+            ));
+        }
+        let inverse = font.build_inverse_map().ok_or_else(|| {
+            PDFError::Generic("failed to build inverse encoding map".into())
+        })?;
+        if !font.can_encode(&inverse, replace) {
+            return Err(PDFError::Generic(
+                "replacement text contains characters not encodable in this font".into(),
+            ));
+        }
+
+        // ── 6. Build full replacement string (prefix + replace + suffix) ──
+        // Get the full decoded text of the matched Tj op.
+        let locator2 = TextRunLocator::new(&ecs, &fonts);
+        let run = locator2
+            .collect_runs()
+            .into_iter()
+            .find(|r| r.op_index == m.op_index)
+            .ok_or_else(|| {
+                PDFError::Generic("matched op_index has no text run".into())
+            })?;
+        let chars: Vec<char> = run.decoded.chars().collect();
+        let prefix: String = chars[..m.char_range.start].iter().collect();
+        let suffix: String = chars[m.char_range.end..].iter().collect();
+        let full_new_text = format!("{prefix}{replace}{suffix}");
+
+        // ── 7. Encode the full new string as glyph codes ─────────────────
+        if !font.can_encode(&inverse, &full_new_text) {
+            return Err(PDFError::Generic(
+                "full replacement string contains characters not encodable in this font".into(),
+            ));
+        }
+        let mut codes: Vec<u8> = Vec::with_capacity(full_new_text.len());
+        for ch in full_new_text.chars() {
+            let code = inverse[&ch] as u8;
+            codes.push(code);
+        }
+
+        // ── 8. Splice replacement into ECS ────────────────────────────
+        let new_op = serialize_operation(OpCode::ShowText, &serialize_hex_string(&codes));
+        ecs.replace_op_bytes(m.op_index, new_op);
+
+        // ── 9. Serialize modified fragments ────────────────────────────
+        let serialized = ecs.serialize_fragments()?;
+
+        // ── 10. Build original + replacement stream objects ────────────
+        // Only fragments that were modified need to be in the command.
+        // For simplicity, include all fragments that belong to the affected stream_index.
+        let affected_stream_index = ecs.ops[m.op_index].stream_index;
+        let affected_ref = stream_info[affected_stream_index].0.ok_or_else(|| {
+            PDFError::Generic(
+                "content stream is a direct object; cannot modify via delta".into(),
+            )
+        })?;
+
+        // Build original stream object for the affected fragment.
+        let orig_dict = stream_info[affected_stream_index].1.clone();
+        let orig_data = stream_info[affected_stream_index].2.clone();
+        let original_stream = PDFObject::Stream {
+            dict: orig_dict,
+            data: orig_data,
+        };
+
+        // Build replacement stream object.
+        let (new_data, new_filter) = &serialized[affected_stream_index];
+        let mut new_dict = stream_info[affected_stream_index].1.clone();
+        match new_filter {
+            Some(f) => {
+                new_dict.insert("Filter".to_string(), PDFObject::Name(f.clone()));
+            }
+            None => {
+                new_dict.remove("Filter");
+                new_dict.remove("DecodeParms");
+            }
+        }
+        new_dict.insert(
+            "Length".to_string(),
+            PDFObject::Number(new_data.len() as f64),
+        );
+        let replacement_stream = PDFObject::Stream {
+            dict: new_dict,
+            data: new_data.clone(),
+        };
+
+        // ── 11. Create and execute the command ────────────────────────
+        let cmd = ReplaceTextCommand::new(vec![(
+            affected_ref,
+            original_stream,
+            replacement_stream,
+        )]);
+        self.execute_command(Box::new(cmd))
+    }
+
+    /// Extract the `Ref` from a `PDFObject::Reference`, if any.
+    fn obj_ref(obj: &PDFObject) -> Option<Ref> {
+        match obj {
+            PDFObject::Ref(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// Find the font name for a text-showing op by scanning backward for Tf.
+    fn find_font_name_for_op(
+        ecs: &super::content_edit::EditableContentStream,
+        op_index: usize,
+    ) -> Option<String> {
+        use super::content_edit::parse_tf_args;
+        for prev_op in ecs.ops[..op_index].iter().rev() {
+            if let Some(super::content_stream::OpCode::SetFont) = prev_op.op {
+                let span_bytes = &ecs.bytes()[prev_op.span.clone()];
+                if let Some((name, _)) = parse_tf_args(span_bytes) {
+                    return Some(name);
+                }
+                break;
+            }
+        }
+        None
     }
 
     /// Gets an inheritable property from a page dictionary.

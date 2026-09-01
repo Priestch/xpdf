@@ -647,42 +647,7 @@ impl ContentStreamEvaluator {
         resources: &PDFObject,
         xref: &mut crate::core::xref::XRef,
     ) -> PDFResult<()> {
-        // Get the Font dictionary from resources
-        let resources_dict = match resources {
-            PDFObject::Dictionary(d) => d,
-            _ => return Ok(()), // No resources, skip
-        };
-
-        let font_dict = match resources_dict.get("Font") {
-            Some(PDFObject::Dictionary(d)) => d.clone(),
-            Some(PDFObject::Ref(ref_obj)) => {
-                // Dereference the font dictionary
-                let font_obj = xref.fetch(ref_obj.num, ref_obj.generation)?;
-                match &*font_obj {
-                    PDFObject::Dictionary(d) => d.clone(),
-                    _ => return Ok(()), // Not a dictionary
-                }
-            }
-            _ => return Ok(()), // No fonts
-        };
-
-        // Load each font
-        for (font_name, font_ref) in &font_dict {
-            // Fetch the font dictionary
-            let font_dict_obj = xref.fetch_if_ref(font_ref)?;
-
-            // Create Font object
-            match Font::new((*font_dict_obj).clone(), xref) {
-                Ok(font) => {
-                    self.fonts.insert(font_name.clone(), font);
-                }
-                Err(e) => {
-                    // Log error but continue loading other fonts
-                    eprintln!("Warning: Failed to load font '{}': {:?}", font_name, e);
-                }
-            }
-        }
-
+        self.fonts = load_fonts_from_resources(resources, xref);
         Ok(())
     }
 
@@ -1092,34 +1057,7 @@ impl ContentStreamEvaluator {
         // Try to use the current font's CMap
         if let Some(ref font_name) = self.text_state.current_font_name {
             if let Some(font) = self.fonts.get(font_name) {
-                let mut decoded = String::new();
-
-                // Check if this is a CID font (multi-byte character codes)
-                if font.font_type().is_cid_font() {
-                    // CID fonts use multi-byte character codes (typically 2 bytes)
-                    let mut i = 0;
-                    while i + 1 < text_bytes.len() {
-                        // Combine two bytes to form a CID
-                        let cid = u16::from_be_bytes([text_bytes[i], text_bytes[i + 1]]);
-                        let unicode_char = font.char_code_to_unicode(cid);
-                        decoded.push(unicode_char);
-                        i += 2;
-                    }
-                    // Handle any remaining single byte
-                    if i < text_bytes.len() {
-                        let cid = text_bytes[i] as u16;
-                        decoded.push(font.char_code_to_unicode(cid));
-                    }
-                } else {
-                    // Simple fonts use single-byte character codes
-                    for &byte in text_bytes {
-                        let cid = byte as u16;
-                        let unicode_char = font.char_code_to_unicode(cid);
-                        decoded.push(unicode_char);
-                    }
-                }
-
-                return decoded;
+                return decode_text_with_font(font, text_bytes);
             }
         }
 
@@ -1246,6 +1184,92 @@ impl ContentStreamEvaluator {
     pub fn has_more(&self) -> bool {
         self.parser.has_more()
     }
+}
+
+/// Decodes raw text bytes to a Unicode string using the given font's encoding.
+///
+/// This is the standalone version of `TextExtractionState::decode_text`,
+/// factored out so that both text extraction and text editing can share the
+/// same decoding logic without duplicating the font-lookup chain.
+///
+/// # Arguments
+/// * `font` - The font to use for character-code → Unicode mapping.
+/// * `text_bytes` - Raw character codes from a `(string)` or `<hex>` operand.
+///
+/// # Returns
+/// Decoded Unicode string.
+#[inline]
+pub fn decode_text_with_font(font: &Font, text_bytes: &[u8]) -> String {
+    let mut decoded = String::new();
+
+    if font.font_type().is_cid_font() {
+        // CID fonts use multi-byte character codes (typically 2 bytes).
+        let mut i = 0;
+        while i + 1 < text_bytes.len() {
+            let cid = u16::from_be_bytes([text_bytes[i], text_bytes[i + 1]]);
+            decoded.push(font.char_code_to_unicode(cid));
+            i += 2;
+        }
+        // Handle any remaining single byte.
+        if i < text_bytes.len() {
+            decoded.push(font.char_code_to_unicode(text_bytes[i] as u16));
+        }
+    } else {
+        // Simple fonts use single-byte character codes.
+        for &byte in text_bytes {
+            decoded.push(font.char_code_to_unicode(byte as u16));
+        }
+    }
+
+    decoded
+}
+
+/// Loads all fonts from a page's /Resources /Font dictionary.
+///
+/// Standalone version of `ContentStreamEvaluator::load_fonts`, factored out
+/// so that text editing can load fonts independently of a full evaluator.
+///
+/// Based on PDF.js src/core/evaluator.js font loading.
+pub fn load_fonts_from_resources<R: crate::core::page::PageResolver>(
+    resources: &PDFObject,
+    resolver: &mut R,
+) -> FxHashMap<String, Font> {
+    let mut fonts = FxHashMap::default();
+
+    let resources_dict = match resources {
+        PDFObject::Dictionary(d) => d,
+        _ => return fonts,
+    };
+
+    let font_dict = match resources_dict.get("Font") {
+        Some(PDFObject::Dictionary(d)) => d.clone(),
+        Some(PDFObject::Ref(ref_obj)) => {
+            let font_obj = match resolver.resolve_ref(ref_obj.num, ref_obj.generation) {
+                Ok(obj) => obj,
+                Err(_) => return fonts,
+            };
+            match &*font_obj {
+                PDFObject::Dictionary(d) => d.clone(),
+                _ => return fonts,
+            }
+        }
+        _ => return fonts,
+    };
+
+    for (font_name, font_ref) in &font_dict {
+        let font_dict_obj = match resolver.resolve_if_ref(font_ref) {
+            Ok(obj) => obj,
+            Err(_) => continue,
+        };
+        match Font::new((*font_dict_obj).clone(), resolver) {
+            Ok(font) => {
+                fonts.insert(font_name.clone(), font);
+            }
+            Err(_) => continue,
+        }
+    }
+
+    fonts
 }
 
 fn normalize_args(op: OpCode, args: Vec<PDFObject>) -> Vec<PDFObject> {

@@ -33,7 +33,8 @@ pub enum Command {
     RotatePage { page: usize, angle: u16 },
     SetInfo { entries: Vec<(String, Option<String>)> },
     Save,
- DeletePage { page: usize },
+    DeletePage { page: usize },
+    ReplaceText { page: usize, find: String, replace: String },
 }
 
 /// Parsed CLI arguments.
@@ -192,6 +193,44 @@ impl Args {
                     }
                     command = Command::DeletePage { page: p - 1 };
                 }
+                "replace-text" => {
+                    i += 1;
+                    if i >= raw.len() {
+                        return Err("replace-text requires <page>".into());
+                    }
+                    let p: usize = raw[i].parse().map_err(|_| "invalid page number")?;
+                    if p == 0 {
+                        return Err("page numbers are 1-based".into());
+                    }
+                    let mut find = String::new();
+                    let mut replace = String::new();
+                    while i + 1 < raw.len() {
+                        match raw[i + 1].as_str() {
+                            "--find" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--find requires a value".into());
+                                }
+                                find = raw[i].to_string();
+                            }
+                            "--replace" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--replace requires a value".into());
+                                }
+                                replace = raw[i].to_string();
+                            }
+                            _ => break,
+                        }
+                    }
+                    if find.is_empty() {
+                        return Err("replace-text requires --find <text>".into());
+                    }
+                    if replace.is_empty() {
+                        return Err("replace-text requires --replace <text>".into());
+                    }
+                    command = Command::ReplaceText { page: p - 1, find, replace };
+                }
                 "save" => {
                     command = Command::Save;
                 }
@@ -285,8 +324,9 @@ impl Args {
             "  rotate-page <P> --angle <DEG>  Rotate page (90/180/270)",
             "  set-info --title T --author A ...  Set document metadata",
             "                                    (empty value removes the key)",
-            "  delete-page <P>                   Delete a page
-  save --output <path>               Save edits to file",
+            "  delete-page <P>                   Delete a page",
+            "  replace-text <P> --find <T> --replace <R>  Replace text (v1: Tj)",
+            "  save --output <path>               Save edits to file",
             "",
             "Edit commands accept --output to save in one step:",
             "  pdf-x in.pdf rotate-page 1 --angle 90 --output out.pdf",

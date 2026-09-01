@@ -2,6 +2,7 @@ pub mod annotation;
 pub mod base_stream;
 pub mod byte_source;
 pub mod cmap;
+pub mod content_edit;
 pub mod content_stream;
 pub mod crypto;
 pub mod decode;
@@ -40,13 +41,16 @@ pub use byte_source::{
     BaseStreamSource, ByteSource, Loadable, MemoryByteSource, Need, StepErr, drive,
 };
 pub use cmap::CMap;
-pub use content_stream::{ContentStreamEvaluator, OpCode, Operation, TextItem};
+pub use content_edit::{ContentFragment, EditableContentStream, FindOptions, TextMatch, TextRunLocator};
+pub use content_stream::{
+    ContentStreamEvaluator, OpCode, Operation, TextItem, decode_text_with_font, load_fonts_from_resources,
+};
 pub use crypto::{
     AES128Cipher, AES256Cipher, ARC4Cipher, PDF17, PDF20, PDFPasswordAlgorithm, calculate_md5,
     calculate_sha256, calculate_sha384, calculate_sha512,
 };
 pub use delta::{
-    AddHighlightCommand, Command, CommandHistory, DeltaLayer, DeltaObject, RotatePageCommand,
+    AddHighlightCommand, Command, CommandHistory, DeltaLayer, DeltaObject, ReplaceTextCommand, RotatePageCommand,
 };
 pub use doc_store::DocStore;
 pub use document::{LinearizedInfo, PDFDocument};

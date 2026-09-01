@@ -1,7 +1,6 @@
 //! Edit commands (rotate-page, set-info, delete-page, save).
 
 use crate::commands::Ctx;
-use pdf_x_core::PDFObject;
 use serde_json::{Value, json};
 
 /// Save the current delta as an incremental update appended to the original file.
@@ -90,6 +89,31 @@ pub fn run_delete_page(
     maybe_save(ctx)?;
     Ok(json!({
         "page": page_index + 1,
+        "dirty": dirty,
+        "can_undo": can_undo,
+        "can_redo": can_redo,
+    }))
+}
+
+/// `replace-text <page> --find <text> --replace <text> [--output <path>]`
+pub fn run_replace_text(
+    ctx: &mut Ctx,
+    page_index: usize,
+    find: &str,
+    replace: &str,
+) -> Result<Value, String> {
+    use pdf_x_core::core::FindOptions;
+
+    let opts = FindOptions::default();
+    ctx.doc
+        .replace_text(page_index, find, replace, &opts)
+        .map_err(|e| format!("replace-text failed: {e}"))?;
+    let (dirty, can_undo, can_redo) = ctx.doc.editor_state();
+    maybe_save(ctx)?;
+    Ok(json!({
+        "page": page_index + 1,
+        "find": find,
+        "replace": replace,
         "dirty": dirty,
         "can_undo": can_undo,
         "can_redo": can_redo,
