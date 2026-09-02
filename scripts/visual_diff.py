@@ -195,7 +195,7 @@ EXPECTED_DIVERGENCES = {
     # on much darker hairline coverage (~97.2%) but match local mutool at only
     # ~21%; pdf-x is closer to mutool, yet still differs from mutool's lighter
     # antialiasing coverage.
-    "path_rendering_14.pdf": 61.4,
+    "path_rendering_14.pdf": 21.6,
     # Tiling-pattern fixtures where pdf-x, PDFium, and hayro agree on tile
     # placement/content, but local mutool rasterizes pattern edge coverage
     # darker. hayro vs mutool matches these same rates on the local oracle.
@@ -355,6 +355,36 @@ EXPECTED_DIVERGENCES = {
     "resvg_masking_mask_transform_on_shape.pdf": 96.0,
     "resvg_masking_mask_with_clip_path.pdf": 96.0,
     "resvg_masking_mask_with_image.pdf": 96.0,
+}
+
+# Known divergences for the hayro oracle (vs mutool above).
+# Tiling patterns: hayro rasterizes a step-sized cell + Extend::Repeat (crops overlap);
+# xpdf alpha-composites the full BBox cell (PDFium model). Both are spec-valid.
+# resvg clipPath: sub-pixel boundary differences only.
+HAYRO_EXPECTED_DIVERGENCES = {
+    # --- Tiling pattern engine divergence (step-crop vs alpha-composite) ---
+    "pattern_tiling_simple.pdf": 99.4,
+    "pattern_tiling_small.pdf": 99.4,
+    "pattern_tiling_lines.pdf": 99.2,
+    "pattern_tiling_rotated.pdf": 98.8,
+    "pattern_tiling_rotated_shape.pdf": 98.6,
+    "pattern_tiling_inner_transform.pdf": 99.3,
+    "pattern_tiling_stencil.pdf": 97.4,
+    "pattern_tiling_nested.pdf": 86.7,
+    "pattern_tiling_small_cell.pdf": 90.3,
+    "pattern_tiling_large_x_step.pdf": 75.6,
+    "pattern_tiling_small_x_step.pdf": 48.7,
+    "pattern_tiling_small_x_and_y_step.pdf": 35.6,
+    "pattern_tiling_with_text.pdf": 66.8,
+    # --- /None colorant: xpdf skips fill/stroke, hayro sets opacity=0.
+    # Both produce white page; ~98% from stroke anti-aliasing edge.
+    "separation_none.pdf": 98.0,
+    "devicen_none.pdf": 98.0,
+    # --- resvg clipPath sub-pixel boundary ---
+    "resvg_masking_clipPath_mixed_clip_rule.pdf": 99.0,
+    "resvg_masking_clipPath_nested_clip_path.pdf": 99.1,
+    "resvg_masking_clipPath_overlapped_shapes_with_evenodd.pdf": 98.9,
+    "resvg_masking_clipPath_self_recursive.pdf": 99.1,
 }
 
 def get_page_count(pdf_path):
@@ -623,9 +653,13 @@ def main():
             if pct < PASS_THRESHOLD:
                 all_match = False
 
-        expected_divergence = (
-            EXPECTED_DIVERGENCES.get(name) if oracle_name == "mutool" else None
-        )
+        # Look up oracle-specific expected divergence (mutool or hayro).
+        expected_divergence = None
+        if oracle_name == "mutool":
+            expected_divergence = EXPECTED_DIVERGENCES.get(name)
+        elif oracle_name == "hayro":
+            expected_divergence = HAYRO_EXPECTED_DIVERGENCES.get(name)
+
         if worst_diff == 999:
             status = "SKIP"
         elif expected_divergence is not None:

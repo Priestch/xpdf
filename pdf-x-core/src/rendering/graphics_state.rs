@@ -72,7 +72,9 @@ impl Default for StrokeProps {
             miter_limit: 10.0,
             dash_array: Vec::new(),
             dash_offset: 0.0,
-            min_device_width: 0.2,
+            // PDF spec §6.5.4: hairline strokes must be visible (min 1 device px).
+            // Reference: hayro renderer.rs:875-886 min_factor() → 1.0 for paths.
+            min_device_width: 1.0,
         }
     }
 }
@@ -321,6 +323,14 @@ pub struct GraphicsState {
     /// Fill color
     pub fill_color: Color,
 
+    /// True when the current fill color space is Separation/DeviceN with
+    /// colorant name "None" (PDF spec §6.2.11: shall not produce any visible output).
+    pub fill_color_is_none: bool,
+
+    /// True when the current stroke color space is Separation/DeviceN with
+    /// colorant name "None".
+    pub stroke_color_is_none: bool,
+
     /// Current blend mode from ExtGState (`/BM`), defaults to Normal.
     pub blend_mode: BlendMode,
 
@@ -371,6 +381,8 @@ impl Default for GraphicsState {
             ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             stroke_color: Color::black(),
             fill_color: Color::black(),
+            fill_color_is_none: false,
+            stroke_color_is_none: false,
             blend_mode: BlendMode::default(),
             fill_alpha: 1.0,
             stroke_alpha: 1.0,

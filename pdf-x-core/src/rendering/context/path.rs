@@ -109,6 +109,11 @@ impl<'a, D: Device> RenderingContext<'a, D> {
 
     // === Path Painting Operators ===
     pub(super) fn stroke(&mut self) -> PDFResult<()> {
+        // PDF spec §6.2.11: /None colorant produces no visible output.
+        if self.current_state().stroke_color_is_none {
+            self.current_path.begin();
+            return Ok(());
+        }
         self.apply_pending_clip()?;
 
         // Pattern Type 2 stroke: rasterize the stroke into an alpha mask, then
@@ -191,6 +196,12 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         self.stroke()
     }
     pub(super) fn fill(&mut self, rule: FillRule) -> PDFResult<()> {
+        // PDF spec §6.2.11: /None colorant produces no visible output.
+        if self.current_state().fill_color_is_none {
+            self.current_path.begin();
+            return Ok(());
+        }
+
         // Pattern colours are sticky (PDF §8.7.3): keep pending across paints
         // until the fill colour is replaced. Source: text_stroked_complex_paint
         // applies one `scn` then many `f` for successive glyph outlines.

@@ -1480,11 +1480,44 @@ pub(super) fn color_from_color_space(
                 ))
             }
             Some(PDFObject::Name(name)) if name == "Separation" && arr.len() >= 4 => {
+                // PDF spec §6.2.11: /None colorant shall not produce visible output.
+                let colorant_name = arr.get(1).and_then(|v| v.as_ref().as_name());
+                if colorant_name == Some("None") {
+                    return None;
+                }
                 let tint = extract_number(args, 0).ok()?;
                 let alternate = resolve_object_clone(arr[2].as_ref().clone(), resolver)?;
                 let tint_fn = resolve_object_clone(arr[3].as_ref().clone(), resolver)?;
                 let alternate_components = components_for_color_space(&alternate, resolver).max(1);
                 let components = eval_tint_function(&tint_fn, &[tint], alternate_components)?;
+                color_from_components(&alternate, &components, resolver)
+            }
+            // DeviceN color space (PDF 1.7 §6.2.10).
+            // Reference: hayro color.rs:835-846.
+            Some(PDFObject::Name(name)) if name == "DeviceN" && arr.len() >= 4 => {
+                let colorants = match arr.get(1).and_then(|v| v.as_ref().as_array()) {
+                    Some(a) => a,
+                    None => return None,
+                };
+                // PDF spec §6.2.11: all-None colorants produce no visible output.
+                let all_none =
+                    colorants.iter().all(|c| c.as_ref().as_name() == Some("None"));
+                if all_none {
+                    return None;
+                }
+                let tint_values: Vec<f64> =
+                    args.iter().filter_map(|a| a.as_number()).collect();
+                if tint_values.len() != colorants.len() {
+                    return None;
+                }
+                let alternate =
+                    resolve_object_clone(arr[2].as_ref().clone(), resolver)?;
+                let tint_fn =
+                    resolve_object_clone(arr[3].as_ref().clone(), resolver)?;
+                let alternate_components =
+                    components_for_color_space(&alternate, resolver).max(1);
+                let components =
+                    eval_tint_function(&tint_fn, &tint_values, alternate_components)?;
                 color_from_components(&alternate, &components, resolver)
             }
             Some(PDFObject::Name(name)) if name == "ICCBased" && arr.len() >= 2 => {
@@ -1493,6 +1526,32 @@ pub(super) fn color_from_color_space(
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Check if a color space has a /None colorant (PDF spec §6.2.11).
+///
+/// Separation with colorant "None" or DeviceN with all-None colorants
+/// shall not produce any visible output.
+pub(super) fn is_none_colorant(color_space: &PDFObject) -> bool {
+    let arr = match color_space {
+        PDFObject::Array(a) => a,
+        _ => return false,
+    };
+    match arr.first().map(|v| v.as_ref()) {
+        Some(PDFObject::Name(name)) if name == "Separation" && arr.len() >= 2 => {
+            arr.get(1).and_then(|v| v.as_ref().as_name()) == Some("None")
+        }
+        Some(PDFObject::Name(name)) if name == "DeviceN" && arr.len() >= 2 => {
+            arr.get(1)
+                .and_then(|v| v.as_ref().as_array())
+                .is_some_and(|colorants| {
+                    colorants
+                        .iter()
+                        .all(|c| c.as_ref().as_name() == Some("None"))
+                })
+        }
+        _ => false,
     }
 }
 

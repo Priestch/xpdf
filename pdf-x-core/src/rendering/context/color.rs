@@ -27,6 +27,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         // G implicitly selects DeviceGray and replaces any Pattern stroke colour.
         self.pending_stroke_shading = None;
         self.stroke_color_space = Some(PDFObject::Name("DeviceGray".to_string()));
+        self.current_state_mut().stroke_color_is_none = false;
         self.current_state_mut().stroke_color = Color::Gray(gray);
         Ok(())
     }
@@ -46,6 +47,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         self.pending_fill_shading = None;
         self.pending_fill_tiling = None;
         self.fill_color_space = Some(PDFObject::Name("DeviceGray".to_string()));
+        self.current_state_mut().fill_color_is_none = false;
         self.current_state_mut().fill_color = Color::Gray(gray);
         Ok(())
     }
@@ -65,6 +67,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         // RG implicitly selects DeviceRGB and replaces any Pattern stroke colour.
         self.pending_stroke_shading = None;
         self.stroke_color_space = Some(PDFObject::Name("DeviceRGB".to_string()));
+        self.current_state_mut().stroke_color_is_none = false;
         self.current_state_mut().stroke_color = Color::RGB(r, g, b);
         Ok(())
     }
@@ -89,6 +92,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         self.pending_fill_shading = None;
         self.pending_fill_tiling = None;
         self.fill_color_space = Some(PDFObject::Name("DeviceRGB".to_string()));
+        self.current_state_mut().fill_color_is_none = false;
         self.current_state_mut().fill_color = Color::RGB(r, g, b);
         Ok(())
     }
@@ -108,6 +112,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         let k = extract_number(args, 3)?;
         self.pending_stroke_shading = None;
         self.stroke_color_space = Some(PDFObject::Name("DeviceCMYK".to_string()));
+        self.current_state_mut().stroke_color_is_none = false;
         self.current_state_mut().stroke_color = Color::CMYK(c, m, y, k);
         Ok(())
     }
@@ -128,6 +133,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         self.pending_fill_shading = None;
         self.pending_fill_tiling = None;
         self.fill_color_space = Some(PDFObject::Name("DeviceCMYK".to_string()));
+        self.current_state_mut().fill_color_is_none = false;
         self.current_state_mut().fill_color = Color::CMYK(c, m, y, k);
         Ok(())
     }
@@ -170,6 +176,8 @@ impl<'a, D: Device> RenderingContext<'a, D> {
             if is_pattern_color_space(&cs) {
                 return self.set_pattern_stroke(args);
             }
+            // PDF spec §6.2.11: /None colorant produces no visible output.
+            self.current_state_mut().stroke_color_is_none = is_none_colorant(&cs);
             if let Some(color) = self.color_from_current_space(args, Some(cs))? {
                 self.pending_stroke_shading = None;
                 self.current_state_mut().stroke_color = color;
@@ -191,10 +199,10 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 return self.set_pattern_fill(args);
             }
         }
-        if self.fill_color_space.is_some() {
-            if let Some(color) =
-                self.color_from_current_space(args, self.fill_color_space.clone())?
-            {
+        if let Some(cs) = self.fill_color_space.clone() {
+            // PDF spec §6.2.11: /None colorant produces no visible output.
+            self.current_state_mut().fill_color_is_none = is_none_colorant(&cs);
+            if let Some(color) = self.color_from_current_space(args, Some(cs))? {
                 self.pending_fill_shading = None;
                 self.pending_fill_tiling = None;
                 self.current_state_mut().fill_color = color;
