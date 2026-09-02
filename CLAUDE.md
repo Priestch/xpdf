@@ -102,10 +102,15 @@ in `pdf-x-core`) for render/viewer tests.
 - **Object graph**: objects reference each other indirectly; the delta must track/fix-up these
   refs when objects are modified or deleted.
 
+## Standard Font Selection Strategies
+
+See [`docs/standard-font-strategies.md`](docs/standard-font-strategies.md) for
+hayro / pdf.js / pdfium / xpdf standard-font substitution strategies.
 ## References
 
 - PDF 1.7 spec (ISO 32000-1) — §7.5.6 (Incremental Updates) is crucial for the delta layer.
 - `pdf.js/` submodule — primary reference implementation.
 - `../hayro/` — font/image-decode libraries.
+- `/home/gaopeng/Enter/pdfium-lib/build/wasm32/pdfium/` — pdfium source (WASM build checkout).
 - `docs/architecture.md` — full architecture & delta-layer design.
 - `docs/phase-0-foundation-spec.md` — current foundation migration steps & acceptance criteria.

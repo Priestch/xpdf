@@ -26,6 +26,7 @@ mod path;
 mod pattern;
 mod shading;
 mod state;
+pub mod standard_font_resolvers;
 mod text;
 mod type3;
 

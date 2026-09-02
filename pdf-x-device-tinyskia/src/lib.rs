@@ -18,6 +18,7 @@ mod skia_device;
 mod type1_font;
 
 pub use skia_device::SkiaDevice;
+pub use skia_device::standard_font_resolvers;
 
 use pdf_x_core::core::PDFDocument;
 use pdf_x_core::core::error::{PDFError, PDFResult};

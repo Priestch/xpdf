@@ -1,0 +1,84 @@
+set_matrix([1.000000,0.000000,0.000000,-1.000000,0.000000,841.890000])
+begin_path
+move_to(0.000000,0.000000)
+line_to(595.280000,0.000000)
+line_to(595.280000,841.890000)
+line_to(0.000000,841.890000)
+close_path
+clip_path(NonZero)
+load_font_data(name=F2, bytes=19395)
+flush_text_clip
+load_font_data(name=F1, bytes=15025)
+flush_text_clip
+save_state
+flush_text_clip
+save_state
+concat_matrix([1.000000,0.000000,0.000000,1.000000,0.000000,765.355000])
+save_state
+concat_matrix([1.000000,0.000000,0.000000,1.000000,0.000000,0.000000])
+begin_path
+move_to(0.000000,0.000000)
+line_to(595.280000,0.000000)
+line_to(595.280000,76.540000)
+line_to(0.000000,76.540000)
+close_path
+clip_path(NonZero)
+load_font_data(name=F3, bytes=16344)
+flush_text_clip
+flush_text_clip
+save_state
+flush_text_clip
+draw_text(font=F1, size=1.000000, paint=RGB(0.000000,0.000000,0.000000), tm=[1.000000,0.000000,0.000000,1.000000,136.060000,60.130000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=1)
+flush_text_clip
+restore_state
+move_to(42.520000,57.030000)
+line_to(552.760000,57.030000)
+set_opacity(1.000000)
+draw_path(stroke, paint=RGB(0.000000,0.000000,0.000000), stroke=lw=0.850000,cap=ProjectingSquare,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+set_opacity(1.000000)
+restore_state
+restore_state
+restore_state
+flush_text_clip
+flush_text_clip
+flush_text_clip
+draw_text(font=F2, size=16.000000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,237.640000,749.620000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=16)
+flush_text_clip
+load_font_data(name=F4, bytes=83156)
+set_font_raw_cid_codes(name=F4, enabled=true)
+flush_text_clip
+load_font_data(name=F5, bytes=17597)
+flush_text_clip
+load_font_data(name=F6, bytes=81692)
+set_font_raw_cid_codes(name=F6, enabled=true)
+flush_text_clip
+flush_text_clip
+draw_text(font=F6, size=12.000000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,45.350000,713.700000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=20)
+flush_text_clip
+flush_text_clip
+flush_text_clip
+draw_text(font=F5, size=12.000000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,117.920000,714.520000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=60)
+flush_text_clip
+flush_text_clip
+flush_text_clip
+draw_text(font=F4, size=11.000000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,60.620000,699.670000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=28)
+flush_text_clip
+flush_text_clip
+flush_text_clip
+draw_text(font=F5, size=12.000000, paint=Gray(0.000000), tm=[1.000000,0.000000,0.000000,1.000000,146.720000,699.520000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=56)
+flush_text_clip
+flush_text_clip
+save_state
+flush_text_clip
+move_to(42.520000,28.350000)
+line_to(552.760000,28.350000)
+set_opacity(1.000000)
+draw_path(stroke, paint=RGB(0.000000,0.000000,0.000000), stroke=lw=0.850000,cap=ProjectingSquare,join=Miter,ml=10.000000,dash=[],doff=0.000000)
+set_opacity(1.000000)
+save_state
+flush_text_clip
+draw_text(font=F1, size=12.000000, paint=RGB(0.000000,0.000000,0.000000), tm=[1.000000,0.000000,0.000000,1.000000,389.280000,16.400000], hscale=100.000000, rise=0.000000, cs=0.000000, ws=0.000000, bytes=41)
+flush_text_clip
+restore_state
+restore_state
+flush_text_clip

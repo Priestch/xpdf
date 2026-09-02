@@ -325,6 +325,9 @@ pub struct RecordingDevice {
     page_height: f64,
     /// Track which fonts have been "loaded" so `has_font` works correctly.
     fonts_loaded: std::collections::HashSet<String>,
+    /// Optional standard-font resolver — mirrors `Device::resolve_standard_font_data`.
+    /// Set via [`Self::with_standard_font_resolver`].
+    standard_font_resolver: Option<fn(&str) -> Option<Vec<u8>>>,
 }
 
 impl RecordingDevice {
@@ -335,7 +338,16 @@ impl RecordingDevice {
             page_width: width,
             page_height: height,
             fonts_loaded: std::collections::HashSet::new(),
+            standard_font_resolver: None,
         }
+    }
+
+    /// Install a custom standard-font resolver (e.g. Liberation TTF).
+    /// When set, `resolve_standard_font_data` delegates to this function
+    /// instead of returning `None`.
+    pub fn with_standard_font_resolver(mut self, resolver: fn(&str) -> Option<Vec<u8>>) -> Self {
+        self.standard_font_resolver = Some(resolver);
+        self
     }
 
     /// Get the recorded calls.
@@ -792,6 +804,10 @@ impl Device for RecordingDevice {
 
     fn has_font(&self, name: &str) -> bool {
         self.fonts_loaded.contains(name)
+    }
+
+    fn resolve_standard_font_data(&mut self, base_font: &str) -> Option<Vec<u8>> {
+        self.standard_font_resolver.and_then(|r| r(base_font))
     }
 }
 

@@ -100,11 +100,15 @@ fn run_recording_snapshot(
     snapshot_name: &str,
     page_width: f64,
     page_height: f64,
+    resolver: Option<fn(&str) -> Option<Vec<u8>>>,
 ) {
     let bytes = std::fs::read(pdf_path).unwrap();
     let mut doc = pdf_x_core::core::PDFDocument::open(bytes).unwrap();
     let resolved = doc.resolve_page(page_index).unwrap();
     let mut device = RecordingDevice::new(page_width, page_height);
+    if let Some(r) = resolver {
+        device = device.with_standard_font_resolver(r);
+    }
     interpret_with_scale(&resolved, &mut device, 1.0).unwrap();
     let output = device.serialize();
     write_or_compare(snapshot_name, &output);
@@ -263,71 +267,153 @@ fn ops_inline_img() {
 #[test]
 fn snapshot_basicapi_page0() {
     let f = &all_fixtures()[0];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
+}
+
+#[test]
+fn snapshot_basicapi_liberation() {
+    let f = &all_fixtures()[0];
+    let font_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("assets")
+        .join("fonts");
+    let resolver = liberation_ttf_resolver(font_dir.to_str().unwrap());
+    run_recording_snapshot(
+        &f.path,
+        f.page,
+        "dev_basicapi_liberation.txt",
+        f.w,
+        f.h,
+        Some(resolver),
+    );
+}
+
+/// Global font directory for [`liberation_ttf_resolver_fn`].
+///
+/// `cargo test` runs tests sequentially by default, so setting this once per
+/// process is safe for our single Liberation test.
+static LIBERATION_FONT_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install `font_dir` into the global and return a bare `fn` pointer.
+///
+/// The returned pointer reads from the global [`LIBERATION_FONT_DIR`] so it
+/// has no captures and is a valid `fn` item → `fn` pointer coercion.
+fn liberation_ttf_resolver(font_dir: &str) -> fn(&str) -> Option<Vec<u8>> {
+    LIBERATION_FONT_DIR
+        .set(font_dir.to_string())
+        .expect("LIBERATION_FONT_DIR already set — only one Liberation test should run");
+    liberation_ttf_resolver_fn
+}
+
+fn liberation_ttf_resolver_fn(base_font: &str) -> Option<Vec<u8>> {
+    let dir = LIBERATION_FONT_DIR.get()?;
+    let lower = base_font.to_ascii_lowercase();
+    let symbol = lower.contains("symbol");
+    let dingbats = lower.contains("dingbat");
+    if symbol || dingbats {
+        return None;
+    }
+    let bold = lower.contains("bold")
+        || lower.contains("black")
+        || lower.contains("heavy")
+        || lower.contains("medi")
+        || lower.contains("demibold")
+        || lower.contains("semibold");
+    let italic = lower.contains("italic")
+        || lower.contains("oblique")
+        || lower.contains("slant");
+    let mono = lower.contains("mono")
+        || lower.contains("courier")
+        || lower.contains("typewriter");
+    let serif = lower.contains("times")
+        || lower.contains("roman")
+        || lower.contains("serif")
+        || lower.contains("nimbusrom")
+        || lower.contains("garamond")
+        || lower.contains("book")
+        || lower.contains("palatino");
+    let family = if mono { 2 } else if serif { 1 } else { 0 };
+    let style = match (bold, italic) {
+        (true, true) => 3,
+        (true, false) => 1,
+        (false, true) => 2,
+        (false, false) => 0,
+    };
+    const FILES: [[&str; 4]; 3] = [
+        ["LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf",
+         "LiberationSans-Italic.ttf", "LiberationSans-BoldItalic.ttf"],
+        ["LiberationSerif-Regular.ttf", "LiberationSerif-Bold.ttf",
+         "LiberationSerif-Italic.ttf", "LiberationSerif-BoldItalic.ttf"],
+        ["LiberationMono-Regular.ttf", "LiberationMono-Bold.ttf",
+         "LiberationMono-Italic.ttf", "LiberationMono-BoldItalic.ttf"],
+    ];
+    let filename = FILES[family][style];
+    std::fs::read(std::path::Path::new(dir).join(filename)).ok()
 }
 
 #[test]
 fn snapshot_tracemonkey_page0() {
     let f = &all_fixtures()[1];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_type3_simple() {
     let f = &all_fixtures()[2];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_type3_filled() {
     let f = &all_fixtures()[3];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_cid_1() {
     let f = &all_fixtures()[4];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_shading_axial() {
     let f = &all_fixtures()[5];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_shading_radial() {
     let f = &all_fixtures()[6];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_tiling_simple() {
     let f = &all_fixtures()[7];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_fireworks() {
     let f = &all_fixtures()[8];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_mask_alpha() {
     let f = &all_fixtures()[9];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_cmyk_jpg() {
     let f = &all_fixtures()[10];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
 
 #[test]
 fn snapshot_inline_img() {
     let f = &all_fixtures()[11];
-    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h);
+    run_recording_snapshot(&f.path, f.page, &format!("dev_{}.txt", f.name), f.w, f.h, None);
 }
