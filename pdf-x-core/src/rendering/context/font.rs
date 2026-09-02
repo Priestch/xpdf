@@ -813,6 +813,7 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         base_font: &str,
         encoding: Option<&PDFObject>,
     ) -> PDFResult<()> {
+        eprintln!("[stretch] load_standard_font cache_key={} base_font={}", cache_key, base_font);
         #[cfg(feature = "debug-logging")]
         #[cfg(feature = "debug-logging")]
         eprintln!(
@@ -848,7 +849,11 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 "DEBUG: Loaded adapter standard font for cache_key='{}', base_font='{}'",
                 cache_key, base_font
             );
-            return self.device.load_font_data(cache_key, data, encoding);
+            let result = self.device.load_font_data(cache_key, data, encoding);
+            if result.is_ok() {
+                let _ = self.device.mark_font_substituted(cache_key);
+            }
+            return result;
         }
 
         if let Some(data) = bundled_standard_font_data(clean_font) {
@@ -857,7 +862,11 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 "DEBUG: Loaded bundled standard font for cache_key='{}', base_font='{}'",
                 cache_key, base_font
             );
-            return self.device.load_font_data(cache_key, data, encoding);
+            let result = self.device.load_font_data(cache_key, data, encoding);
+            if result.is_ok() {
+                let _ = self.device.mark_font_substituted(cache_key);
+            }
+            return result;
         }
 
         #[cfg(feature = "debug-logging")]

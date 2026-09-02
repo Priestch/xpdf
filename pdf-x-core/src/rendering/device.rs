@@ -526,6 +526,17 @@ pub trait Device {
         Ok(())
     }
 
+    /// Mark a font as a non-embedded standard-font substitution.
+    ///
+    /// Signals that the font program is a substitute (Base-14 mapping) rather than
+    /// an embedded font. Devices can use this to compensate when the PDF `/Widths`
+    /// table disagrees with the substitute's intrinsic glyph metrics, e.g. by
+    /// horizontally stretching outlines.
+    /// Reference: hayro `Type1Font::fallback` / pdf.js `remeasure`.
+    fn mark_font_substituted(&mut self, _name: &str) -> PDFResult<()> {
+        Ok(())
+    }
+
     /// Request that a loaded composite font be rendered from raw CIDs.
     ///
     /// Backends that can address embedded CID fonts by glyph id can use this

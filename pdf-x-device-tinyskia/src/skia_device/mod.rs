@@ -656,6 +656,10 @@ pub struct StoredFont {
     /// Native FreeType charmap target used only for CIDFontType2 charmap lookup.
     #[cfg(feature = "native-freetype")]
     native_charmap_target: freetype::ffi::FT_Encoding,
+    /// True when the font program is a Base-14 substitute for a non-embedded
+    /// PDF font. Gates per-glyph width-stretch compensation so embedded fonts
+    /// are never stretched.
+    substituted: bool,
     /// Whether the embedded font actually has a FreeType charmap to query.
     #[cfg(feature = "native-freetype")]
     native_charmap_available: bool,
@@ -698,6 +702,7 @@ impl StoredFont {
                 native_charmap_target: freetype::ffi::FT_ENCODING_UNICODE,
                 #[cfg(feature = "native-freetype")]
                 native_charmap_available: false,
+                substituted: false,
             })
         } else {
             // Try TrueType font
@@ -736,6 +741,7 @@ impl StoredFont {
                 native_charmap_target: freetype::ffi::FT_ENCODING_UNICODE,
                 #[cfg(feature = "native-freetype")]
                 native_charmap_available: false,
+                substituted: false,
             })
         }
     }
@@ -1034,6 +1040,57 @@ impl StoredFont {
             .as_ref()
             .and_then(|w| w.get(code as usize).copied())
             .unwrap_or(self.pdf_default_width)
+    }
+
+    pub fn mark_substituted(&mut self) {
+        self.substituted = true;
+    }
+
+    pub fn is_substituted(&self) -> bool {
+        self.substituted
+    }
+
+    /// Horizontal stretch factor aligning a substitute TrueType glyph's outline
+    /// with the PDF /Widths advance. Both widths in native font units (upem).
+    /// Returns 1.0 when no compensation applies.
+    /// Reference: hayro hayro-interpret/src/font/type1.rs:202-221.
+    pub fn truetype_glyph_stretch(&self, pdf_width: f32, gid: ttf_parser::GlyphId) -> f32 {
+        if !self.substituted {
+            return 1.0;
+        }
+        if gid.0 == 0 {
+            return 1.0;
+        }
+        let Some(face) = self.face() else {
+            return 1.0;
+        };
+        let intrinsic = match face.glyph_hor_advance(gid) {
+            Some(w) if w > 0 => w as f32,
+            _ => return 1.0,
+        };
+        let pdf_width_font_units = pdf_width * face.units_per_em() as f32 / 1000.0;
+        if pdf_width_font_units <= 0.0 {
+            return 1.0;
+        }
+        let stretch = pdf_width_font_units / intrinsic;
+        if stretch.is_finite() { stretch } else { 1.0 }
+    }
+
+    /// Horizontal stretch factor for a substitute Type1/CFF glyph.
+    /// Both widths are in 1000-unit glyph space, so this is a plain ratio.
+    pub fn type1_glyph_stretch(&self, pdf_width: f32, byte: u8) -> f32 {
+        if !self.substituted {
+            return 1.0;
+        }
+        let Some(t1) = self.type1_font() else {
+            return 1.0;
+        };
+        let intrinsic = t1.glyph_width(char::from(byte)) as f32;
+        if intrinsic <= 0.0 || pdf_width <= 0.0 {
+            return 1.0;
+        }
+        let stretch = pdf_width / intrinsic;
+        if stretch.is_finite() { stretch } else { 1.0 }
     }
 
     /// When the PDF omits `/Widths` (common for Base-14 fonts), synthesize a
@@ -2756,6 +2813,13 @@ impl<'a> Device for SkiaDevice<'a> {
         default_width: f64,
     ) -> PDFResult<()> {
         self.set_font_widths(name, first_char, widths, default_width)
+    }
+
+    fn mark_font_substituted(&mut self, name: &str) -> PDFResult<()> {
+        if let Some(font) = self.font_cache.get_mut(name) {
+            font.mark_substituted();
+        }
+        Ok(())
     }
 
     fn set_font_raw_cid_codes(&mut self, name: &str, enabled: bool) -> PDFResult<()> {

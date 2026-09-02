@@ -41,7 +41,7 @@ const LIBERATION_FILES: [[&str; 4]; 3] = [
     ],
 ];
 
-fn liberation_filename(base_font: &str) -> Option<&'static str> {
+pub(crate) fn liberation_filename(base_font: &str) -> Option<&'static str> {
     let lower = base_font.to_ascii_lowercase();
 
     let symbol = lower.contains("symbol");

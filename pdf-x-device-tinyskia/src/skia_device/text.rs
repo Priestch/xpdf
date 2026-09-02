@@ -179,7 +179,15 @@ impl<'a> SkiaDevice<'a> {
                             .and_then(|f| f.face())
                             .map(|face| face.outline_glyph(gid, &mut converter));
                         if let Some(p) = converter.0.finish() {
-                            let transform = Transform::from_row(1.0, 0.0, 0.0, 1.0, current_x, 0.0);
+                            // Width compensation: stretch outline to match PDF /Widths
+                            // when substitute face metrics disagree (hayro approach 2).
+                            let stretch = self
+                                .font_cache
+                                .get(font_name)
+                                .map(|f| f.truetype_glyph_stretch(width_pdf, gid))
+                                .unwrap_or(1.0);
+                            let transform =
+                                Transform::from_row(stretch, 0.0, 0.0, 1.0, current_x, 0.0);
                             if let Some(path_transformed) = p.transform(transform) {
                                 text_path_builder.push_path(&path_transformed);
                             }
@@ -378,15 +386,16 @@ impl<'a> SkiaDevice<'a> {
         } else {
             for &byte in text_bytes {
                 let ch = char::from(byte);
-                let glyph_width = self
+                let pdf_w = self
                     .font_cache
                     .get(font_name)
                     .and_then(|f| {
                         f.pdf_widths
                             .as_ref()
                             .and_then(|w| w.get(byte as usize).copied())
-                    })
-                    .unwrap_or(type1_font.glyph_width(ch) as f32);
+                    });
+                let glyph_width =
+                    pdf_w.unwrap_or_else(|| type1_font.glyph_width(ch) as f32);
                 let mut spacing_user = char_spacing;
                 if byte == b' ' {
                     spacing_user += word_spacing;
@@ -400,7 +409,20 @@ impl<'a> SkiaDevice<'a> {
                     .unwrap()
                     .cached_glyph_path(byte)
                 {
-                    let transform = Transform::from_row(1.0, 0.0, 0.0, 1.0, current_x, current_y);
+                    // Width compensation: stretch outline to match PDF /Widths
+                    // when substitute CFF metrics disagree (hayro approach 2).
+                    // Only stretch when the advance came from PDF /Widths;
+                    // when it came from the font itself the ratio is 1 by construction.
+                    let stretch = pdf_w
+                        .and_then(|w| {
+                            self.font_cache
+                                .get(font_name)
+                                .map(|f| f.type1_glyph_stretch(w, byte))
+                        })
+                        .unwrap_or(1.0);
+                    let transform = Transform::from_row(
+                        stretch, 0.0, 0.0, 1.0, current_x, current_y,
+                    );
                     if let Some(path_transformed) = glyph_path.transform(transform) {
                         text_path_builder.push_path(&path_transformed);
                     }
@@ -794,15 +816,16 @@ impl<'a> SkiaDevice<'a> {
             } else {
                 for &byte in text_bytes {
                     let ch = char::from(byte);
-                    let glyph_width = self
+                    let pdf_w = self
                         .font_cache
                         .get(font_name)
                         .and_then(|f| {
                             f.pdf_widths
                                 .as_ref()
                                 .and_then(|w| w.get(byte as usize).copied())
-                        })
-                        .unwrap_or(type1_font.glyph_width(ch) as f32);
+                        });
+                    let glyph_width =
+                        pdf_w.unwrap_or_else(|| type1_font.glyph_width(ch) as f32);
                     let mut spacing_user = char_spacing;
                     if byte == b' ' {
                         spacing_user += word_spacing;
@@ -816,7 +839,17 @@ impl<'a> SkiaDevice<'a> {
                         .unwrap()
                         .cached_glyph_path(byte)
                     {
-                        let transform = Transform::from_row(1.0, 0.0, 0.0, 1.0, current_x, 0.0);
+                        // Width compensation (mirror draw_text Branch D).
+                        let stretch = pdf_w
+                            .and_then(|w| {
+                                self.font_cache
+                                    .get(font_name)
+                                    .map(|f| f.type1_glyph_stretch(w, byte))
+                            })
+                            .unwrap_or(1.0);
+                        let transform = Transform::from_row(
+                            stretch, 0.0, 0.0, 1.0, current_x, 0.0,
+                        );
                         if let Some(t) = glyph_path.transform(transform) {
                             text_path.push_path(&t);
                         }

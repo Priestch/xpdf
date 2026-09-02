@@ -175,9 +175,14 @@ impl Default for RenderSession {
     }
 }
 
-/// Pure render: interpret a `ResolvedPage` through a `SkiaDevice` and rasterize
-/// to RGBA. The `font_cache` is borrowed from PDFDocument so parsed fonts
-/// persist across renders.
+/// Directory holding Liberation TTF files (set from `PDFX_LIBERATION_FONTS_DIR` env var).
+static LIBERATION_FONT_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn liberation_resolver_fn(base_font: &str) -> Option<Vec<u8>> {
+    let dir = LIBERATION_FONT_DIR.get()?;
+    let filename = standard_font_resolvers::liberation_filename(base_font)?;
+    std::fs::read(std::path::Path::new(dir).join(filename)).ok()
+}
 fn render_resolved_page(
     resolved: &ResolvedPage,
     scale: Option<f32>,
@@ -216,6 +221,15 @@ fn render_resolved_page(
     let mut device = SkiaDevice::new(pixmap.as_mut(), font_cache);
     if std::env::var_os("PDFX_NATIVE_STANDARD_FONTS").is_some() {
         device.use_system_standard_fonts();
+    }
+    if let Some(dir) = std::env::var_os("PDFX_LIBERATION_FONTS_DIR") {
+        let dir = std::path::PathBuf::from(&dir);
+        if dir.is_dir() {
+            LIBERATION_FONT_DIR
+                .set(dir.to_string_lossy().into_owned())
+                .ok();
+            device.set_standard_font_resolver(liberation_resolver_fn);
+        }
     }
 
     // Viewport scale must be applied inside interpret (page CTM + root_ctm).
