@@ -16,6 +16,7 @@ fn main() {
             commands::get_page_sizes,
             commands::render_page,
             commands::add_highlight,
+            commands::move_page,
             commands::undo_edit,
             commands::redo_edit,
             commands::get_editor_state,

@@ -1052,6 +1052,283 @@ impl Command for DeletePageCommand {
     }
 }
 
+/// Reversible command that moves a page to a new slot in the page tree.
+///
+/// The page is removed from the source parent's `/Kids` at `src_kid_index`
+/// and inserted into the destination parent's `/Kids` at `dst_insert_at`.
+/// A same-parent move is one merged `/Kids` permutation with no `/Count`
+/// write (the count is net zero); a cross-parent move decrements `/Count`
+/// on the source chain and increments it on the destination chain. Ancestor
+/// chains can share a tail (the common path up to the root `/Pages`): those
+/// nodes get a net-zero delta and are left untouched.
+///
+/// Reference: pdf.js has no page-move support (viewer-level feature, like
+/// deletion). hayro only extracts pages into a *new* PDF
+/// (`hayro-write/src/lib.rs` `extract_pages_to_pdf`), not in-place moves.
+pub struct MovePageCommand {
+    /// Reference of the page dict being moved.
+    page_ref: Ref,
+
+    /// Reference of the parent `/Pages` node currently holding the page.
+    src_parent_ref: Ref,
+
+    /// Slot of the page within the source parent's `/Kids`.
+    src_kid_index: usize,
+
+    /// Pre-fetched source parent dictionary.
+    original_src_parent: PDFObject,
+
+    /// Ancestors strictly above the source parent: `(ref, original dict)`.
+    src_ancestors: Vec<(Ref, PDFObject)>,
+
+    /// Reference of the destination parent `/Pages` node.
+    dst_parent_ref: Ref,
+
+    /// Insert slot within the destination parent's `/Kids`.
+    dst_insert_at: usize,
+
+    /// Pre-fetched destination parent dictionary.
+    original_dst_parent: PDFObject,
+
+    /// Ancestors strictly above the destination parent: `(ref, original dict)`.
+    dst_ancestors: Vec<(Ref, PDFObject)>,
+
+    /// Whether both endpoints resolve to the same parent node.
+    same_parent: bool,
+}
+
+impl MovePageCommand {
+    /// Create a new page-move command.
+    ///
+    /// All objects are pre-fetched so the command needs no `fetch_base`
+    /// callback. `src_ancestors` / `dst_ancestors` must exclude the parents
+    /// themselves (chain strictly above each parent).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        page_ref: Ref,
+        src_parent_ref: Ref,
+        src_kid_index: usize,
+        original_src_parent: PDFObject,
+        src_ancestors: Vec<(Ref, PDFObject)>,
+        dst_parent_ref: Ref,
+        dst_insert_at: usize,
+        original_dst_parent: PDFObject,
+        dst_ancestors: Vec<(Ref, PDFObject)>,
+        same_parent: bool,
+    ) -> Self {
+        Self {
+            page_ref,
+            src_parent_ref,
+            src_kid_index,
+            original_src_parent,
+            src_ancestors,
+            dst_parent_ref,
+            dst_insert_at,
+            original_dst_parent,
+            dst_ancestors,
+            same_parent,
+        }
+    }
+
+    /// True if `r` sits on the source ancestor chain.
+    fn on_src_chain(&self, r: &Ref) -> bool {
+        self.src_ancestors
+            .iter()
+            .any(|(a, _)| a.num == r.num && a.generation == r.generation)
+    }
+
+    /// True if `r` sits on the destination ancestor chain.
+    fn on_dst_chain(&self, r: &Ref) -> bool {
+        self.dst_ancestors
+            .iter()
+            .any(|(a, _)| a.num == r.num && a.generation == r.generation)
+    }
+}
+
+impl Command for MovePageCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        if self.same_parent {
+            // Same parent: one merged write — a pure /Kids permutation. The
+            // parent's /Count is net zero and must not be rewritten.
+            let mut parent = match &self.original_src_parent {
+                PDFObject::Dictionary(d) => d.clone(),
+                _ => {
+                    return Err(PDFError::Generic(format!(
+                        "Source parent {} {} is not a dictionary",
+                        self.src_parent_ref.num, self.src_parent_ref.generation
+                    )));
+                }
+            };
+            let mut kids = parent
+                .get("Kids")
+                .and_then(|k| k.as_array())
+                .ok_or_else(|| {
+                    PDFError::Generic(format!(
+                        "Source parent {} {} has no Kids array",
+                        self.src_parent_ref.num, self.src_parent_ref.generation
+                    ))
+                })?
+                .to_vec();
+            if self.src_kid_index >= kids.len() {
+                return Err(PDFError::Generic(format!(
+                    "src_kid_index {} out of range (Kids len={})",
+                    self.src_kid_index,
+                    kids.len()
+                )));
+            }
+            if self.dst_insert_at > kids.len() - 1 {
+                return Err(PDFError::Generic(format!(
+                    "dst_insert_at {} out of range (post-removal Kids len={})",
+                    self.dst_insert_at,
+                    kids.len() - 1
+                )));
+            }
+            let page = kids.remove(self.src_kid_index);
+            kids.insert(self.dst_insert_at, page);
+            parent.insert("Kids".to_string(), PDFObject::Array(kids.into()));
+            delta.modify_object(self.src_parent_ref, PDFObject::Dictionary(parent));
+            return Ok(());
+        }
+
+        // Cross-parent move: remove from the source parent (Count -1) and
+        // insert into the destination parent (Count +1) as two writes.
+        let mut src = match &self.original_src_parent {
+            PDFObject::Dictionary(d) => d.clone(),
+            _ => {
+                return Err(PDFError::Generic(format!(
+                    "Source parent {} {} is not a dictionary",
+                    self.src_parent_ref.num, self.src_parent_ref.generation
+                )));
+            }
+        };
+        let mut src_kids = src
+            .get("Kids")
+            .and_then(|k| k.as_array())
+            .ok_or_else(|| {
+                PDFError::Generic(format!(
+                    "Source parent {} {} has no Kids array",
+                    self.src_parent_ref.num, self.src_parent_ref.generation
+                ))
+            })?
+            .to_vec();
+        if self.src_kid_index >= src_kids.len() {
+            return Err(PDFError::Generic(format!(
+                "src_kid_index {} out of range (Kids len={})",
+                self.src_kid_index,
+                src_kids.len()
+            )));
+        }
+        let _page = src_kids.remove(self.src_kid_index);
+        let src_count = src.get("Count").and_then(|c| c.as_number()).unwrap_or(0.0) as u32;
+        src.insert("Kids".to_string(), PDFObject::Array(src_kids.into()));
+        src.insert(
+            "Count".to_string(),
+            PDFObject::Number(src_count.saturating_sub(1) as f64),
+        );
+        delta.modify_object(self.src_parent_ref, PDFObject::Dictionary(src));
+
+        let mut dst = match &self.original_dst_parent {
+            PDFObject::Dictionary(d) => d.clone(),
+            _ => {
+                return Err(PDFError::Generic(format!(
+                    "Destination parent {} {} is not a dictionary",
+                    self.dst_parent_ref.num, self.dst_parent_ref.generation
+                )));
+            }
+        };
+        let mut dst_kids = dst
+            .get("Kids")
+            .and_then(|k| k.as_array())
+            .ok_or_else(|| {
+                PDFError::Generic(format!(
+                    "Destination parent {} {} has no Kids array",
+                    self.dst_parent_ref.num, self.dst_parent_ref.generation
+                ))
+            })?
+            .to_vec();
+        if self.dst_insert_at > dst_kids.len() {
+            return Err(PDFError::Generic(format!(
+                "dst_insert_at {} out of range (Kids len={})",
+                self.dst_insert_at,
+                dst_kids.len()
+            )));
+        }
+        dst_kids.insert(self.dst_insert_at, Box::new(PDFObject::Ref(self.page_ref)));
+        let dst_count = dst.get("Count").and_then(|c| c.as_number()).unwrap_or(0.0) as u32;
+        dst.insert("Kids".to_string(), PDFObject::Array(dst_kids.into()));
+        dst.insert(
+            "Count".to_string(),
+            PDFObject::Number(dst_count.saturating_add(1) as f64),
+        );
+        delta.modify_object(self.dst_parent_ref, PDFObject::Dictionary(dst));
+
+        // Ancestor /Count walks. Shared-tail ancestors appear on both chains:
+        // -1 and +1 cancel out, so they are skipped on BOTH sides rather than
+        // written (a lone -1 would corrupt the shared count).
+        for (ancestor_ref, original) in &self.src_ancestors {
+            if self.on_dst_chain(ancestor_ref) {
+                continue;
+            }
+            if let PDFObject::Dictionary(d) = original {
+                let mut dict = d.clone();
+                let count = dict.get("Count").and_then(|c| c.as_number()).unwrap_or(0.0) as u32;
+                dict.insert(
+                    "Count".to_string(),
+                    PDFObject::Number(count.saturating_sub(1) as f64),
+                );
+                delta.modify_object(*ancestor_ref, PDFObject::Dictionary(dict));
+            }
+        }
+        for (ancestor_ref, original) in &self.dst_ancestors {
+            if self.on_src_chain(ancestor_ref) {
+                continue;
+            }
+            if let PDFObject::Dictionary(d) = original {
+                let mut dict = d.clone();
+                let count = dict.get("Count").and_then(|c| c.as_number()).unwrap_or(0.0) as u32;
+                dict.insert(
+                    "Count".to_string(),
+                    PDFObject::Number(count.saturating_add(1) as f64),
+                );
+                delta.modify_object(*ancestor_ref, PDFObject::Dictionary(dict));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        // Undo runs LIFO, so the delta holds exactly the post-execute state:
+        // restoring every pre-fetched original is sufficient.
+        delta.modify_object(self.src_parent_ref, self.original_src_parent.clone());
+        if !self.same_parent {
+            delta.modify_object(self.dst_parent_ref, self.original_dst_parent.clone());
+        }
+        for (ancestor_ref, original) in &self.src_ancestors {
+            if self.on_dst_chain(ancestor_ref) {
+                continue; // never written by execute
+            }
+            delta.modify_object(*ancestor_ref, original.clone());
+        }
+        for (ancestor_ref, original) in &self.dst_ancestors {
+            if self.on_src_chain(ancestor_ref) {
+                continue; // never written by execute
+            }
+            delta.modify_object(*ancestor_ref, original.clone());
+        }
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        // redo is identical to execute: re-apply the move.
+        self.execute(delta, None)
+    }
+}
+
 /// Reversible command that appends a standard highlight annotation to a page.
 pub struct AddHighlightCommand {
     page_ref: Ref,

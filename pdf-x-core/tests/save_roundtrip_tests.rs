@@ -103,6 +103,27 @@ fn outlined_two_page_pdf() -> Vec<u8> {
     )
 }
 
+/// Four-page PDF with a two-level page tree (one intermediate /Pages node per
+/// branch). Object map: 1=Catalog, 2=RootPages, 3=Inter1 (pages 0,1),
+/// 4=Inter2 (pages 2,3), 5-8=Page dicts.
+fn nested_tree_pdf() -> Vec<u8> {
+    let page =
+        |parent: u32| format!("<< /Type /Page /Parent {parent} 0 R /MediaBox [0 0 612 792] >>");
+    assemble_pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 4 >>".to_string(),
+            "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R 6 0 R] /Count 2 >>".to_string(),
+            "<< /Type /Pages /Parent 2 0 R /Kids [7 0 R 8 0 R] /Count 2 >>".to_string(),
+            page(3),
+            page(3),
+            page(4),
+            page(4),
+        ],
+        "/Root 1 0 R",
+    )
+}
+
 // ==========================================================================
 // Save / validate helpers
 // ==========================================================================
@@ -455,4 +476,120 @@ fn save_twice_same_session() {
         .expect("annots must persist")
         .len();
     assert_eq!(annots, 2, "both highlights must survive two saves");
+}
+
+// ==========================================================================
+// Page reorder
+// ==========================================================================
+
+/// Current page order as object refs — the order oracle.
+fn page_refs(doc: &mut PDFDocument) -> Vec<(u32, u32)> {
+    let n = doc.page_count().expect("page count") as usize;
+    (0..n)
+        .map(|i| {
+            doc.get_page(i)
+                .unwrap_or_else(|e| panic!("page {i} should resolve: {e}"))
+                .reference()
+                .unwrap_or_else(|| panic!("page {i} has no object reference"))
+        })
+        .collect()
+}
+
+#[test]
+fn move_page_same_parent_roundtrip() {
+    let original = three_page_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    // Move last page to the front: [P1 P2 P3] -> [P3 P1 P2].
+    doc.move_page(2, 0).expect("move should apply");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    assert_qpdf_clean(&saved, "move_page same parent");
+
+    let mut reopened = reopen(saved);
+    assert_eq!(
+        reopened.page_count().expect("page count"),
+        3,
+        "page count must survive a reorder"
+    );
+    assert_eq!(
+        page_refs(&mut reopened),
+        vec![(5, 0), (3, 0), (4, 0)],
+        "moved order must persist after save + reopen"
+    );
+}
+
+#[test]
+fn move_page_cross_parent_roundtrip() {
+    let original = nested_tree_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    // Move page 0 (obj 5, branch 3) to the end (after obj 8 in branch 4):
+    // [5 6 | 7 8] -> [6 | 7 8 5]. The shared root /Count must stay 4.
+    doc.move_page(0, 3).expect("cross-parent move should apply");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    assert_qpdf_clean(&saved, "move_page cross parent");
+
+    let mut reopened = reopen(saved);
+    assert_eq!(reopened.page_count().expect("page count"), 4);
+    assert_eq!(
+        page_refs(&mut reopened),
+        vec![(6, 0), (7, 0), (8, 0), (5, 0)],
+        "cross-parent move must persist with consistent /Count"
+    );
+}
+
+#[test]
+fn move_page_to_end_roundtrip() {
+    let original = three_page_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    // Adjacent move is a no-op that must not dirty the delta…
+    doc.move_page(0, 1).expect("no-op move");
+    assert_eq!(doc.editor_state(), (false, false, false));
+
+    // …then move the first page to the end (destination beyond the last page
+    // clamps): [P1 P2 P3] -> [P2 P3 P1].
+    doc.move_page(0, 99)
+        .expect("clamped move to end should apply");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    assert_qpdf_clean(&saved, "move_page to end");
+
+    let mut reopened = reopen(saved);
+    assert_eq!(
+        page_refs(&mut reopened),
+        vec![(4, 0), (5, 0), (3, 0)],
+        "only the real move must persist"
+    );
+}
+
+#[test]
+fn move_page_undo_restores_order() {
+    let original = nested_tree_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    // Move page 3 (obj 8, branch 4) to the front: [5 6 | 7 8] -> [8 | 5 6 7].
+    doc.move_page(3, 0).expect("move should apply");
+    doc.undo().expect("undo should apply");
+    // Undo restores the tree content exactly. `dirty` stays true because the
+    // delta keeps the restored (base-identical) entries — pre-existing
+    // behavior shared by every structural command's undo, not move-specific.
+    assert_eq!(doc.editor_state(), (true, false, true));
+    assert_eq!(page_refs(&mut doc), vec![(5, 0), (6, 0), (7, 0), (8, 0)]);
+
+    // Redo, then persist: the saved file shows the moved order.
+    doc.redo().expect("redo should apply");
+    let saved = save(&doc, &original);
+    assert_qpdf_clean(&saved, "move_page undo/redo");
+
+    let mut reopened = reopen(saved);
+    assert_eq!(
+        page_refs(&mut reopened),
+        vec![(8, 0), (5, 0), (6, 0), (7, 0)]
+    );
 }

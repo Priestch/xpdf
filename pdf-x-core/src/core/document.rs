@@ -1,6 +1,6 @@
 use super::delta::{
-    AddHighlightCommand, CommandHistory, DeletePageCommand, DeltaLayer, ReplaceTextCommand,
-    RotatePageCommand, SetInfoCommand,
+    AddHighlightCommand, CommandHistory, DeletePageCommand, DeltaLayer, MovePageCommand,
+    ReplaceTextCommand, RotatePageCommand, SetInfoCommand,
 };
 use super::doc_store::DocStore;
 use super::document_loader::{DocumentLoader, OpenProgress};
@@ -504,6 +504,101 @@ impl PDFDocument {
             ancestors,
             original_parent,
             original_ancestors,
+        );
+        self.execute_command(Box::new(cmd))
+    }
+
+    /// Move a page to a new position in the page tree.
+    ///
+    /// Final-position semantics (pdfium `FPDF_MovePage` convention): `to_index`
+    /// is the page's 0-based position in the document *after* the move, counted
+    /// as if the page were first removed. Moving backwards (`to < from`) places
+    /// the page before the one currently at `to`; moving forwards places it
+    /// after it. Same-parent moves are a pure `/Kids` permutation (net-zero
+    /// `/Count`); cross-parent moves keep `/Count` consistent on both chains.
+    /// `to_index` beyond the last page clamps to the end; a no-op move
+    /// (`to == from` or `to == from + 1`) returns `Ok` without dirtying the
+    /// delta.
+    ///
+    /// Reference: pdf.js has no page-move support (viewer-level feature, like
+    /// deletion).
+    pub fn move_page(&mut self, from_index: usize, to_index: usize) -> PDFResult<()> {
+        let count = self.page_count()?;
+        if from_index >= count as usize {
+            return Err(PDFError::Generic(format!(
+                "from_index {from_index} out of range (page count {count})"
+            )));
+        }
+        let to_index = to_index.min(count as usize - 1);
+        if to_index == from_index || to_index == from_index + 1 {
+            return Ok(()); // no-op: order unchanged
+        }
+
+        // 1. Resolve the page and both endpoint parent chains. Probing the
+        //    destination chain must happen BEFORE any mutation (it maps the
+        //    destination page's current global slot into its parent's /Kids).
+        let page = self.get_page(from_index)?;
+        let page_ref = page.reference().ok_or_else(|| {
+            PDFError::Generic("Cannot move a page without an indirect object reference".into())
+        })?;
+        let page_ref = Ref::new(page_ref.0, page_ref.1);
+
+        let (src_parent_ref, src_kid_index, src_chain) = self.page_parent_chain(from_index)?;
+        let (dst_parent_ref, dst_kid_index, dst_chain) = self.page_parent_chain(to_index)?;
+
+        let same_parent = src_parent_ref.num == dst_parent_ref.num
+            && src_parent_ref.generation == dst_parent_ref.generation;
+
+        // 2. Insert slot in the destination /Kids. A page-tree node's kids
+        //    occupy a contiguous global index range, so slots are order-stable:
+        //    same-parent moves always land at the destination page's current
+        //    slot (moving forwards, that slot is already shifted by the
+        //    removal). Cross-parent moves are unaffected by the removal:
+        //    insert before the destination page when moving backwards, after
+        //    it when moving forwards.
+        let dst_insert_at = if to_index < from_index || same_parent {
+            dst_kid_index
+        } else {
+            dst_kid_index + 1
+        };
+
+        // 3. Pre-fetch parents and the chains strictly above them
+        //    (page_parent_chain returns the parent as chain[0], so skip it).
+        let original_src_parent = {
+            let obj = self
+                .doc_store
+                .resolve_ref(src_parent_ref.num, src_parent_ref.generation)?;
+            (*obj).clone()
+        };
+        let original_dst_parent = {
+            let obj = self
+                .doc_store
+                .resolve_ref(dst_parent_ref.num, dst_parent_ref.generation)?;
+            (*obj).clone()
+        };
+
+        let mut src_ancestors = Vec::with_capacity(src_chain.len().saturating_sub(1));
+        for (r, _) in src_chain.iter().skip(1) {
+            let obj = self.doc_store.resolve_ref(r.num, r.generation)?;
+            src_ancestors.push((*r, (*obj).clone()));
+        }
+        let mut dst_ancestors = Vec::with_capacity(dst_chain.len().saturating_sub(1));
+        for (r, _) in dst_chain.iter().skip(1) {
+            let obj = self.doc_store.resolve_ref(r.num, r.generation)?;
+            dst_ancestors.push((*r, (*obj).clone()));
+        }
+
+        let cmd = MovePageCommand::new(
+            page_ref,
+            src_parent_ref,
+            src_kid_index,
+            original_src_parent,
+            src_ancestors,
+            dst_parent_ref,
+            dst_insert_at,
+            original_dst_parent,
+            dst_ancestors,
+            same_parent,
         );
         self.execute_command(Box::new(cmd))
     }
@@ -3313,5 +3408,128 @@ startxref
         // node (4) and the root (2).
         doc.delete_page(2).expect("delete");
         assert_eq!(doc.page_count().unwrap(), 3);
+    }
+
+    // ===================== move_page =====================
+
+    /// Current page order as object refs — the order oracle for moves.
+    /// Flat fixture: pages 0..2 -> objects 3..5. Nested fixture:
+    /// pages 0..3 -> objects 5..8.
+    fn page_order(doc: &mut PDFDocument) -> Vec<(u32, u32)> {
+        let n = doc.page_count().expect("page count") as usize;
+        (0..n)
+            .map(|i| {
+                doc.get_page(i)
+                    .unwrap_or_else(|e| panic!("page {i} should resolve: {e}"))
+                    .reference()
+                    .unwrap_or_else(|| panic!("page {i} has no object reference"))
+            })
+            .collect()
+    }
+
+    /// /Count of a `/Pages` node resolved through the delta (by object number).
+    fn node_count(doc: &mut PDFDocument, num: u32) -> u32 {
+        let obj = doc
+            .doc_store_mut()
+            .resolve_ref(num, 0)
+            .unwrap_or_else(|e| panic!("object {num} should resolve: {e}"));
+        match &*obj {
+            PDFObject::Dictionary(d) => {
+                d.get("Count").and_then(|c| c.as_number()).unwrap_or(0.0) as u32
+            }
+            other => panic!("object {num} is not a dictionary: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_page_flat_tree_same_parent() {
+        let original = create_3page_flat_pdf();
+        let mut doc = PDFDocument::open(original).expect("open");
+
+        // Move first page to the end: [P1 P2 P3] -> [P2 P3 P1].
+        doc.move_page(0, 2).expect("move");
+        assert_eq!(doc.page_count().unwrap(), 3);
+        assert_eq!(page_order(&mut doc), vec![(4, 0), (5, 0), (3, 0)]);
+        assert_eq!(doc.editor_state(), (true, true, false));
+
+        // Undo restores the original order.
+        doc.undo().expect("undo");
+        assert_eq!(page_order(&mut doc), vec![(3, 0), (4, 0), (5, 0)]);
+
+        // Redo re-applies it.
+        doc.redo().expect("redo");
+        assert_eq!(page_order(&mut doc), vec![(4, 0), (5, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn move_page_backward_inserts_before_destination() {
+        let original = create_3page_flat_pdf();
+        let mut doc = PDFDocument::open(original).expect("open");
+
+        // Move last page to the front: [P1 P2 P3] -> [P3 P1 P2].
+        doc.move_page(2, 0).expect("move");
+        assert_eq!(page_order(&mut doc), vec![(5, 0), (3, 0), (4, 0)]);
+    }
+
+    #[test]
+    fn move_page_noop_and_invalid() {
+        let original = create_3page_flat_pdf();
+        let mut doc = PDFDocument::open(original).expect("open");
+
+        // Identical and adjacent positions are order-preserving no-ops that
+        // must not dirty the delta.
+        doc.move_page(0, 0).expect("no-op move");
+        doc.move_page(1, 2).expect("no-op move");
+        assert_eq!(doc.editor_state(), (false, false, false));
+        assert_eq!(page_order(&mut doc), vec![(3, 0), (4, 0), (5, 0)]);
+
+        // Out-of-range source is an error; out-of-range destination clamps
+        // to the end.
+        assert!(doc.move_page(3, 0).is_err());
+        doc.move_page(0, 99).expect("clamped move to end");
+        assert_eq!(page_order(&mut doc), vec![(4, 0), (5, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn move_page_cross_parent_forward_keeps_shared_counts() {
+        let original = create_nested_tree_pdf();
+        let mut doc = PDFDocument::open(original).expect("open");
+
+        // Move page 0 (obj 5, intermediate node 3) to the end (after obj 8
+        // in node 4): [5 6 | 7 8] -> [6 | 7 8 5].
+        doc.move_page(0, 3).expect("cross-parent move");
+        assert_eq!(page_order(&mut doc), vec![(6, 0), (7, 0), (8, 0), (5, 0)]);
+
+        // Source branch lost a page, destination branch gained one, and the
+        // shared root (net-zero ancestor) must be left untouched.
+        assert_eq!(node_count(&mut doc, 3), 1);
+        assert_eq!(node_count(&mut doc, 4), 3);
+        assert_eq!(node_count(&mut doc, 2), 4);
+
+        // Undo restores both branches and the order.
+        doc.undo().expect("undo");
+        assert_eq!(page_order(&mut doc), vec![(5, 0), (6, 0), (7, 0), (8, 0)]);
+        assert_eq!(node_count(&mut doc, 3), 2);
+        assert_eq!(node_count(&mut doc, 4), 2);
+        assert_eq!(node_count(&mut doc, 2), 4);
+
+        // Redo re-applies.
+        doc.redo().expect("redo");
+        assert_eq!(node_count(&mut doc, 3), 1);
+        assert_eq!(node_count(&mut doc, 4), 3);
+    }
+
+    #[test]
+    fn move_page_cross_parent_backward() {
+        let original = create_nested_tree_pdf();
+        let mut doc = PDFDocument::open(original).expect("open");
+
+        // Move page 3 (obj 8, intermediate node 4) to the front (before obj 5
+        // in node 3): [5 6 | 7 8] -> [8 | 5 6 7].
+        doc.move_page(3, 0).expect("cross-parent move");
+        assert_eq!(page_order(&mut doc), vec![(8, 0), (5, 0), (6, 0), (7, 0)]);
+        assert_eq!(node_count(&mut doc, 3), 3);
+        assert_eq!(node_count(&mut doc, 4), 1);
+        assert_eq!(node_count(&mut doc, 2), 4);
     }
 }

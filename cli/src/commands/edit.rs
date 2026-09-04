@@ -1,4 +1,4 @@
-//! Edit commands (rotate-page, set-info, delete-page, save).
+//! Edit commands (rotate-page, set-info, delete-page, move-page, save).
 
 use crate::commands::Ctx;
 use serde_json::{Value, json};
@@ -89,6 +89,27 @@ pub fn run_delete_page(
     maybe_save(ctx)?;
     Ok(json!({
         "page": page_index + 1,
+        "dirty": dirty,
+        "can_undo": can_undo,
+        "can_redo": can_redo,
+    }))
+}
+
+/// `move-page <page> --to <page> [--output <path>]` — final-position semantics.
+pub fn run_move_page(ctx: &mut Ctx, from_index: usize, to_index: usize) -> Result<Value, String> {
+    ctx.doc
+        .move_page(from_index, to_index)
+        .map_err(|e| format!("move failed: {e}"))?;
+    let (dirty, can_undo, can_redo) = ctx.doc.editor_state();
+    maybe_save(ctx)?;
+    let page_count = ctx
+        .doc
+        .page_count()
+        .map_err(|e| format!("page count failed: {e}"))?;
+    Ok(json!({
+        "from": from_index + 1,
+        "to": to_index + 1,
+        "page_count": page_count,
         "dirty": dirty,
         "can_undo": can_undo,
         "can_redo": can_redo,

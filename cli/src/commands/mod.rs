@@ -93,6 +93,7 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
         RotatePage { page, angle } => edit::run_rotate_page(ctx, *page, *angle),
         SetInfo { entries } => edit::run_set_info(ctx, entries.clone()),
         DeletePage { page } => edit::run_delete_page(ctx, *page),
+        MovePage { page, to } => edit::run_move_page(ctx, *page, *to),
         ReplaceText { page, find, replace } => {
             edit::run_replace_text(ctx, *page, find, replace)
         }
@@ -120,6 +121,7 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
         RotatePage { .. } => "rotate-page",
         SetInfo { .. } => "set-info",
         DeletePage { .. } => "delete-page",
+        MovePage { .. } => "move-page",
         ReplaceText { .. } => "replace-text",
         Save => "save",
     };

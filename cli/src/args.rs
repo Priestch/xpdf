@@ -34,6 +34,7 @@ pub enum Command {
     SetInfo { entries: Vec<(String, Option<String>)> },
     Save,
     DeletePage { page: usize },
+    MovePage { page: usize, to: usize },
     ReplaceText { page: usize, find: String, replace: String },
 }
 
@@ -193,6 +194,37 @@ impl Args {
                     }
                     command = Command::DeletePage { page: p - 1 };
                 }
+                "move-page" => {
+                    i += 1;
+                    if i >= raw.len() {
+                        return Err("move-page requires a page number".into());
+                    }
+                    let p: usize = raw[i].parse().map_err(|_| "invalid page number")?;
+                    if p == 0 {
+                        return Err("page numbers are 1-based".into());
+                    }
+                    let mut to: Option<usize> = None;
+                    while i + 1 < raw.len() {
+                        match raw[i + 1].as_str() {
+                            "--to" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--to requires a page number".into());
+                                }
+                                let t: usize = raw[i].parse().map_err(|_| "invalid page number")?;
+                                if t == 0 {
+                                    return Err("page numbers are 1-based".into());
+                                }
+                                to = Some(t - 1);
+                            }
+                            _ => break,
+                        }
+                    }
+                    let Some(to) = to else {
+                        return Err("move-page requires --to <page>".into());
+                    };
+                    command = Command::MovePage { page: p - 1, to };
+                }
                 "replace-text" => {
                     i += 1;
                     if i >= raw.len() {
@@ -325,6 +357,7 @@ impl Args {
             "  set-info --title T --author A ...  Set document metadata",
             "                                    (empty value removes the key)",
             "  delete-page <P>                   Delete a page",
+            "  move-page <P> --to <P>            Move a page (final position, 1-based)",
             "  replace-text <P> --find <T> --replace <R>  Replace text (v1: Tj)",
             "  save --output <path>               Save edits to file",
             "",

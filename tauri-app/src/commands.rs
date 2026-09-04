@@ -345,6 +345,20 @@ pub fn add_highlight(
     Ok(editor_state(doc))
 }
 
+/// Move a page to a new position (final-position semantics, 0-based).
+#[tauri::command]
+pub fn move_page(
+    from_index: usize,
+    to_index: usize,
+    state: State<'_, AppState>,
+) -> Result<EditorState, String> {
+    let mut guard = state.document.lock().unwrap();
+    let doc = guard.as_mut().ok_or("No document loaded")?;
+    doc.move_page(from_index, to_index)
+        .map_err(|e| e.to_string())?;
+    Ok(editor_state(doc))
+}
+
 #[tauri::command]
 pub fn undo_edit(state: State<'_, AppState>) -> Result<EditorState, String> {
     let mut guard = state.document.lock().unwrap();
