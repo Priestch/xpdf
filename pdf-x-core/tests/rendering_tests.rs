@@ -729,3 +729,103 @@ fn generated_underline_appearance_paints_after_save_and_reopen() {
         );
     }
 }
+
+// ============================================================================
+// Form widget appearance synthesis
+// ============================================================================
+
+/// Assembles a PDF from object bodies (object N = objects[N-1]) with a
+/// programmatic xref. Same shape as save_roundtrip_tests.rs's helper.
+#[cfg(feature = "rendering")]
+fn assemble_pdf(objects: &[String], trailer_entries: &str) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
+    }
+
+    let xref_pos = out.len();
+    let size = objects.len() + 1; // + free-list head object 0
+    out.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {size} {trailer_entries} >>\nstartxref\n{xref_pos}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+/// One-page PDF with a single Text widget at /Rect [100 600 300 640] that
+/// has NO /AP and NO /V — the render must show nothing until a value is
+/// set, then the synthesized appearance paints the text.
+/// Object map: 1=Catalog, 2=Pages, 3=Page, 4=Text widget, 5=AcroForm.
+#[cfg(feature = "rendering")]
+fn text_widget_pdf() -> Vec<u8> {
+    assemble_pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>".to_string(),
+            "<< /Type /Annot /Subtype /Widget /T (name) /FT /Tx /Rect [100 600 300 640] \
+             /DA (/Helv 0 Tf 0 g) /Q 1 >>"
+                .to_string(),
+            "<< /Fields [4 0 R] /DA (/Helv 0 Tf 0 g) >>".to_string(),
+        ],
+        "/Root 1 0 R",
+    )
+}
+
+/// Setting a Text field's value must make the value visible in the viewer
+/// even though no appearance stream exists: the renderer synthesizes one
+/// (rendering/context/widget.rs). Device y = 792 - y_pdf puts the widget's
+/// [600, 640] band at rows 152..192 at scale 1.
+#[cfg(feature = "rendering")]
+#[test]
+fn text_widget_value_paints_without_appearance() {
+    use pdf_x_core::core::PDFDocument;
+    use pdf_x_device_tinyskia::RenderToImage;
+
+    let original = text_widget_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+    let baseline = doc
+        .render_page_to_image(0, Some(1.0))
+        .expect("baseline render");
+
+    doc.set_field_value("name", "HELLO FORM")
+        .expect("set value");
+
+    // Save + reopen: the synthesized appearance must come from the persisted
+    // /V, not from session state.
+    let mut saved = original.clone();
+    saved.extend_from_slice(&doc.incremental_update(&original).expect("update"));
+    let mut reopened = PDFDocument::open(saved).expect("saved file should reopen");
+    let (width, height, pixels) = reopened
+        .render_page_to_image(0, Some(1.0))
+        .expect("render after reopen");
+
+    assert_eq!(
+        (width, height),
+        (baseline.0, baseline.1),
+        "page size must not change"
+    );
+
+    let mut changed = Vec::new();
+    for i in 0..(width as usize * height as usize) {
+        let a = &pixels[i * 4..i * 4 + 4];
+        let b = &baseline.2[i * 4..i * 4 + 4];
+        if a != b {
+            changed.push((i as u32 % width, i as u32 / width));
+        }
+    }
+    assert!(!changed.is_empty(), "the field value must be visible");
+    for (x, y) in changed {
+        assert!(
+            (95..=305).contains(&x) && (148..=196).contains(&y),
+            "changed pixel ({x}, {y}) outside the text widget band"
+        );
+    }
+}

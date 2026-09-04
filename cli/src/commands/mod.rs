@@ -4,6 +4,7 @@ pub mod annotations;
 pub mod annotations_edit;
 pub mod edit;
 pub mod fonts;
+pub mod forms;
 pub mod images;
 pub mod info;
 pub mod operators;
@@ -115,6 +116,8 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
             color,
             contents,
         } => annotations_edit::run_edit_annotation(ctx, *page, *object, *color, contents.clone()),
+        Fields => forms::run_fields(ctx),
+        SetField { name, value } => forms::run_set_field(ctx, name, value),
         Save => edit::run_save(ctx),
     };
 
@@ -144,6 +147,8 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
         AddAnnotation { .. } => "add-annotation",
         DeleteAnnotation { .. } => "delete-annotation",
         EditAnnotation { .. } => "edit-annotation",
+        Fields => "fields",
+        SetField { .. } => "set-field",
         Save => "save",
     };
 

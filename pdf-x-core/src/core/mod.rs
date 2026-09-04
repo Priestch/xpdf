@@ -1,3 +1,4 @@
+pub mod acroform;
 pub mod annotation;
 pub mod base_stream;
 pub mod byte_source;
@@ -31,6 +32,7 @@ pub mod stream;
 pub mod sub_stream;
 pub mod xref;
 
+pub use acroform::FormField;
 pub use annotation::{
     Annotation, AnnotationBorder, AnnotationColor, AnnotationData, AnnotationFlags, AnnotationRect,
     AnnotationType, FileAttachmentAnnotation, FormFieldType, LinkAction, LinkAnnotation,
@@ -50,7 +52,8 @@ pub use crypto::{
     calculate_sha256, calculate_sha384, calculate_sha512,
 };
 pub use delta::{
-    AddHighlightCommand, Command, CommandHistory, DeltaLayer, DeltaObject, ReplaceTextCommand, RotatePageCommand,
+    AddHighlightCommand, Command, CommandHistory, DeltaLayer, DeltaObject, ReplaceTextCommand,
+    RotatePageCommand, SetFieldValueCommand,
 };
 pub use doc_store::DocStore;
 pub use document::{LinearizedInfo, PDFDocument};

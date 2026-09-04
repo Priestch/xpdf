@@ -2107,6 +2107,86 @@ impl Command for EditAnnotationCommand {
     }
 }
 
+// ── SetFieldValueCommand ───────────────────────────────────────────
+
+/// Sets a form field's value (`/V`) — text fields and checkboxes (v1).
+///
+/// `/V` goes to the nearest dictionary carrying `/T` — for a field from
+/// `acroform::field_tree` that is the field node itself. This is the pdf.js
+/// rule (`WidgetAnnotation.setValue` + `getParentToUpdate`, core_utils.js:186):
+/// writing `/V` on the widget dict of a field that shares its name through a
+/// parent is the classic form-save bug.
+///
+/// Checkbox state additionally syncs each widget's `/AS` to the matching
+/// appearance state (pdf.js `_saveCheckbox`, annotation.js:3361-3362). Text
+/// values set `/NeedAppearances true` on the `/AcroForm` instead of
+/// generating an appearance at save time — the pdf.js `writer.js
+/// updateAcroform` precedent (writer.js:249, 281).
+///
+/// All updates are prefetched `(ref, original, updated)` triples so
+/// `execute`/`undo`/`redo` are plain `modify_object` swaps.
+pub struct SetFieldValueCommand {
+    /// The `/T`-carrying field dictionary receiving `/V`.
+    field: (Ref, PDFObject, PDFObject),
+
+    /// Widget dictionaries receiving `/AS` (checkbox/radio widgets only).
+    widget_states: Vec<(Ref, PDFObject, PDFObject)>,
+
+    /// The `/AcroForm` dictionary receiving `/NeedAppearances true`
+    /// (Text values only; `None` when the flag is already set or a
+    /// non-Text value was written).
+    acroform: Option<(Ref, PDFObject, PDFObject)>,
+}
+
+impl SetFieldValueCommand {
+    /// Create the command from prefetched originals and their new states.
+    pub fn new(
+        field: (Ref, PDFObject, PDFObject),
+        widget_states: Vec<(Ref, PDFObject, PDFObject)>,
+        acroform: Option<(Ref, PDFObject, PDFObject)>,
+    ) -> Self {
+        Self {
+            field,
+            widget_states,
+            acroform,
+        }
+    }
+}
+
+impl Command for SetFieldValueCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        let (field_ref, _, new_field) = &self.field;
+        delta.modify_object(*field_ref, new_field.clone());
+        for (widget_ref, _, new_state) in &self.widget_states {
+            delta.modify_object(*widget_ref, new_state.clone());
+        }
+        if let Some((acroform_ref, _, new_acroform)) = &self.acroform {
+            delta.modify_object(*acroform_ref, new_acroform.clone());
+        }
+        Ok(())
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        let (field_ref, original_field, _) = &self.field;
+        delta.modify_object(*field_ref, original_field.clone());
+        for (widget_ref, original_state, _) in &self.widget_states {
+            delta.modify_object(*widget_ref, original_state.clone());
+        }
+        if let Some((acroform_ref, original_acroform, _)) = &self.acroform {
+            delta.modify_object(*acroform_ref, original_acroform.clone());
+        }
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        self.execute(delta, None)
+    }
+}
+
 // ── ReplaceTextCommand ─────────────────────────────────────────────
 
 /// Pre-computed text replacement for one or more content-stream fragments.

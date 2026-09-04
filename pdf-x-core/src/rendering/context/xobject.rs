@@ -822,7 +822,11 @@ impl<'a, D: Device> RenderingContext<'a, D> {
                 continue;
             }
 
-            let Some((form_dict, form_data)) = self.resolve_annotation_appearance(annot_dict)
+            // No /AP /N: a Text widget with a /V value gets a limited
+            // synthesized appearance (see widget.rs for the v1 scope).
+            let Some((form_dict, form_data)) = self
+                .resolve_annotation_appearance(annot_dict)
+                .or_else(|| super::widget::synthesize_text_widget_appearance(annot_dict))
             else {
                 continue;
             };

@@ -34,6 +34,7 @@ mod pattern;
 mod tests;
 mod text;
 mod type3;
+mod widget;
 mod xobject;
 
 use color::*;
@@ -3452,8 +3453,14 @@ impl<'a, D: Device> RenderingContext<'a, D> {
         resolver: &'a mut dyn PageResolver,
         resources: &'a PDFObject,
     ) {
+        // Install the resolver even for resource-less pages: annotation
+        // appearance synthesis still needs object resolution (fonts from a
+        // synthesized form's /Resources), and `set_font` silently skips
+        // loading whenever the resolver is absent.
         self.resolver = Some(resolver);
-        self.resources = Some(resources.clone());
+        if !matches!(resources, PDFObject::Null) {
+            self.resources = Some(resources.clone());
+        }
     }
 
     /// Get the current graphics state.

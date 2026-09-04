@@ -71,6 +71,11 @@ pub enum Command {
         color: Option<[f64; 3]>,
         contents: Option<String>,
     },
+    Fields,
+    SetField {
+        name: String,
+        value: String,
+    },
 }
 
 /// Parsed CLI arguments.
@@ -502,6 +507,20 @@ impl Args {
                 "outline" => command = Command::Outline,
                 "annotations" => command = Command::Annotations,
                 "images" => command = Command::Images,
+                "fields" => command = Command::Fields,
+                "set-field" => {
+                    i += 1;
+                    if i >= raw.len() || raw[i].starts_with('-') {
+                        return Err("set-field requires <name> <value>".into());
+                    }
+                    let name = raw[i].clone();
+                    i += 1;
+                    if i >= raw.len() {
+                        return Err("set-field requires <name> <value>".into());
+                    }
+                    let value = raw[i].clone();
+                    command = Command::SetField { name, value };
+                }
                 // Subcommand flags
                 "--positions" => {
                     if let Command::Text { .. } = command {
@@ -582,6 +601,9 @@ impl Args {
             "  delete-annotation <P> --object <N>  Delete annotation by object number",
             "  edit-annotation <P> --object <N> [--color r,g,b] [--contents T]",
             "                                     Edit annotation color/contents",
+            "  fields            List AcroForm fields (name/type/value/pages)",
+            "  set-field <NAME> <VALUE>           Set a form field value (Text or",
+            "                                     Checkbox: true/false)",
             "  save --output <path>               Save edits to file",
             "",
             "Edit commands accept --output to save in one step:",

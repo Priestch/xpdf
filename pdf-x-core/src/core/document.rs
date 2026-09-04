@@ -1,7 +1,8 @@
+use super::annotation::FormFieldType;
 use super::delta::{
     AddHighlightCommand, AddMarkupAnnotationCommand, CommandHistory, DeleteAnnotationCommand,
     DeletePageCommand, DeltaLayer, EditAnnotationCommand, MarkupKind, MovePageCommand, QuadPoints,
-    ReplaceTextCommand, RotatePageCommand, SetInfoCommand,
+    ReplaceTextCommand, RotatePageCommand, SetFieldValueCommand, SetInfoCommand,
 };
 use super::doc_store::DocStore;
 use super::document_loader::{DocumentLoader, OpenProgress};
@@ -1469,6 +1470,256 @@ impl PDFDocument {
     ) -> PDFResult<Vec<(Option<Ref>, crate::core::annotation::Annotation)>> {
         let page = self.get_page(page_index)?;
         page.extract_annotations_with_refs(self.doc_store_mut())
+    }
+
+    /// Returns the AcroForm field tree in `/Fields` order — depth-first, with
+    /// fully qualified names (`a.b`, pdf.js `_constructFieldName`),
+    /// inheritable `/FT` and `/V` resolved, and widget references collected.
+    ///
+    /// Documents without an `/AcroForm` catalog entry yield an empty tree.
+    /// All resolution goes through the [`DocStore`] (delta-aware); v1 does
+    /// not cache (same policy as `page_count`).
+    pub fn acroform_fields(&mut self) -> PDFResult<Vec<crate::core::acroform::FormField>> {
+        let catalog = self
+            .catalog
+            .clone()
+            .ok_or_else(|| PDFError::Generic("No catalog".into()))?;
+        // A non-dictionary /AcroForm is tolerated as "no form" — same
+        // behavior as pdf.js, where a failed dict lookup simply yields no
+        // fields.
+        let Some(acroform_obj) = catalog
+            .as_dictionary()
+            .and_then(|dict| dict.get("AcroForm"))
+        else {
+            return Ok(Vec::new());
+        };
+        let acroform = self.doc_store_mut().resolve_if_ref(acroform_obj)?;
+        if acroform.as_dictionary().is_none() {
+            return Ok(Vec::new());
+        }
+        crate::core::acroform::field_tree(&acroform, self.doc_store_mut())
+    }
+
+    /// Sets a form field's value by fully qualified name (exact match).
+    ///
+    /// Text fields accept any string; checkboxes accept `"true"` /
+    /// `"false"` (case-insensitive). The value is written as `/V` on the
+    /// field's `/T`-carrying dictionary — the pdf.js `getParentToUpdate` rule
+    /// ([`SetFieldValueCommand`]); checkbox widgets additionally get `/AS`
+    /// synced to the matching appearance state, and text values set
+    /// `/NeedAppearances true` on the `/AcroForm` (pdf.js `updateAcroform`)
+    /// because no appearance stream is generated at save time.
+    pub fn set_field_value(&mut self, name: &str, value: &str) -> PDFResult<()> {
+        let tree = self.acroform_fields()?;
+        let field = crate::core::acroform::find_by_name(&tree, name).ok_or_else(|| {
+            let mut known = Vec::new();
+            crate::core::acroform::collect_names(&tree, &mut known);
+            let known = if known.is_empty() {
+                "(none)".to_string()
+            } else {
+                known.join(", ")
+            };
+            PDFError::Generic(format!("Unknown field {name:?}; known fields: {known}"))
+        })?;
+
+        // The `/T`-carrying dict must be an indirect object to be modified.
+        let field_ref = field.field_ref.ok_or_else(|| {
+            PDFError::Generic("Cannot edit an inline (non-indirect) field dictionary".into())
+        })?;
+        let original_field = self
+            .doc_store
+            .resolve_ref(field_ref.num, field_ref.generation)?
+            .as_ref()
+            .clone();
+
+        match &field.field_type {
+            FormFieldType::Text => self.set_text_value(field_ref, original_field, value),
+            FormFieldType::Button => {
+                self.set_checkbox_value(field_ref, original_field, field, value)
+            }
+            other => Err(PDFError::Generic(format!(
+                "Setting {other:?} fields is not supported (v1 supports Text and Checkbox)"
+            ))),
+        }
+    }
+
+    /// Text value: `/V` on the field dict + `/NeedAppearances true`.
+    fn set_text_value(
+        &mut self,
+        field_ref: Ref,
+        original_field: PDFObject,
+        value: &str,
+    ) -> PDFResult<()> {
+        let mut dict = match &original_field {
+            PDFObject::Dictionary(dict) => dict.clone(),
+            _ => return Err(PDFError::Generic("Field object is not a dictionary".into())),
+        };
+        dict.insert("V".into(), SetInfoCommand::encode_info_string(value));
+        let acroform = self.need_appearances_update()?;
+        let command = SetFieldValueCommand::new(
+            (field_ref, original_field, PDFObject::Dictionary(dict)),
+            Vec::new(),
+            acroform,
+        );
+        self.execute_command(Box::new(command))
+    }
+
+    /// Checkbox value: `/V` as the on-state (or `/Off`) name on the field
+    /// dict, `/AS` synced on every widget (pdf.js `_saveCheckbox`).
+    fn set_checkbox_value(
+        &mut self,
+        field_ref: Ref,
+        original_field: PDFObject,
+        field: &crate::core::acroform::FormField,
+        value: &str,
+    ) -> PDFResult<()> {
+        let checked = match value.to_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(PDFError::Generic(format!(
+                    "Checkbox value must be \"true\" or \"false\", got {value:?}"
+                )));
+            }
+        };
+
+        let mut widget_states = Vec::new();
+        let mut field_on_state: Option<String> = None;
+        // For a merged field+widget (field_ref == widget_ref) the /V and /AS
+        // updates target the SAME object — two `modify_object` calls on one
+        // number would leave the second (stale) copy winning. The /AS value
+        // is merged into the field dict instead.
+        let mut merged_as: Option<PDFObject> = None;
+        for widget_ref in &field.widget_refs {
+            let original_widget = self
+                .doc_store
+                .resolve_ref(widget_ref.num, widget_ref.generation)?
+                .as_ref()
+                .clone();
+            let Some(widget_dict) = original_widget.as_dictionary() else {
+                continue;
+            };
+            // Per-widget on-state: first non-"Off" key of /AP /N
+            // (pdf.js annotation.js:3713-3720), falling back to the
+            // conventional default export value "Yes".
+            let on_state = self
+                .widget_on_state(&original_widget)?
+                .unwrap_or_else(|| "Yes".to_string());
+            if field_on_state.is_none() {
+                field_on_state = Some(on_state.clone());
+            }
+            let new_as = PDFObject::Name(if checked { on_state } else { "Off".to_string() });
+            if widget_ref.num == field_ref.num && widget_ref.generation == field_ref.generation {
+                merged_as = Some(new_as);
+                continue;
+            }
+            let mut new_widget = widget_dict.clone();
+            new_widget.insert("AS".into(), new_as);
+            widget_states.push((
+                *widget_ref,
+                original_widget,
+                PDFObject::Dictionary(new_widget),
+            ));
+        }
+
+        // Field-level on-state: the first widget's, else the field's current
+        // non-"Off" name value, else "Yes".
+        let existing_name = original_field
+            .as_dictionary()
+            .and_then(|dict| match dict.get("V") {
+                Some(PDFObject::Name(name)) if name != "Off" => Some(name.clone()),
+                _ => None,
+            });
+        let on_state = field_on_state
+            .or(existing_name)
+            .unwrap_or_else(|| "Yes".to_string());
+        let v = if checked { on_state } else { "Off".to_string() };
+
+        let mut field_dict = match &original_field {
+            PDFObject::Dictionary(dict) => dict.clone(),
+            _ => return Err(PDFError::Generic("Field object is not a dictionary".into())),
+        };
+        field_dict.insert("V".into(), PDFObject::Name(v));
+        if let Some(as_state) = merged_as {
+            field_dict.insert("AS".into(), as_state);
+        }
+        let command = SetFieldValueCommand::new(
+            (field_ref, original_field, PDFObject::Dictionary(field_dict)),
+            widget_states,
+            None,
+        );
+        self.execute_command(Box::new(command))
+    }
+
+    /// A checkbox widget's appearance on-state: the first non-"Off" key of
+    /// its `/AP /N` state dictionary (pdf.js annotation.js:3713-3720).
+    /// `Ok(None)` when the widget carries no state map — `/N` being a stream
+    /// (single appearance) does not count.
+    fn widget_on_state(&mut self, widget: &PDFObject) -> PDFResult<Option<String>> {
+        let Some(dict) = widget.as_dictionary() else {
+            return Ok(None);
+        };
+        let Some(ap_obj) = dict.get("AP") else {
+            return Ok(None);
+        };
+        let ap = self.doc_store.resolve_if_ref(ap_obj)?;
+        let ap_dict = match ap.as_ref() {
+            PDFObject::Dictionary(dict) => dict,
+            _ => return Ok(None),
+        };
+        let Some(n_obj) = ap_dict.get("N") else {
+            return Ok(None);
+        };
+        let n = self.doc_store.resolve_if_ref(n_obj)?;
+        let n_dict = match n.as_ref() {
+            PDFObject::Dictionary(dict) => dict,
+            _ => return Ok(None),
+        };
+        Ok(n_dict.keys().find(|key| key.as_str() != "Off").cloned())
+    }
+
+    /// Builds the `/NeedAppearances true` update for the `/AcroForm`
+    /// dictionary (pdf.js writer.js updateAcroform:281). `Ok(None)` when the
+    /// flag is already set; an indirect `/AcroForm` is required since an
+    /// inline dict has no object number to modify.
+    fn need_appearances_update(&mut self) -> PDFResult<Option<(Ref, PDFObject, PDFObject)>> {
+        let catalog = self
+            .catalog
+            .clone()
+            .ok_or_else(|| PDFError::Generic("No catalog".into()))?;
+        let Some(acroform_obj) = catalog
+            .as_dictionary()
+            .and_then(|dict| dict.get("AcroForm"))
+        else {
+            return Ok(None);
+        };
+        let acroform_ref = match acroform_obj {
+            PDFObject::Ref(r) => Ref::new(r.num, r.generation),
+            _ => {
+                return Err(PDFError::Generic(
+                    "/AcroForm is not an indirect object; cannot set /NeedAppearances".into(),
+                ));
+            }
+        };
+        let original = self
+            .doc_store
+            .resolve_if_ref(acroform_obj)?
+            .as_ref()
+            .clone();
+        let dict = match &original {
+            PDFObject::Dictionary(dict) => dict.clone(),
+            _ => {
+                return Err(PDFError::Generic(
+                    "/AcroForm object is not a dictionary".into(),
+                ));
+            }
+        };
+        if matches!(dict.get("NeedAppearances"), Some(PDFObject::Boolean(true))) {
+            return Ok(None);
+        }
+        let mut dict = dict;
+        dict.insert("NeedAppearances".into(), PDFObject::Boolean(true));
+        Ok(Some((acroform_ref, original, PDFObject::Dictionary(dict))))
     }
 
     /// Extracts text from a specific page.
@@ -3952,5 +4203,240 @@ startxref
             Some(PDFObject::Array(items)) => assert_eq!(items.len(), 1),
             other => panic!("Annots not restored: {other:?}"),
         }
+    }
+
+    /// Assembles a PDF from object bodies (object N = objects[N-1]) with a
+    /// programmatic xref. Same shape as save_roundtrip_tests.rs's helper.
+    fn assemble_pdf(objects: &[String], trailer_entries: &str) -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
+        }
+
+        let xref_pos = out.len();
+        let size = objects.len() + 1; // + free-list head object 0
+        out.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in &offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} {trailer_entries} >>\nstartxref\n{xref_pos}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// A stream object body with a correct /Length.
+    fn stream_object(data: &str) -> String {
+        format!("<< /Length {} >>\nstream\n{}\nendstream", data.len(), data)
+    }
+
+    /// One-page PDF with an AcroForm exercising every field-tree behavior:
+    ///
+    /// - object 4: non-terminal field `top` carrying inherited `/FT /Tx` and
+    ///   `/V` with one child field (merged field+widget) `top.child` that has
+    ///   neither — proves the FQN join and both inheritances;
+    /// - object 6: merged terminal text field `solo` (self widget ref);
+    /// - object 7: checkbox `agree` with a `/Yes` name value and both AP
+    ///   states present (its `/AS` starts `/Off` — unchecked).
+    ///
+    /// Object map: 1=Catalog, 2=Pages, 3=Page, 4=`top` field, 5=`top.child`
+    /// widget, 6=`solo` widget, 7=`agree` widget, 8/9=checkbox AP states,
+    /// 10=AcroForm (indirect — `/NeedAppearances` updates modify it).
+    fn form_pdf() -> Vec<u8> {
+        assemble_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R /AcroForm 10 0 R >>".to_string(),
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Annots [5 0 R 6 0 R 7 0 R] >>"
+                    .to_string(),
+                "<< /T (top) /FT /Tx /V (from parent) /Kids [5 0 R] >>".to_string(),
+                "<< /Subtype /Widget /Parent 4 0 R /T (child) /Rect [10 700 110 720] >>"
+                    .to_string(),
+                "<< /T (solo) /FT /Tx /V (solo value) /Subtype /Widget \
+                 /Rect [10 650 210 670] /DA (/Helv 0 Tf 0 g) >>"
+                    .to_string(),
+                "<< /T (agree) /FT /Btn /V /Off /AS /Off /Subtype /Widget \
+                 /Rect [10 600 30 620] /AP << /N << /Yes 8 0 R /Off 9 0 R >> >> >>"
+                    .to_string(),
+                stream_object("q 0 g 0 0 20 20 re f Q"),
+                stream_object("q 0.8 g 0 0 20 20 re f Q"),
+                "<< /Fields [4 0 R 6 0 R 7 0 R] /DA (/Helv 0 Tf 0 g) >>".to_string(),
+            ],
+            "/Root 1 0 R",
+        )
+    }
+
+    #[test]
+    fn acroform_fields_parses_tree() {
+        let mut doc = PDFDocument::open(form_pdf()).expect("open");
+        let fields = doc.acroform_fields().expect("fields");
+        assert_eq!(fields.len(), 3, "top-level /Fields order");
+
+        // `top` — /FT and /V inherited by the child, non-terminal.
+        let top = &fields[0];
+        assert_eq!(top.fully_qualified_name, "top");
+        assert_eq!(top.field_type, FormFieldType::Text);
+        assert!(!top.terminal);
+        assert_eq!(top.value.as_deref(), Some("from parent"));
+        assert!(top.widget_refs.is_empty(), "parent is not a widget");
+
+        // `top.child` — merged field+widget, inherits both entries.
+        let child = &top.kids[0];
+        assert_eq!(child.fully_qualified_name, "top.child");
+        assert_eq!(child.field_type, FormFieldType::Text, "/FT inherited");
+        assert!(child.terminal);
+        assert_eq!(child.value.as_deref(), Some("from parent"), "/V inherited");
+        assert_eq!(child.widget_refs.len(), 1, "self is the widget");
+        assert_eq!(
+            child.field_ref.as_ref().map(|r| r.num),
+            Some(5),
+            "kid keeps its object identity"
+        );
+
+        // `solo` — merged terminal text field.
+        let solo = &fields[1];
+        assert_eq!(solo.fully_qualified_name, "solo");
+        assert_eq!(solo.field_type, FormFieldType::Text);
+        assert!(solo.terminal);
+        assert_eq!(solo.value.as_deref(), Some("solo value"));
+        assert_eq!(solo.widget_refs.len(), 1);
+        assert_eq!(solo.widget_refs[0].num, 6);
+
+        // `agree` — checkbox, name value (starts unchecked: /V /Off).
+        let agree = &fields[2];
+        assert_eq!(agree.fully_qualified_name, "agree");
+        assert_eq!(agree.field_type, FormFieldType::Button);
+        assert_eq!(agree.value.as_deref(), Some("Off"));
+        assert!(agree.terminal);
+    }
+
+    #[test]
+    fn acroform_fields_without_acroform_is_empty() {
+        let mut doc = PDFDocument::open(create_minimal_pdf()).expect("open");
+        assert!(doc.acroform_fields().expect("fields").is_empty());
+    }
+
+    /// Resolves an object through the delta-aware store and returns its dict.
+    fn dict_of(doc: &mut PDFDocument, num: u32) -> std::collections::HashMap<String, PDFObject> {
+        match &*doc.doc_store.resolve_ref(num, 0).expect("resolve") {
+            PDFObject::Dictionary(dict) => dict.clone(),
+            other => panic!("object {num} is not a dictionary: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_text_field_writes_v_and_need_appearances() {
+        let mut doc = PDFDocument::open(form_pdf()).expect("open");
+        doc.set_field_value("solo", "hello form").expect("set");
+
+        // /V on the field dict (object 6).
+        let dict = dict_of(&mut doc, 6);
+        assert!(
+            matches!(dict.get("V"), Some(PDFObject::String(bytes)) if bytes.as_slice() == b"hello form")
+        );
+
+        // /NeedAppearances true on the /AcroForm (object 10) — pdf.js
+        // updateAcroform, since no appearance is generated at save time.
+        let acroform = dict_of(&mut doc, 10);
+        assert_eq!(
+            acroform.get("NeedAppearances"),
+            Some(&PDFObject::Boolean(true))
+        );
+
+        // The checkbox field must be untouched.
+        let agree = dict_of(&mut doc, 7);
+        assert_eq!(agree.get("AS"), Some(&PDFObject::Name("Off".into())));
+    }
+
+    #[test]
+    fn set_text_value_goes_to_the_t_dict_not_the_parent() {
+        // getParentToUpdate regression: `top.child` has /T, so /V lands on
+        // the child (object 5); the parent `top` (object 4) stays untouched.
+        let mut doc = PDFDocument::open(form_pdf()).expect("open");
+        doc.set_field_value("top.child", "nested").expect("set");
+
+        let child = dict_of(&mut doc, 5);
+        assert!(
+            matches!(child.get("V"), Some(PDFObject::String(bytes)) if bytes.as_slice() == b"nested")
+        );
+
+        let top = dict_of(&mut doc, 4);
+        assert!(
+            matches!(top.get("V"), Some(PDFObject::String(bytes)) if bytes.as_slice() == b"from parent"),
+            "parent /V must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn set_checkbox_true_writes_v_and_widget_as() {
+        let mut doc = PDFDocument::open(form_pdf()).expect("open");
+        doc.set_field_value("agree", "TRUE").expect("set");
+
+        let dict = dict_of(&mut doc, 7);
+        assert_eq!(dict.get("V"), Some(&PDFObject::Name("Yes".into())));
+        assert_eq!(dict.get("AS"), Some(&PDFObject::Name("Yes".into())));
+
+        // No NeedAppearances for button values (no synthesis needed — the
+        // widget's own /AP /Yes state paints it).
+        let acroform = dict_of(&mut doc, 10);
+        assert!(!acroform.contains_key("NeedAppearances"));
+    }
+
+    #[test]
+    fn set_checkbox_false_writes_off() {
+        let mut doc = PDFDocument::open(form_pdf()).expect("open");
+        doc.set_field_value("agree", "false").expect("set");
+
+        let dict = dict_of(&mut doc, 7);
+        assert_eq!(dict.get("V"), Some(&PDFObject::Name("Off".into())));
+        assert_eq!(dict.get("AS"), Some(&PDFObject::Name("Off".into())));
+    }
+
+    #[test]
+    fn set_field_value_unknown_name_lists_known_fields() {
+        let mut doc = PDFDocument::open(form_pdf()).expect("open");
+        let err = doc.set_field_value("soloo", "x").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("soloo"), "names the bad field: {msg}");
+        assert!(msg.contains("top.child"), "lists nested names: {msg}");
+        assert!(msg.contains("solo"), "lists top-level names: {msg}");
+    }
+
+    #[test]
+    fn set_field_value_rejects_non_booleans_for_checkbox() {
+        let mut doc = PDFDocument::open(form_pdf()).expect("open");
+        assert!(doc.set_field_value("agree", "maybe").is_err());
+    }
+
+    #[test]
+    fn set_field_value_undo_restores_field_and_acroform() {
+        let mut doc = PDFDocument::open(form_pdf()).expect("open");
+        doc.set_field_value("solo", "temporary").expect("set");
+        doc.undo().expect("undo");
+
+        let dict = dict_of(&mut doc, 6);
+        assert!(
+            matches!(dict.get("V"), Some(PDFObject::String(bytes)) if bytes.as_slice() == b"solo value"),
+            "/V restored"
+        );
+        let acroform = dict_of(&mut doc, 10);
+        assert!(
+            !acroform.contains_key("NeedAppearances"),
+            "NeedAppearances removed again"
+        );
+
+        doc.redo().expect("redo");
+        let dict = dict_of(&mut doc, 6);
+        assert!(
+            matches!(dict.get("V"), Some(PDFObject::String(bytes)) if bytes.as_slice() == b"temporary"),
+            "/V re-applied"
+        );
     }
 }

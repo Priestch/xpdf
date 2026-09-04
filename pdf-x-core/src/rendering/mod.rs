@@ -66,7 +66,7 @@ pub fn interpret_with_scale<D: Device>(
     use crate::core::base_stream::BaseStream;
     use crate::core::content_stream::ContentStreamEvaluator;
     use crate::core::lexer::Lexer;
-    use crate::core::parser::{PDFObject, Parser};
+    use crate::core::parser::Parser;
     use crate::core::resolved_page::SnapshotPageResolver;
     use crate::core::stream::Stream;
     use crate::rendering::context::RenderingContext;
@@ -148,9 +148,10 @@ pub fn interpret_with_scale<D: Device>(
     let mut ctx = RenderingContext::new(device);
     ctx.current_state_mut().set_matrix(&page_transform);
     ctx.set_root_ctm(page_transform);
-    if !matches!(page.resources(), PDFObject::Null) {
-        ctx.set_xobject_resources(&mut resolver, page.resources());
-    }
+    // Always install the resolver (set_xobject_resources skips storing
+    // resource-less page dicts itself) — annotation appearance painting and
+    // Text-widget synthesis resolve objects regardless of page /Resources.
+    ctx.set_xobject_resources(&mut resolver, page.resources());
 
     // C.3 render budget: hostile content streams must not loop unbounded.
     // Real pages are orders of magnitude below this (tracemonkey p0 is ~50k

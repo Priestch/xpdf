@@ -10,6 +10,7 @@ use pdf_x_core::core::outline::parse_document_outline;
 use pdf_x_core::core::{
     FindOptions, OutlineDestination, PDFDocument, PDFError, PDFObject, XRefEntry,
 };
+use std::collections::HashMap;
 
 // ==========================================================================
 // PDF assembly helper (fixtures with computed xref offsets)
@@ -798,4 +799,179 @@ fn edit_annotation_color_save_reopens() {
         Some(vec![1.0, 0.0, 0.0]),
         "recolored /C must round-trip"
     );
+}
+
+// ── Form field value round-trips ───────────────────────────────────
+
+/// A stream object body with a correct /Length (same shape as document.rs's
+/// in-module helper).
+fn form_stream_object(data: &str) -> String {
+    format!("<< /Length {} >>\nstream\n{}\nendstream", data.len(), data)
+}
+
+/// One-page PDF with an AcroForm: nested Text field (`top.child` — value
+/// written on the /T-carrying child, not the parent), a plain Text field
+/// (`solo`), and a checkbox (`agree`) with both AP states present.
+/// Object map: 1=Catalog, 2=Pages, 3=Page, 4=`top` field, 5=`top.child`
+/// widget, 6=`solo` widget, 7=`agree` widget, 8/9=AP states, 10=AcroForm.
+fn form_pdf() -> Vec<u8> {
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 10 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Annots [5 0 R 6 0 R 7 0 R] >>"
+            .to_string(),
+        "<< /T (top) /FT /Tx /V (from parent) /Kids [5 0 R] >>".to_string(),
+        "<< /Type /Annot /Subtype /Widget /Parent 4 0 R /T (child) \
+         /Rect [10 700 110 720] /DA (/Helv 0 Tf 0 g) >>"
+            .to_string(),
+        "<< /Type /Annot /Subtype /Widget /T (solo) /FT /Tx /V (solo value) \
+         /Rect [10 650 210 670] /DA (/Helv 0 Tf 0 g) >>"
+            .to_string(),
+        "<< /Type /Annot /Subtype /Widget /T (agree) /FT /Btn /V /Off /AS /Off \
+         /Rect [10 600 30 620] /AP << /N << /Yes 8 0 R /Off 9 0 R >> >> >>"
+            .to_string(),
+        form_stream_object("q 0 g 0 0 20 20 re f Q"),
+        form_stream_object("q 0.8 g 0 0 20 20 re f Q"),
+        "<< /Fields [4 0 R 6 0 R 7 0 R] /DA (/Helv 0 Tf 0 g) >>".to_string(),
+    ];
+    assemble_pdf(&objects, "/Root 1 0 R")
+}
+
+/// Raw object dict via the public base-xref fetch — only meaningful for
+/// documents reopened from bytes (base state == saved state).
+fn raw_dict(doc: &mut PDFDocument, num: u32) -> HashMap<String, PDFObject> {
+    match &*doc.xref_mut().fetch(num, 0).expect("object should resolve") {
+        PDFObject::Dictionary(dict) => dict.clone(),
+        other => panic!("object {num} is not a dictionary: {other:?}"),
+    }
+}
+
+/// Field value via the public delta-aware field tree (mid-session safe).
+fn field_value(doc: &mut PDFDocument, name: &str) -> Option<String> {
+    let tree = doc.acroform_fields().expect("field tree");
+    pdf_x_core::core::acroform::find_by_name(&tree, name).and_then(|field| field.value.clone())
+}
+
+#[test]
+fn set_text_field_save_reopens_with_need_appearances() {
+    let original = form_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    doc.set_field_value("solo", "typed by pdf-x").expect("set");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    assert_qpdf_clean(&saved, "set_text_field");
+
+    let mut reopened = reopen(saved);
+    let dict = raw_dict(&mut reopened, 6);
+    assert!(
+        matches!(dict.get("V"), Some(PDFObject::String(bytes)) if bytes.as_slice() == b"typed by pdf-x"),
+        "/V must round-trip"
+    );
+    // pdf.js updateAcroform precedent: text values need the flag because no
+    // appearance stream is generated at save time.
+    let acroform = raw_dict(&mut reopened, 10);
+    assert_eq!(
+        acroform.get("NeedAppearances"),
+        Some(&PDFObject::Boolean(true)),
+        "/NeedAppearances must round-trip"
+    );
+    assert_eq!(
+        field_value(&mut reopened, "solo").as_deref(),
+        Some("typed by pdf-x"),
+        "the reopened tree must report the new value"
+    );
+}
+
+#[test]
+fn set_nested_text_field_writes_the_t_dict() {
+    let original = form_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    doc.set_field_value("top.child", "nested value")
+        .expect("set");
+
+    let saved = save(&doc, &original);
+    assert_qpdf_clean(&saved, "set_nested_text_field");
+
+    let mut reopened = reopen(saved);
+    // /V lands on the child (object 5) — the nearest /T dictionary; the
+    // parent `top` (object 4) keeps its own value.
+    let child = raw_dict(&mut reopened, 5);
+    assert!(
+        matches!(child.get("V"), Some(PDFObject::String(bytes)) if bytes.as_slice() == b"nested value"),
+        "/V must be written on the /T-carrying child"
+    );
+    let top = raw_dict(&mut reopened, 4);
+    assert!(
+        matches!(top.get("V"), Some(PDFObject::String(bytes)) if bytes.as_slice() == b"from parent"),
+        "parent /V must stay untouched"
+    );
+    assert_eq!(
+        field_value(&mut reopened, "top.child").as_deref(),
+        Some("nested value"),
+        "the reopened tree must resolve the nested name"
+    );
+}
+
+#[test]
+fn set_checkbox_save_reopens_with_as_synced() {
+    let original = form_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    doc.set_field_value("agree", "true").expect("set");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    assert_qpdf_clean(&saved, "set_checkbox");
+
+    let mut reopened = reopen(saved);
+    let dict = raw_dict(&mut reopened, 7);
+    assert_eq!(dict.get("V"), Some(&PDFObject::Name("Yes".into())));
+    assert_eq!(dict.get("AS"), Some(&PDFObject::Name("Yes".into())));
+    // Button values need no NeedAppearances — the widget's own /AP /Yes
+    // state is the appearance.
+    let acroform = raw_dict(&mut reopened, 10);
+    assert!(!acroform.contains_key("NeedAppearances"));
+
+    // Unchecking in the same session, then persisting: /Off in both places.
+    doc.set_field_value("agree", "false").expect("unset");
+    assert_eq!(field_value(&mut doc, "agree").as_deref(), Some("Off"));
+    let saved = save(&doc, &original);
+    let mut reopened = reopen(saved);
+    let dict = raw_dict(&mut reopened, 7);
+    assert_eq!(dict.get("V"), Some(&PDFObject::Name("Off".into())));
+    assert_eq!(dict.get("AS"), Some(&PDFObject::Name("Off".into())));
+}
+
+#[test]
+fn set_field_undo_restores_all_updated_objects() {
+    let original = form_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    doc.set_field_value("solo", "temporary").expect("set");
+    doc.set_field_value("agree", "true").expect("check");
+
+    doc.undo().expect("undo checkbox");
+    assert_eq!(field_value(&mut doc, "agree").as_deref(), Some("Off"));
+
+    doc.undo().expect("undo text");
+    assert_eq!(
+        field_value(&mut doc, "solo").as_deref(),
+        Some("solo value"),
+        "/V must be restored"
+    );
+
+    // Persist the undone state and confirm every updated object is back.
+    let saved = save(&doc, &original);
+    let mut reopened = reopen(saved);
+    let acroform = raw_dict(&mut reopened, 10);
+    assert!(
+        !acroform.contains_key("NeedAppearances"),
+        "NeedAppearances must be removed again"
+    );
+    let dict = raw_dict(&mut reopened, 7);
+    assert_eq!(dict.get("AS"), Some(&PDFObject::Name("Off".into())));
 }
