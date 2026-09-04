@@ -359,6 +359,37 @@ pub fn move_page(
     Ok(editor_state(doc))
 }
 
+/// Delete an annotation by its object number (0-based page index).
+#[tauri::command]
+pub fn delete_annotation(
+    page_index: usize,
+    object_num: u32,
+    state: State<'_, AppState>,
+) -> Result<EditorState, String> {
+    let mut guard = state.document.lock().unwrap();
+    let doc = guard.as_mut().ok_or("No document loaded")?;
+    doc.delete_annotation(page_index, object_num)
+        .map_err(|e| e.to_string())?;
+    Ok(editor_state(doc))
+}
+
+/// Edit an annotation's color and/or contents (0-based page index). Recoloring
+/// a markup annotation regenerates its appearance stream.
+#[tauri::command]
+pub fn edit_annotation(
+    page_index: usize,
+    object_num: u32,
+    color: Option<[f64; 3]>,
+    contents: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<EditorState, String> {
+    let mut guard = state.document.lock().unwrap();
+    let doc = guard.as_mut().ok_or("No document loaded")?;
+    doc.edit_annotation(page_index, object_num, color, contents)
+        .map_err(|e| e.to_string())?;
+    Ok(editor_state(doc))
+}
+
 #[tauri::command]
 pub fn undo_edit(state: State<'_, AppState>) -> Result<EditorState, String> {
     let mut guard = state.document.lock().unwrap();

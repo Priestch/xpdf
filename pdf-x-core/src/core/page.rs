@@ -44,6 +44,15 @@ pub trait PageResolver {
     fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
         unimplemented!("this resolver has no live XRef")
     }
+    /// Resolve a page object reference `(num, generation)` to its 0-based page
+    /// index (delta-aware where supported).
+    ///
+    /// `None` when the resolver has no page-tree view — the base `XRef` has no
+    /// catalog access. `DocStore` implements this (delta-aware, cached) so
+    /// link/GoTo destinations can resolve their target page.
+    fn resolve_page_index(&mut self, _num: u32, _generation: u32) -> Option<usize> {
+        None
+    }
 }
 
 impl PageResolver for super::xref::XRef {
@@ -67,6 +76,9 @@ impl PageResolver for super::doc_store::DocStore {
     }
     fn as_xref_mut(&mut self) -> &mut super::xref::XRef {
         super::doc_store::DocStore::xref_mut(self)
+    }
+    fn resolve_page_index(&mut self, num: u32, generation: u32) -> Option<usize> {
+        super::doc_store::DocStore::resolve_page_index(self, num, generation)
     }
 }
 
@@ -1969,5 +1981,25 @@ impl Page {
         };
 
         parse_annotations(annots, resolver)
+    }
+
+    /// Extracts annotations with their indirect object references.
+    ///
+    /// The reference is the annotation's **object identity** — what edit
+    /// commands (delete/edit annotation) address; inline dictionaries (rare,
+    /// spec-legal) carry no reference and are reported as `None`. See
+    /// [`super::annotation::parse_annotations_with_refs`].
+    pub fn extract_annotations_with_refs<R: PageResolver>(
+        &self,
+        resolver: &mut R,
+    ) -> PDFResult<Vec<(Option<super::parser::Ref>, super::annotation::Annotation)>> {
+        use super::annotation::parse_annotations_with_refs;
+
+        let annots = match self.annotations() {
+            Some(a) => a,
+            None => return Ok(Vec::new()),
+        };
+
+        parse_annotations_with_refs(annots, resolver)
     }
 }

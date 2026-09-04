@@ -17,6 +17,8 @@ fn main() {
             commands::render_page,
             commands::add_highlight,
             commands::move_page,
+            commands::delete_annotation,
+            commands::edit_annotation,
             commands::undo_edit,
             commands::redo_edit,
             commands::get_editor_state,

@@ -380,6 +380,16 @@ impl DeltaLayer {
         self.deleted.contains(&(obj_ref.num, obj_ref.generation))
     }
 
+    /// Whether this reference belongs to a delta-allocated (new) object
+    /// rather than a base-PDF object. Commands that delete objects need the
+    /// distinction: new objects are removed with [`Self::remove_new_object`],
+    /// base objects are tombstoned with [`Self::delete_object`].
+    pub fn is_new_object(&self, obj_ref: Ref) -> bool {
+        self.new_objects
+            .iter()
+            .any(|item| item.obj_num == obj_ref.num && item.generation == obj_ref.generation)
+    }
+
     /// Get a modified/new object from the delta.
     ///
     /// # Arguments
@@ -1481,6 +1491,619 @@ impl Command for AddHighlightCommand {
         delta.restore_new_object(annotation_ref, self.annotation.clone().unwrap());
         delta.modify_object(self.page_ref, self.modified_page.clone().unwrap());
         Ok(())
+    }
+}
+
+// ── AddMarkupAnnotationCommand ─────────────────────────────────────
+
+/// The markup annotation kinds [`AddMarkupAnnotationCommand`] can create and
+/// [`EditAnnotationCommand`] can regenerate appearances for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkupKind {
+    Highlight,
+    Underline,
+    Squiggly,
+    StrikeOut,
+}
+
+impl MarkupKind {
+    /// The `/Subtype` name for this kind.
+    pub fn pdf_name(self) -> &'static str {
+        match self {
+            MarkupKind::Highlight => "Highlight",
+            MarkupKind::Underline => "Underline",
+            MarkupKind::Squiggly => "Squiggly",
+            MarkupKind::StrikeOut => "StrikeOut",
+        }
+    }
+
+    /// Parse a `/Subtype` name (inverse of [`Self::pdf_name`]).
+    pub fn from_pdf_name(name: &str) -> Option<Self> {
+        match name {
+            "Highlight" => Some(MarkupKind::Highlight),
+            "Underline" => Some(MarkupKind::Underline),
+            "Squiggly" => Some(MarkupKind::Squiggly),
+            "StrikeOut" => Some(MarkupKind::StrikeOut),
+            _ => None,
+        }
+    }
+}
+
+/// One `/QuadPoints` quad: `[x1 y1 x2 y2 x3 y3 x4 y4]` in PDF user space,
+/// with 1 = top-left, 2 = top-right, 3 = bottom-left, 4 = bottom-right
+/// (the normalized order pdf.js `getQuadPoints` produces and this crate's
+/// annotation dicts write).
+pub type QuadPoints = [f64; 8];
+
+/// Build the flattened markup appearance-stream ops and the stream `/BBox`
+/// for one quad set.
+///
+/// Adapted from pdf.js `MarkupAnnotation._setDefaultAppearance`
+/// (`annotation.js:1767`) and the per-kind `pointsCallback`s — Highlight
+/// (`annotation.js:5036`), Underline (`annotation.js:5188`), Squiggly
+/// (`annotation.js:5236`), StrikeOut (`annotation.js:5290`). pdf.js wraps the
+/// ops in an inner Form XObject with an ExtGState (Multiply blend, alpha);
+/// we flatten into a single stream (same geometry, no blend) — the same
+/// flattening the already-delivered `AddHighlightCommand` uses. The 0.571 /
+/// 1.3 underline constants are Acrobat-matched (pdf.js comment at
+/// `annotation.js:5186`).
+///
+/// Returns `(ops, bbox)` — ops without the surrounding `q`/`Q`, bbox in
+/// user space (quad union, extended vertically for the squiggle).
+fn markup_appearance_ops(
+    kind: MarkupKind,
+    quadpoints: &[QuadPoints],
+    color: [f64; 3],
+) -> (String, [f64; 4]) {
+    let mut ops = String::new();
+    let mut bbox: [f64; 4] = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+
+    let mut include = |x0: f64, y0: f64, x1: f64, y1: f64| {
+        bbox[0] = bbox[0].min(x0);
+        bbox[1] = bbox[1].min(y0);
+        bbox[2] = bbox[2].max(x1);
+        bbox[3] = bbox[3].max(y1);
+    };
+
+    match kind {
+        MarkupKind::Highlight => {
+            ops += &format!("{} {} {} rg", color[0], color[1], color[2]);
+            for q in quadpoints {
+                // Quad polygon top-left → top-right → bottom-right →
+                // bottom-left, filled.
+                ops += &format!(
+                    " {} {} m {} {} l {} {} l {} {} l f",
+                    q[0], q[1], q[2], q[3], q[6], q[7], q[4], q[5]
+                );
+                include(q[0], q[7], q[2], q[3]);
+            }
+        }
+        MarkupKind::Underline => {
+            ops += &format!("[] 0 d 0.571 w {} {} {} RG", color[0], color[1], color[2]);
+            for q in quadpoints {
+                // Stroke 1.3 above the quad's bottom edge.
+                ops += &format!(" {} {} m {} {} l S", q[4], q[5] + 1.3, q[6], q[7] + 1.3);
+                include(q[0], q[7], q[2], q[3]);
+            }
+        }
+        MarkupKind::Squiggly => {
+            ops += &format!("[] 0 d 1 w {} {} {} RG", color[0], color[1], color[2]);
+            for q in quadpoints {
+                // Zigzag along the bottom edge: dy = quad height / 6, steps of
+                // 2 alternating between the edge and dy above it.
+                let dy = (q[1] - q[5]) / 6.0;
+                let y = q[5];
+                let x_end = q[6];
+                let mut x = q[4];
+                let mut shift = dy;
+                ops += &format!(" {x} {} m", y + shift);
+                while x < x_end {
+                    x += 2.0;
+                    shift = if shift == 0.0 { dy } else { 0.0 };
+                    ops += &format!(" {x} {} l", y + shift);
+                }
+                ops += " S";
+                include(q[4], y - 2.0 * dy, x_end, y + 2.0 * dy);
+            }
+        }
+        MarkupKind::StrikeOut => {
+            ops += &format!("[] 0 d 1 w {} {} {} RG", color[0], color[1], color[2]);
+            for q in quadpoints {
+                // Line through the midpoints of the quad's left and right edges.
+                ops += &format!(
+                    " {} {} m {} {} l S",
+                    (q[0] + q[4]) / 2.0,
+                    (q[1] + q[5]) / 2.0,
+                    (q[2] + q[6]) / 2.0,
+                    (q[3] + q[7]) / 2.0
+                );
+                include(q[0], q[7], q[2], q[3]);
+            }
+        }
+    }
+
+    (ops, bbox)
+}
+
+/// Reversible command that appends a markup annotation (Highlight, Underline,
+/// Squiggly, StrikeOut) to a page, generating its `/AP /N` appearance stream.
+///
+/// Generalizes [`AddHighlightCommand`] (which stays untouched); appearance
+/// geometry follows pdf.js — see [`markup_appearance_ops`].
+pub struct AddMarkupAnnotationCommand {
+    page_ref: Ref,
+    original_page: PDFObject,
+    kind: MarkupKind,
+    quadpoints: Vec<QuadPoints>,
+    color: [f64; 3],
+    annotation_ref: Option<Ref>,
+    appearance_ref: Option<Ref>,
+    annotation: Option<PDFObject>,
+    appearance: Option<PDFObject>,
+    modified_page: Option<PDFObject>,
+}
+
+impl AddMarkupAnnotationCommand {
+    /// Create a markup annotation command using PDF user-space coordinates.
+    pub fn new(
+        page_ref: Ref,
+        original_page: PDFObject,
+        kind: MarkupKind,
+        quadpoints: Vec<QuadPoints>,
+        color: [f64; 3],
+    ) -> PDFResult<Self> {
+        if quadpoints.is_empty() {
+            return Err(PDFError::Generic(
+                "Markup annotation requires at least one QuadPoints quad".into(),
+            ));
+        }
+        if !matches!(original_page, PDFObject::Dictionary(_)) {
+            return Err(PDFError::Generic("Page object is not a dictionary".into()));
+        }
+        Ok(Self {
+            page_ref,
+            original_page,
+            kind,
+            quadpoints,
+            color,
+            annotation_ref: None,
+            appearance_ref: None,
+            annotation: None,
+            appearance: None,
+            modified_page: None,
+        })
+    }
+
+    fn number_array(values: &[f64]) -> PDFObject {
+        PDFObject::Array(
+            values
+                .iter()
+                .map(|n| Box::new(PDFObject::Number(*n)))
+                .collect(),
+        )
+    }
+
+    fn build_objects(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        let (mut ops, bbox) = markup_appearance_ops(self.kind, &self.quadpoints, self.color);
+        ops = format!("q{ops} Q");
+
+        let mut ap_dict = HashMap::new();
+        ap_dict.insert("Type".into(), PDFObject::Name("XObject".into()));
+        ap_dict.insert("Subtype".into(), PDFObject::Name("Form".into()));
+        ap_dict.insert("BBox".into(), Self::number_array(&bbox));
+        ap_dict.insert("Length".into(), PDFObject::Number(ops.len() as f64));
+        let appearance = PDFObject::Stream {
+            dict: ap_dict,
+            data: ops.into_bytes(),
+        };
+        let appearance_ref = delta.add_object(appearance.clone());
+
+        let mut quadpoint_numbers = Vec::with_capacity(self.quadpoints.len() * 8);
+        for quad in &self.quadpoints {
+            quadpoint_numbers.extend_from_slice(quad);
+        }
+
+        let mut normal_ap = HashMap::new();
+        normal_ap.insert("N".into(), PDFObject::Ref(appearance_ref));
+        let mut annot_dict = HashMap::new();
+        annot_dict.insert("Type".into(), PDFObject::Name("Annot".into()));
+        annot_dict.insert(
+            "Subtype".into(),
+            PDFObject::Name(self.kind.pdf_name().into()),
+        );
+        annot_dict.insert("Rect".into(), Self::number_array(&bbox));
+        annot_dict.insert("QuadPoints".into(), Self::number_array(&quadpoint_numbers));
+        annot_dict.insert("C".into(), Self::number_array(&self.color));
+        annot_dict.insert("F".into(), PDFObject::Number(4.0));
+        annot_dict.insert("AP".into(), PDFObject::Dictionary(normal_ap));
+        let annotation = PDFObject::Dictionary(annot_dict);
+        let annotation_ref = delta.add_object(annotation.clone());
+
+        let mut page_dict = match &self.original_page {
+            PDFObject::Dictionary(dict) => dict.clone(),
+            _ => unreachable!(),
+        };
+        let mut annots = match page_dict.remove("Annots") {
+            Some(PDFObject::Array(items)) => items,
+            Some(other) => smallvec::smallvec![Box::new(other)],
+            None => smallvec::SmallVec::new(),
+        };
+        annots.push(Box::new(PDFObject::Ref(annotation_ref)));
+        page_dict.insert("Annots".into(), PDFObject::Array(annots));
+        let modified_page = PDFObject::Dictionary(page_dict);
+        delta.modify_object(self.page_ref, modified_page.clone());
+
+        self.annotation_ref = Some(annotation_ref);
+        self.appearance_ref = Some(appearance_ref);
+        self.annotation = Some(annotation);
+        self.appearance = Some(appearance);
+        self.modified_page = Some(modified_page);
+        Ok(())
+    }
+}
+
+impl Command for AddMarkupAnnotationCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        self.build_objects(delta)
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        delta.modify_object(self.page_ref, self.original_page.clone());
+        if let Some(reference) = self.annotation_ref {
+            delta.remove_new_object(reference);
+        }
+        if let Some(reference) = self.appearance_ref {
+            delta.remove_new_object(reference);
+        }
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        let annotation_ref = self
+            .annotation_ref
+            .ok_or_else(|| PDFError::Generic("Missing markup annotation reference".into()))?;
+        let appearance_ref = self
+            .appearance_ref
+            .ok_or_else(|| PDFError::Generic("Missing markup appearance reference".into()))?;
+        delta.restore_new_object(appearance_ref, self.appearance.clone().unwrap());
+        delta.restore_new_object(annotation_ref, self.annotation.clone().unwrap());
+        delta.modify_object(self.page_ref, self.modified_page.clone().unwrap());
+        Ok(())
+    }
+}
+
+// ── DeleteAnnotationCommand ────────────────────────────────────────
+
+/// Reversible command that removes one annotation from a page.
+///
+/// Deletes the annotation object plus its indirect `/AP /N` appearance (one
+/// cascade level); undo restores the page's `/Annots` and un-deletes both
+/// objects. Whether an object is removed from the delta's new-object pool
+/// (`remove_new_object`) or marked deleted against the base (`delete_object`)
+/// is fixed at construction, when the caller knows which pool holds it.
+pub struct DeleteAnnotationCommand {
+    page_ref: Ref,
+    original_page: PDFObject,
+    modified_page: Option<PDFObject>,
+    annot_ref: Ref,
+    annot_is_new: bool,
+    annot_object: PDFObject,
+    appearance_ref: Option<Ref>,
+    appearance_is_new: bool,
+    appearance_object: Option<PDFObject>,
+}
+
+impl DeleteAnnotationCommand {
+    /// Create an annotation deletion. `annot_object` / `appearance_object`
+    /// are the pre-fetched current contents (needed to restore new objects on
+    /// undo); `appearance_*` describe the indirect `/AP /N` target, if any.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        page_ref: Ref,
+        original_page: PDFObject,
+        annot_ref: Ref,
+        annot_is_new: bool,
+        annot_object: PDFObject,
+        appearance_ref: Option<Ref>,
+        appearance_is_new: bool,
+        appearance_object: Option<PDFObject>,
+    ) -> PDFResult<Self> {
+        if !matches!(original_page, PDFObject::Dictionary(_)) {
+            return Err(PDFError::Generic("Page object is not a dictionary".into()));
+        }
+        Ok(Self {
+            page_ref,
+            original_page,
+            modified_page: None,
+            annot_ref,
+            annot_is_new,
+            annot_object,
+            appearance_ref,
+            appearance_is_new,
+            appearance_object,
+        })
+    }
+
+    fn remove_object(&self, delta: &mut DeltaLayer, obj_ref: Ref, is_new: bool) {
+        if is_new {
+            delta.remove_new_object(obj_ref);
+        } else {
+            delta.delete_object(obj_ref);
+        }
+    }
+
+    fn restore_object(
+        &self,
+        delta: &mut DeltaLayer,
+        obj_ref: Ref,
+        is_new: bool,
+        original: Option<&PDFObject>,
+    ) {
+        if is_new {
+            if let Some(obj) = original {
+                delta.restore_new_object(obj_ref, obj.clone());
+            }
+        } else {
+            delta.undelete_object(obj_ref);
+        }
+    }
+
+    fn build_modified_page(&mut self) -> PDFResult<()> {
+        if self.modified_page.is_some() {
+            return Ok(());
+        }
+        let page_dict = match &self.original_page {
+            PDFObject::Dictionary(dict) => dict.clone(),
+            _ => return Err(PDFError::Generic("Page object is not a dictionary".into())),
+        };
+        let annots = match page_dict.get("Annots") {
+            Some(PDFObject::Array(items)) => items.clone(),
+            _ => {
+                return Err(PDFError::Generic(
+                    "Page /Annots is not an array; cannot remove annotation".into(),
+                ));
+            }
+        };
+        let before = annots.len();
+        let remaining: smallvec::SmallVec<_> = annots
+            .into_iter()
+            .filter(|item| match &**item {
+                PDFObject::Ref(r) => r.as_id() != self.annot_ref.as_id(),
+                _ => true,
+            })
+            .collect();
+        if remaining.len() == before {
+            return Err(PDFError::Generic(format!(
+                "Annotation {} {} not found in page /Annots",
+                self.annot_ref.num, self.annot_ref.generation
+            )));
+        }
+        let mut page_dict = page_dict;
+        page_dict.insert("Annots".into(), PDFObject::Array(remaining));
+        self.modified_page = Some(PDFObject::Dictionary(page_dict));
+        Ok(())
+    }
+}
+
+impl Command for DeleteAnnotationCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        self.build_modified_page()?;
+        delta.modify_object(
+            self.page_ref,
+            self.modified_page.clone().expect("just built"),
+        );
+        self.remove_object(delta, self.annot_ref, self.annot_is_new);
+        if let Some(appearance_ref) = self.appearance_ref {
+            self.remove_object(delta, appearance_ref, self.appearance_is_new);
+        }
+        Ok(())
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        delta.modify_object(self.page_ref, self.original_page.clone());
+        self.restore_object(
+            delta,
+            self.annot_ref,
+            self.annot_is_new,
+            Some(&self.annot_object),
+        );
+        if let Some(appearance_ref) = self.appearance_ref {
+            self.restore_object(
+                delta,
+                appearance_ref,
+                self.appearance_is_new,
+                self.appearance_object.as_ref(),
+            );
+        }
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        self.execute(delta, None)
+    }
+}
+
+// ── EditAnnotationCommand ──────────────────────────────────────────
+
+/// Reversible command that edits an annotation's `/C` color and/or
+/// `/Contents` (ReplaceTextCommand-style pure `modify_object` swap).
+///
+/// For the four markup kinds with `/QuadPoints` and an indirect `/AP /N`, a
+/// color change also regenerates the appearance stream — our generated APs
+/// bake the color into the stream, so only touching `/C` would leave the
+/// visuals stale (the same rebuild-from-QuadPoints model pdf.js's annotation
+/// editor uses). Authorized appearances of *other* annotation types are never
+/// touched; a non-indirect `/AP /N` is left as-is (documented v1 limitation).
+pub struct EditAnnotationCommand {
+    annot_ref: Ref,
+    original_annot: PDFObject,
+    new_annot: PDFObject,
+    appearance_ref: Option<Ref>,
+    original_appearance: Option<PDFObject>,
+    new_appearance: Option<PDFObject>,
+}
+
+impl EditAnnotationCommand {
+    /// Build the edit from the annotation's current dict and the requested
+    /// changes. `original_appearance` must be the resolved `/AP /N` stream
+    /// when `appearance_ref` is `Some`.
+    pub fn new(
+        annot_ref: Ref,
+        original_annot: PDFObject,
+        new_color: Option<[f64; 3]>,
+        new_contents: Option<&str>,
+        appearance_ref: Option<Ref>,
+        original_appearance: Option<PDFObject>,
+    ) -> PDFResult<Self> {
+        let annot_dict = match &original_annot {
+            PDFObject::Dictionary(dict) => dict.clone(),
+            _ => {
+                return Err(PDFError::Generic(
+                    "Annotation object is not a dictionary".into(),
+                ));
+            }
+        };
+        let mut new_dict = annot_dict.clone();
+
+        if let Some(color) = new_color {
+            new_dict.insert(
+                "C".into(),
+                PDFObject::Array(
+                    color
+                        .iter()
+                        .map(|n| Box::new(PDFObject::Number(*n)))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(contents) = new_contents {
+            new_dict.insert(
+                "Contents".into(),
+                SetInfoCommand::encode_info_string(contents),
+            );
+        }
+        if new_dict == annot_dict {
+            return Err(PDFError::Generic("Annotation edit changes nothing".into()));
+        }
+
+        // Regenerate the appearance when recoloring a markup kind that carries
+        // QuadPoints (the same geometry inputs the add path used).
+        let new_appearance = match (new_color, appearance_ref.as_ref()) {
+            (Some(color), Some(_)) => {
+                let kind = match new_dict.get("Subtype") {
+                    Some(PDFObject::Name(name)) => MarkupKind::from_pdf_name(name.as_str()),
+                    _ => None,
+                };
+                let quadpoints = Self::read_quadpoints(&annot_dict);
+                match (kind, quadpoints) {
+                    (Some(kind), Some(quadpoints)) if !quadpoints.is_empty() => {
+                        let (mut ops, bbox) = markup_appearance_ops(kind, &quadpoints, color);
+                        ops = format!("q{ops} Q");
+                        let original_stream = match original_appearance.as_ref() {
+                            Some(PDFObject::Stream { dict, .. }) => dict.clone(),
+                            _ => {
+                                return Err(PDFError::Generic(
+                                    "/AP /N is not a stream; cannot regenerate appearance".into(),
+                                ));
+                            }
+                        };
+                        let mut ap_dict = original_stream;
+                        ap_dict.insert("Length".into(), PDFObject::Number(ops.len() as f64));
+                        ap_dict.insert(
+                            "BBox".into(),
+                            PDFObject::Array(
+                                bbox.iter()
+                                    .map(|n| Box::new(PDFObject::Number(*n)))
+                                    .collect(),
+                            ),
+                        );
+                        Some(PDFObject::Stream {
+                            dict: ap_dict,
+                            data: ops.into_bytes(),
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        Ok(Self {
+            annot_ref,
+            original_annot,
+            new_annot: PDFObject::Dictionary(new_dict),
+            appearance_ref,
+            original_appearance,
+            new_appearance,
+        })
+    }
+
+    /// Read `/QuadPoints` as a list of 8-number quads (None if absent/malformed).
+    fn read_quadpoints(dict: &HashMap<String, PDFObject>) -> Option<Vec<QuadPoints>> {
+        match dict.get("QuadPoints") {
+            Some(PDFObject::Array(arr)) => {
+                if arr.len() % 8 != 0 || arr.is_empty() {
+                    return None;
+                }
+                let mut numbers = Vec::with_capacity(arr.len());
+                for value in arr {
+                    match &**value {
+                        PDFObject::Number(n) => numbers.push(*n),
+                        _ => return None,
+                    }
+                }
+                Some(
+                    numbers
+                        .chunks_exact(8)
+                        .map(|c| [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Command for EditAnnotationCommand {
+    fn execute<'a>(
+        &mut self,
+        delta: &mut DeltaLayer,
+        _fetch_base: Option<&'a BaseObjectFetcher<'a>>,
+    ) -> PDFResult<()> {
+        delta.modify_object(self.annot_ref, self.new_annot.clone());
+        if let (Some(appearance_ref), Some(appearance)) =
+            (self.appearance_ref, self.new_appearance.as_ref())
+        {
+            delta.modify_object(appearance_ref, appearance.clone());
+        }
+        Ok(())
+    }
+
+    fn undo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        delta.modify_object(self.annot_ref, self.original_annot.clone());
+        if let (Some(appearance_ref), Some(appearance)) =
+            (self.appearance_ref, self.original_appearance.as_ref())
+        {
+            delta.modify_object(appearance_ref, appearance.clone());
+        }
+        Ok(())
+    }
+
+    fn redo(&mut self, delta: &mut DeltaLayer) -> PDFResult<()> {
+        self.execute(delta, None)
     }
 }
 

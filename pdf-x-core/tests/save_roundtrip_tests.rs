@@ -124,6 +124,30 @@ fn nested_tree_pdf() -> Vec<u8> {
     )
 }
 
+/// One-page PDF with a pre-existing (base-object) highlight annotation and its
+/// indirect `/AP /N` stream. Object map: 1=Catalog, 2=Pages, 3=Page,
+/// 4=Contents, 5=Font, 6=Annot, 7=AP stream. The annotation carries the
+/// normalized QuadPoints order (TL, TR, BL, BR).
+fn annotated_pdf() -> Vec<u8> {
+    assemble_pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+             /Annots [6 0 R] /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_string(),
+            stream_object("BT /F1 12 Tf 100 700 Td (Annotated) Tj ET"),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            "<< /Type /Annot /Subtype /Highlight /Rect [90 690 310 730] \
+             /QuadPoints [100 720 300 720 100 700 300 700] /C [1 1 0] /F 4 \
+             /AP << /N 7 0 R >> >>"
+                .to_string(),
+            stream_object("q 1 1 0 rg 100 700 m 300 700 l 300 720 l 100 720 l f Q"),
+        ],
+        "/Root 1 0 R",
+    )
+}
+
 // ==========================================================================
 // Save / validate helpers
 // ==========================================================================
@@ -591,5 +615,187 @@ fn move_page_undo_restores_order() {
     assert_eq!(
         page_refs(&mut reopened),
         vec![(8, 0), (5, 0), (6, 0), (7, 0)]
+    );
+}
+
+// ==========================================================================
+// Annotation CRUD persistence
+// ==========================================================================
+
+/// One horizontal band under a text line, in the normalized quad order.
+fn line_quad(y_top: f64) -> Vec<pdf_x_core::core::delta::QuadPoints> {
+    let (top, bottom) = (y_top, y_top - 20.0);
+    vec![[100.0, top, 300.0, top, 100.0, bottom, 300.0, bottom]]
+}
+
+#[test]
+fn add_underline_save_reopens_and_qpdf_clean() {
+    use pdf_x_core::core::annotation::AnnotationType;
+    use pdf_x_core::core::delta::MarkupKind;
+
+    let original = three_page_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    doc.add_markup(0, MarkupKind::Underline, line_quad(720.0), [0.0, 0.0, 0.0])
+        .expect("add_markup should apply");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    // qpdf validates the synthesized annotation + AP form XObject.
+    assert_qpdf_clean(&saved, "add_underline");
+
+    let mut reopened = reopen(saved);
+    let annots = reopened
+        .annotations_with_refs(0)
+        .expect("annotations after reopen");
+    assert_eq!(annots.len(), 1, "exactly one underline expected");
+    let (annot_ref, annot) = &annots[0];
+    assert!(
+        annot_ref.is_some(),
+        "saved annotation must be an indirect object"
+    );
+    assert_eq!(annot.annotation_type, AnnotationType::Underline);
+    assert_eq!(annot.color, Some(vec![0.0, 0.0, 0.0]), "/C must round-trip");
+}
+
+#[test]
+fn add_squiggly_and_strikeout_save_reopens() {
+    use pdf_x_core::core::annotation::AnnotationType;
+    use pdf_x_core::core::delta::MarkupKind;
+
+    let original = three_page_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    doc.add_markup(0, MarkupKind::Squiggly, line_quad(720.0), [0.0, 0.5, 0.0])
+        .expect("squiggly should apply");
+    doc.add_markup(0, MarkupKind::StrikeOut, line_quad(600.0), [1.0, 0.0, 0.0])
+        .expect("strikeout should apply");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    assert_qpdf_clean(&saved, "add_squiggly_strikeout");
+
+    let mut reopened = reopen(saved);
+    let annots = reopened
+        .annotations_with_refs(0)
+        .expect("annotations after reopen");
+    assert_eq!(annots.len(), 2, "both markups must persist");
+    assert!(
+        annots
+            .iter()
+            .any(|(_, a)| a.annotation_type == AnnotationType::Squiggly),
+        "squiggly must persist"
+    );
+    assert!(
+        annots
+            .iter()
+            .any(|(_, a)| a.annotation_type == AnnotationType::StrikeOut),
+        "strikeout must persist"
+    );
+}
+
+#[test]
+fn delete_annotation_save_removes_and_undo_restores() {
+    use pdf_x_core::core::annotation::AnnotationType;
+
+    // Base-object path: delete the fixture's highlight (object 6), save, and
+    // the annotation is gone on reopen.
+    let original = annotated_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+    doc.delete_annotation(0, 6).expect("delete should apply");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    assert_qpdf_clean(&saved, "delete_annotation");
+
+    let mut reopened = reopen(saved);
+    assert!(
+        reopened
+            .annotations_with_refs(0)
+            .expect("annotations after delete")
+            .is_empty(),
+        "deleted annotation must not come back"
+    );
+
+    // Undo path: delete then undo, save, and the highlight (+ its AP) is back.
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+    doc.delete_annotation(0, 6).expect("delete should apply");
+    doc.undo().expect("undo should apply");
+
+    let saved = save(&doc, &original);
+    assert_qpdf_clean(&saved, "delete_annotation undo");
+
+    let mut reopened = reopen(saved);
+    let annots = reopened
+        .annotations_with_refs(0)
+        .expect("annotations after undo");
+    assert_eq!(annots.len(), 1, "undo must restore the annotation");
+    assert_eq!(annots[0].1.annotation_type, AnnotationType::Highlight);
+}
+
+#[test]
+fn add_then_delete_annotation_save_leaves_no_annotation() {
+    let original = three_page_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    use pdf_x_core::core::delta::MarkupKind;
+    doc.add_markup(0, MarkupKind::Underline, line_quad(720.0), [0.0, 0.0, 0.0])
+        .expect("add_markup should apply");
+    let object_num = doc
+        .annotations_with_refs(0)
+        .expect("annotations")
+        .iter()
+        .find_map(|(r, _)| r.map(|r| r.num))
+        .expect("added annotation must be an indirect object");
+
+    doc.delete_annotation(0, object_num)
+        .expect("delete should apply");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    assert_qpdf_clean(&saved, "add_then_delete_annotation");
+
+    let mut reopened = reopen(saved);
+    assert!(
+        reopened
+            .annotations_with_refs(0)
+            .expect("annotations after reopen")
+            .is_empty(),
+        "add-then-delete must leave no annotation"
+    );
+}
+
+#[test]
+fn edit_annotation_color_save_reopens() {
+    use pdf_x_core::core::delta::MarkupKind;
+
+    let original = three_page_pdf();
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+
+    doc.add_markup(0, MarkupKind::Highlight, line_quad(720.0), [1.0, 1.0, 0.0])
+        .expect("add_markup should apply");
+    let object_num = doc
+        .annotations_with_refs(0)
+        .expect("annotations")
+        .iter()
+        .find_map(|(r, _)| r.map(|r| r.num))
+        .expect("added annotation must be an indirect object");
+
+    doc.edit_annotation(0, object_num, Some([1.0, 0.0, 0.0]), None)
+        .expect("edit should apply");
+
+    let saved = save(&doc, &original);
+    assert_prefix_unchanged(&original, &saved);
+    assert_qpdf_clean(&saved, "edit_annotation_color");
+
+    let mut reopened = reopen(saved);
+    let annots = reopened
+        .annotations_with_refs(0)
+        .expect("annotations after reopen");
+    assert_eq!(annots.len(), 1, "exactly one highlight expected");
+    assert_eq!(
+        annots[0].1.color,
+        Some(vec![1.0, 0.0, 0.0]),
+        "recolored /C must round-trip"
     );
 }

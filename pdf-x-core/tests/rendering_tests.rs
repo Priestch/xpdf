@@ -659,3 +659,73 @@ mod parallel {
         );
     }
 }
+
+// ============================================================================
+// Annotation appearance rendering
+// ============================================================================
+
+/// A generated markup `/AP /N` (AddMarkupAnnotationCommand) must paint through
+/// the standard pipeline (`paint_annotation_appearances` inside `interpret`) —
+/// and still paint after an incremental save + reopen, proving the synthesized
+/// appearance stream survives persistence.
+#[cfg(feature = "rendering")]
+#[test]
+fn generated_underline_appearance_paints_after_save_and_reopen() {
+    use pdf_x_core::core::PDFDocument;
+    use pdf_x_core::core::delta::{MarkupKind, QuadPoints};
+    use pdf_x_device_tinyskia::RenderToImage;
+
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("pdf-x-core has a parent workspace dir")
+        .join("tests")
+        .join("fixtures")
+        .join("pdfs")
+        .join("simpletype3font.pdf");
+    let original = std::fs::read(&path).expect("fixture should exist");
+
+    let mut doc = PDFDocument::open(original.clone()).expect("fixture should open");
+    let baseline = doc
+        .render_page_to_image(0, Some(1.0))
+        .expect("baseline render");
+
+    // One underline quad across a text line, in user-space coordinates. The
+    // pdf.js Underline algorithm strokes y = bottom + 1.3 (here 701.3) with
+    // width 0.571.
+    let quad: QuadPoints = [100.0, 720.0, 300.0, 720.0, 100.0, 700.0, 300.0, 700.0];
+    doc.add_markup(0, MarkupKind::Underline, vec![quad], [0.0, 0.0, 0.0])
+        .expect("add_markup should apply");
+
+    // Save + reopen: the appearance must survive persistence.
+    let mut saved = original.clone();
+    saved.extend_from_slice(&doc.incremental_update(&original).expect("update"));
+    let mut reopened = PDFDocument::open(saved).expect("saved file should reopen");
+    let (width, height, pixels) = reopened
+        .render_page_to_image(0, Some(1.0))
+        .expect("render after reopen");
+
+    assert_eq!(
+        (width, height),
+        (baseline.0, baseline.1),
+        "page size must not change"
+    );
+
+    // The only visible change must be the underline stroke itself. Device y =
+    // 792 - y_pdf puts the stroke at rows ~90-91 at scale 1; allow an
+    // antialias margin. x spans the quad's [100, 300].
+    let mut changed = Vec::new();
+    for i in 0..(width as usize * height as usize) {
+        let a = &pixels[i * 4..i * 4 + 4];
+        let b = &baseline.2[i * 4..i * 4 + 4];
+        if a != b {
+            changed.push((i as u32 % width, i as u32 / width));
+        }
+    }
+    assert!(!changed.is_empty(), "the underline must be visible");
+    for (x, y) in changed {
+        assert!(
+            (97..=303).contains(&x) && (88..=94).contains(&y),
+            "changed pixel ({x}, {y}) outside the underline band"
+        );
+    }
+}

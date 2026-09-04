@@ -13,18 +13,16 @@ pub fn run(ctx: &mut Ctx) -> Result<Value, String> {
     let mut total = 0usize;
 
     for idx in indices {
-        let page = doc
-            .get_page(idx)
-            .map_err(|e| format!("page {} unavailable: {e:?}", idx + 1))?;
-        let annotations = page
-            .extract_annotations(doc.doc_store_mut())
+        let annotations = doc
+            .annotations_with_refs(idx)
             .map_err(|e| format!("page {} annotations unavailable: {e:?}", idx + 1))?;
 
         let count = annotations.len();
         let items: Vec<Value> = annotations
             .iter()
-            .map(|annot| {
+            .map(|(annot_ref, annot)| {
                 json!({
+                    "object": annot_ref.map(|r| format!("{} {} R", r.num, r.generation)),
                     "type": format!("{:?}", annot.annotation_type),
                     "rect": annot.rect,
                     "contents": annot.contents,

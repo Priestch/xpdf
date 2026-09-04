@@ -1,5 +1,6 @@
 use super::delta::{
-    AddHighlightCommand, CommandHistory, DeletePageCommand, DeltaLayer, MovePageCommand,
+    AddHighlightCommand, AddMarkupAnnotationCommand, CommandHistory, DeleteAnnotationCommand,
+    DeletePageCommand, DeltaLayer, EditAnnotationCommand, MarkupKind, MovePageCommand, QuadPoints,
     ReplaceTextCommand, RotatePageCommand, SetInfoCommand,
 };
 use super::doc_store::DocStore;
@@ -138,7 +139,8 @@ impl PDFDocument {
         let encrypt_dict = Self::setup_encryption(&mut xref)?;
 
         // Load the catalog
-        let catalog = Some(xref.catalog()?);
+        let catalog_obj = xref.catalog()?;
+        let catalog = Some(catalog_obj.clone());
 
         // Check if this is a linearized PDF
         let linearized = Self::check_linearized(&mut xref)?;
@@ -146,7 +148,13 @@ impl PDFDocument {
         // Delta layer over the base. Sized by the base object count so new objects
         // (Phase 2+) get fresh object numbers above the base range.
         let delta = DeltaLayer::new(xref.len() as u32);
-        let doc_store = DocStore::new(xref, delta);
+        let mut doc_store = DocStore::new(xref, delta);
+        // Seed the root /Pages reference so link/GoTo destinations resolve page
+        // refs to indices through the resolver (DocStore::resolve_page_index)
+        // without a PDFDocument handle.
+        if let Some(PDFObject::Ref(r)) = catalog_obj.as_dictionary().and_then(|d| d.get("Pages")) {
+            doc_store.set_root_pages_ref(Ref::new(r.num, r.generation));
+        }
 
         Ok(PDFDocument {
             doc_store,
@@ -445,6 +453,186 @@ impl PDFDocument {
         let command =
             AddHighlightCommand::new(Ref::new(num, generation), page_object, rect, color)?;
         self.execute_command(Box::new(command))
+    }
+
+    /// Add a markup annotation (Highlight, Underline, Squiggly, StrikeOut) in
+    /// PDF user-space coordinates, generating its `/AP /N` appearance stream
+    /// after pdf.js's per-kind algorithms (see `delta::markup_appearance_ops`).
+    pub fn add_markup(
+        &mut self,
+        page_index: usize,
+        kind: MarkupKind,
+        quadpoints: Vec<QuadPoints>,
+        color: [f64; 3],
+    ) -> PDFResult<()> {
+        let page = self.get_page(page_index)?;
+        let (num, generation) = page.reference().ok_or_else(|| {
+            PDFError::Generic("Cannot edit a page without an indirect object reference".into())
+        })?;
+        let page_object = self.resolve_annots_for_edit(&page)?;
+        let command = AddMarkupAnnotationCommand::new(
+            Ref::new(num, generation),
+            page_object,
+            kind,
+            quadpoints,
+            color,
+        )?;
+        self.execute_command(Box::new(command))
+    }
+
+    /// Delete an annotation by its object number (the identity exposed by
+    /// `annotations_with_refs`). Cascades one level into an indirect `/AP /N`
+    /// appearance; undo restores the page's `/Annots` and un-deletes both
+    /// objects.
+    pub fn delete_annotation(&mut self, page_index: usize, object_num: u32) -> PDFResult<()> {
+        let (page_ref, page_object, annot_ref, annot_object, appearance) =
+            self.locate_annotation(page_index, object_num)?;
+        let annot_is_new = self.doc_store.delta().is_new_object(annot_ref);
+        let (appearance_ref, appearance_object) = match appearance {
+            Some((reference, object)) => (Some(reference), Some(object)),
+            None => (None, None),
+        };
+        let appearance_is_new = appearance_ref
+            .map(|reference| self.doc_store.delta().is_new_object(reference))
+            .unwrap_or(false);
+        let command = DeleteAnnotationCommand::new(
+            page_ref,
+            page_object,
+            annot_ref,
+            annot_is_new,
+            annot_object,
+            appearance_ref,
+            appearance_is_new,
+            appearance_object,
+        )?;
+        self.execute_command(Box::new(command))
+    }
+
+    /// Edit an annotation's `/C` color and/or `/Contents` by its object
+    /// number. Recoloring a markup annotation (Highlight, Underline, Squiggly,
+    /// StrikeOut) that carries `/QuadPoints` and an indirect `/AP /N`
+    /// regenerates the appearance stream; other appearances are left as-is.
+    pub fn edit_annotation(
+        &mut self,
+        page_index: usize,
+        object_num: u32,
+        color: Option<[f64; 3]>,
+        contents: Option<String>,
+    ) -> PDFResult<()> {
+        let (_page_ref, _page_object, annot_ref, annot_object, appearance) =
+            self.locate_annotation(page_index, object_num)?;
+        let (appearance_ref, appearance_object) = match appearance {
+            Some((reference, object)) => (Some(reference), Some(object)),
+            None => (None, None),
+        };
+        let command = EditAnnotationCommand::new(
+            annot_ref,
+            annot_object,
+            color,
+            contents.as_deref(),
+            appearance_ref,
+            appearance_object,
+        )?;
+        self.execute_command(Box::new(command))
+    }
+
+    /// Clone the page dict with an indirect `/Annots` resolved inline, so an
+    /// annotation command sees a direct array (same normalization as
+    /// `add_highlight`).
+    fn resolve_annots_for_edit(&mut self, page: &Page) -> PDFResult<PDFObject> {
+        let mut page_object = page.dict().clone();
+        if let PDFObject::Dictionary(dict) = &mut page_object {
+            if let Some(PDFObject::Ref(reference)) = dict.get("Annots").cloned() {
+                let resolved = self
+                    .doc_store
+                    .resolve_ref(reference.num, reference.generation)?;
+                if !matches!(resolved.as_ref(), PDFObject::Array(_)) {
+                    return Err(PDFError::Generic(
+                        "Page Annots reference is not an array".into(),
+                    ));
+                }
+                dict.insert("Annots".into(), resolved.as_ref().clone());
+            }
+        }
+        Ok(page_object)
+    }
+
+    /// Locate one annotation by object number on a page. Returns the page ref,
+    /// the page dict with `/Annots` resolved inline, the annotation ref, its
+    /// current dict, and the indirect `/AP /N` appearance as `(ref, object)`
+    /// when present.
+    fn locate_annotation(
+        &mut self,
+        page_index: usize,
+        object_num: u32,
+    ) -> PDFResult<(Ref, PDFObject, Ref, PDFObject, Option<(Ref, PDFObject)>)> {
+        let page = self.get_page(page_index)?;
+        let (num, generation) = page.reference().ok_or_else(|| {
+            PDFError::Generic("Cannot edit a page without an indirect object reference".into())
+        })?;
+        let mut page_object = self.resolve_annots_for_edit(&page)?;
+
+        let mut annot: Option<(Ref, PDFObject)> = None;
+        if let PDFObject::Dictionary(dict) = &page_object {
+            if let Some(PDFObject::Array(items)) = dict.get("Annots") {
+                for item in items {
+                    if let PDFObject::Ref(r) = &**item {
+                        if r.num == object_num {
+                            let resolved = self.doc_store.resolve_ref(r.num, r.generation)?;
+                            annot =
+                                Some((Ref::new(r.num, r.generation), resolved.as_ref().clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let Some((annot_ref, annot_object)) = annot else {
+            return Err(PDFError::Generic(format!(
+                "Annotation object {object_num} not found on page {}",
+                page_index + 1
+            )));
+        };
+
+        // Indirect /AP /N — the appearance object edit/delete commands cascade into.
+        let appearance = match (&annot_object, &mut page_object) {
+            (PDFObject::Dictionary(d), _) => {
+                let ap_ref = match d.get("AP") {
+                    Some(PDFObject::Dictionary(ap)) => match ap.get("N") {
+                        Some(PDFObject::Ref(r)) => Ref::new(r.num, r.generation),
+                        _ => {
+                            return Ok((
+                                Ref::new(num, generation),
+                                page_object,
+                                annot_ref,
+                                annot_object,
+                                None,
+                            ));
+                        }
+                    },
+                    _ => {
+                        return Ok((
+                            Ref::new(num, generation),
+                            page_object,
+                            annot_ref,
+                            annot_object,
+                            None,
+                        ));
+                    }
+                };
+                let resolved = self.doc_store.resolve_ref(ap_ref.num, ap_ref.generation)?;
+                Some((ap_ref, resolved.as_ref().clone()))
+            }
+            _ => None,
+        };
+
+        Ok((
+            Ref::new(num, generation),
+            page_object,
+            annot_ref,
+            annot_object,
+            appearance,
+        ))
     }
 
     /// Delete a page from the document.
@@ -1265,6 +1453,22 @@ impl PDFDocument {
         self.page_cache.put(page_index, page.clone());
 
         Ok(page)
+    }
+
+    /// Extracts annotations from a page with their indirect object references.
+    ///
+    /// The reference is the annotation's edit identity — what annotation
+    /// commands (delete/edit) address. See
+    /// [`super::annotation::parse_annotations_with_refs`].
+    ///
+    /// # Arguments
+    /// * `page_index` - Zero-based page index
+    pub fn annotations_with_refs(
+        &mut self,
+        page_index: usize,
+    ) -> PDFResult<Vec<(Option<Ref>, crate::core::annotation::Annotation)>> {
+        let page = self.get_page(page_index)?;
+        page.extract_annotations_with_refs(self.doc_store_mut())
     }
 
     /// Extracts text from a specific page.
@@ -3531,5 +3735,222 @@ startxref
         assert_eq!(node_count(&mut doc, 3), 3);
         assert_eq!(node_count(&mut doc, 4), 1);
         assert_eq!(node_count(&mut doc, 2), 4);
+    }
+
+    // ==========================================================================
+    // Annotation commands (add markup / delete / edit)
+    // ==========================================================================
+
+    /// One text-line quad on page 1: top-left/top-right/bottom-left/bottom-right.
+    fn line_quad() -> Vec<crate::core::delta::QuadPoints> {
+        vec![[100.0, 720.0, 300.0, 720.0, 100.0, 700.0, 300.0, 700.0]]
+    }
+
+    /// Resolve the (single) markup annotation just added to a page and return
+    /// `(annot_ref, annot_dict, ap_stream_data)`.
+    fn sole_markup_annot(
+        doc: &mut PDFDocument,
+        page_index: usize,
+    ) -> (Ref, std::collections::HashMap<String, PDFObject>, Vec<u8>) {
+        let annots = doc.annotations_with_refs(page_index).expect("annots");
+        let (r, _) = annots
+            .iter()
+            .find(|(r, _)| r.is_some())
+            .expect("one indirect annotation");
+        let annot_ref = r.expect("checked");
+        let resolved = doc
+            .doc_store
+            .resolve_ref(annot_ref.num, annot_ref.generation)
+            .expect("annot resolves");
+        let dict = match resolved.as_ref() {
+            PDFObject::Dictionary(d) => d.clone(),
+            other => panic!("annot is not a dictionary: {other:?}"),
+        };
+        let ap_ref = match dict.get("AP") {
+            Some(PDFObject::Dictionary(ap)) => match ap.get("N") {
+                Some(PDFObject::Ref(r)) => Ref::new(r.num, r.generation),
+                other => panic!("AP /N is not a ref: {other:?}"),
+            },
+            other => panic!("no AP dict: {other:?}"),
+        };
+        let ap = doc
+            .doc_store
+            .resolve_ref(ap_ref.num, ap_ref.generation)
+            .expect("AP resolves");
+        let data = match ap.as_ref() {
+            PDFObject::Stream { data, .. } => data.clone(),
+            other => panic!("AP is not a stream: {other:?}"),
+        };
+        (annot_ref, dict, data)
+    }
+
+    #[test]
+    fn add_markup_underline_builds_acrostyle_ap() {
+        let mut doc = PDFDocument::open(create_3page_flat_pdf()).expect("open");
+        doc.add_markup(0, MarkupKind::Underline, line_quad(), [0.0, 0.0, 1.0])
+            .expect("add underline");
+
+        let (annot_ref, dict, data) = sole_markup_annot(&mut doc, 0);
+        assert_eq!(
+            dict.get("Subtype"),
+            Some(&PDFObject::Name("Underline".into()))
+        );
+        // Quad round-trips into /QuadPoints.
+        match dict.get("QuadPoints") {
+            Some(PDFObject::Array(arr)) => {
+                let nums: Vec<f64> = arr
+                    .iter()
+                    .map(|v| match &**v {
+                        PDFObject::Number(n) => *n,
+                        other => panic!("non-number quadpoint {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    nums,
+                    vec![100.0, 720.0, 300.0, 720.0, 100.0, 700.0, 300.0, 700.0]
+                );
+            }
+            other => panic!("no QuadPoints: {other:?}"),
+        }
+        // pdf.js underline algorithm: Acrobat width 0.571, line 1.3 above the
+        // quad's bottom edge (annotation.js:5186-5195).
+        assert_eq!(
+            String::from_utf8(data).unwrap(),
+            "q[] 0 d 0.571 w 0 0 1 RG 100 701.3 m 300 701.3 l S Q"
+        );
+        // Rect mirrors the appearance BBox (quad union).
+        assert_eq!(
+            dict.get("Rect"),
+            Some(&PDFObject::Array(
+                [100.0, 700.0, 300.0, 720.0]
+                    .iter()
+                    .map(|n| Box::new(PDFObject::Number(*n)))
+                    .collect()
+            ))
+        );
+    }
+
+    #[test]
+    fn add_markup_squiggly_zigzag_and_strikeout_midline() {
+        let mut doc = PDFDocument::open(create_3page_flat_pdf()).expect("open");
+
+        // Squiggly: zigzag steps of 2 alternating edge / edge+dy (dy = 20/6).
+        doc.add_markup(0, MarkupKind::Squiggly, line_quad(), [0.0, 0.0, 0.0])
+            .expect("add squiggly");
+        let (_, _, data) = sole_markup_annot(&mut doc, 0);
+        let dy = (720.0 - 700.0) / 6.0;
+        let mut expected = format!("q[] 0 d 1 w 0 0 0 RG 100 {} m", 700.0 + dy);
+        let mut x = 100.0;
+        let mut shift = dy;
+        while x < 300.0 {
+            x += 2.0;
+            shift = if shift == 0.0 { dy } else { 0.0 };
+            expected += &format!(" {x} {} l", 700.0 + shift);
+        }
+        expected += " S Q";
+        assert_eq!(String::from_utf8(data).unwrap(), expected);
+
+        // StrikeOut: line through the midpoints of the left and right edges
+        // ((100,710) → (300,710)).
+        doc.add_markup(1, MarkupKind::StrikeOut, line_quad(), [1.0, 0.0, 0.0])
+            .expect("add strikeout");
+        let (_, _, data) = sole_markup_annot(&mut doc, 1);
+        assert_eq!(
+            String::from_utf8(data).unwrap(),
+            "q[] 0 d 1 w 1 0 0 RG 100 710 m 300 710 l S Q"
+        );
+    }
+
+    #[test]
+    fn edit_markup_annotation_recolors_ap_and_undoes() {
+        let mut doc = PDFDocument::open(create_3page_flat_pdf()).expect("open");
+        doc.add_markup(0, MarkupKind::Highlight, line_quad(), [1.0, 1.0, 0.0])
+            .expect("add highlight");
+        let (annot_ref, _, original_ap) = sole_markup_annot(&mut doc, 0);
+        assert!(String::from_utf8_lossy(&original_ap).contains("1 1 0 rg"));
+
+        doc.edit_annotation(0, annot_ref.num, Some([1.0, 0.0, 0.0]), None)
+            .expect("recolor");
+        let (_, dict, ap) = sole_markup_annot(&mut doc, 0);
+        assert_eq!(
+            dict.get("C"),
+            Some(&PDFObject::Array(
+                [1.0, 0.0, 0.0]
+                    .iter()
+                    .map(|n| Box::new(PDFObject::Number(*n)))
+                    .collect()
+            ))
+        );
+        assert!(String::from_utf8_lossy(&ap).contains("1 0 0 rg"));
+
+        // Undo restores both the /C and the color-baked AP stream.
+        doc.undo().expect("undo");
+        let (_, dict, ap) = sole_markup_annot(&mut doc, 0);
+        assert!(
+            matches!(dict.get("C"), Some(PDFObject::Array(c)) if c.len() == 3
+                && matches!(&*c[0], PDFObject::Number(1.0))
+                && matches!(&*c[1], PDFObject::Number(1.0)))
+        );
+        assert_eq!(ap, original_ap);
+    }
+
+    #[test]
+    fn edit_annotation_contents_only_keeps_ap() {
+        let mut doc = PDFDocument::open(create_3page_flat_pdf()).expect("open");
+        doc.add_markup(0, MarkupKind::Underline, line_quad(), [0.0, 0.0, 0.0])
+            .expect("add underline");
+        let (annot_ref, _, ap_before) = sole_markup_annot(&mut doc, 0);
+
+        doc.edit_annotation(0, annot_ref.num, None, Some("needs review".into()))
+            .expect("edit contents");
+        let (_, dict, ap_after) = sole_markup_annot(&mut doc, 0);
+        assert_eq!(ap_after, ap_before, "contents edit must not touch the AP");
+        assert!(matches!(dict.get("Contents"), Some(PDFObject::String(_))));
+    }
+
+    #[test]
+    fn delete_annotation_cascades_to_ap_and_undoes() {
+        let mut doc = PDFDocument::open(create_3page_flat_pdf()).expect("open");
+        doc.add_markup(0, MarkupKind::Underline, line_quad(), [0.0, 0.0, 0.0])
+            .expect("add underline");
+        let (annot_ref, _, _) = sole_markup_annot(&mut doc, 0);
+        let ap_ref = {
+            let resolved = doc
+                .doc_store
+                .resolve_ref(annot_ref.num, annot_ref.generation)
+                .expect("annot");
+            match resolved.as_ref() {
+                PDFObject::Dictionary(d) => match d.get("AP") {
+                    Some(PDFObject::Dictionary(ap)) => match ap.get("N") {
+                        Some(PDFObject::Ref(r)) => Ref::new(r.num, r.generation),
+                        other => panic!("AP /N not a ref: {other:?}"),
+                    },
+                    other => panic!("no AP: {other:?}"),
+                },
+                other => panic!("not a dict: {other:?}"),
+            }
+        };
+
+        doc.delete_annotation(0, annot_ref.num).expect("delete");
+        let page = doc.get_page(0).expect("page");
+        match page.dict().as_dictionary().and_then(|d| d.get("Annots")) {
+            Some(PDFObject::Array(items)) => assert_eq!(items.len(), 0),
+            None => {}
+            other => panic!("unexpected Annots: {other:?}"),
+        }
+        assert!(doc.doc_store.resolve_ref(annot_ref.num, 0).is_err());
+        assert!(doc.doc_store.resolve_ref(ap_ref.num, 0).is_err());
+
+        // Undo restores the /Annots entry and both objects (base objects are
+        // un-deleted; the objects were created this session, so they come back
+        // via restore).
+        doc.undo().expect("undo");
+        assert!(doc.doc_store.resolve_ref(annot_ref.num, 0).is_ok());
+        assert!(doc.doc_store.resolve_ref(ap_ref.num, 0).is_ok());
+        let page = doc.get_page(0).expect("page");
+        match page.dict().as_dictionary().and_then(|d| d.get("Annots")) {
+            Some(PDFObject::Array(items)) => assert_eq!(items.len(), 1),
+            other => panic!("Annots not restored: {other:?}"),
+        }
     }
 }

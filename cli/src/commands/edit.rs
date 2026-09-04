@@ -20,7 +20,7 @@ fn save_to(ctx: &mut Ctx, output_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn maybe_save(ctx: &mut Ctx) -> Result<(), String> {
+pub(crate) fn maybe_save(ctx: &mut Ctx) -> Result<(), String> {
     let Some(path) = ctx.output_path.take() else {
         return Ok(());
     };

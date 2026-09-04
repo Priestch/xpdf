@@ -23,19 +23,54 @@ pub enum Command {
     Object(u32),
     Version,
     Fonts,
-    Text { positions: bool },
+    Text {
+        positions: bool,
+    },
     Outline,
     Annotations,
     PageSizes,
     Images,
-    Operators { summary: bool, max: Option<usize> },
+    Operators {
+        summary: bool,
+        max: Option<usize>,
+    },
     Stream(u32),
-    RotatePage { page: usize, angle: u16 },
-    SetInfo { entries: Vec<(String, Option<String>)> },
+    RotatePage {
+        page: usize,
+        angle: u16,
+    },
+    SetInfo {
+        entries: Vec<(String, Option<String>)>,
+    },
     Save,
-    DeletePage { page: usize },
-    MovePage { page: usize, to: usize },
-    ReplaceText { page: usize, find: String, replace: String },
+    DeletePage {
+        page: usize,
+    },
+    MovePage {
+        page: usize,
+        to: usize,
+    },
+    ReplaceText {
+        page: usize,
+        find: String,
+        replace: String,
+    },
+    AddAnnotation {
+        page: usize,
+        kind: String,
+        quads: Vec<[f64; 8]>,
+        color: Option<[f64; 3]>,
+    },
+    DeleteAnnotation {
+        page: usize,
+        object: u32,
+    },
+    EditAnnotation {
+        page: usize,
+        object: u32,
+        color: Option<[f64; 3]>,
+        contents: Option<String>,
+    },
 }
 
 /// Parsed CLI arguments.
@@ -45,6 +80,31 @@ pub struct Args {
     pub output: OutputMode,
     pub pages: Vec<usize>,
     pub output_path: Option<String>,
+}
+
+/// Parse `n` comma-separated floats ("100,720,300,700").
+fn parse_numbers(raw: &str, n: usize) -> Result<Vec<f64>, String> {
+    let values: Vec<f64> = raw
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<f64>()
+                .map_err(|_| format!("invalid number: {s}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if values.len() != n {
+        return Err(format!(
+            "expected {n} comma-separated numbers, got {}",
+            values.len()
+        ));
+    }
+    Ok(values)
+}
+
+/// Parse one quad: 8 comma-separated numbers (pdf.js normalized order).
+fn parse_quadpoints(raw: &str) -> Result<[f64; 8], String> {
+    let v = parse_numbers(raw, 8)?;
+    Ok([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
 }
 
 impl Args {
@@ -266,6 +326,162 @@ impl Args {
                 "save" => {
                     command = Command::Save;
                 }
+                "add-annotation" => {
+                    i += 1;
+                    if i >= raw.len() {
+                        return Err("add-annotation requires a page number".into());
+                    }
+                    let p: usize = raw[i].parse().map_err(|_| "invalid page number")?;
+                    if p == 0 {
+                        return Err("page numbers are 1-based".into());
+                    }
+                    let mut kind = String::from("highlight");
+                    let mut quads: Vec<[f64; 8]> = Vec::new();
+                    let mut color: Option<[f64; 3]> = None;
+                    while i + 1 < raw.len() {
+                        match raw[i + 1].as_str() {
+                            "--kind" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--kind requires a value".into());
+                                }
+                                kind = raw[i].to_lowercase();
+                            }
+                            "--quadpoints" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err(
+                                        "--quadpoints requires 8 comma-separated numbers".into()
+                                    );
+                                }
+                                quads.push(parse_quadpoints(&raw[i])?);
+                            }
+                            "--rect" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--rect requires x1,y1,x2,y2".into());
+                                }
+                                let rect = parse_numbers(&raw[i], 4)?;
+                                if rect[2] <= rect[0] || rect[3] <= rect[1] {
+                                    return Err("--rect must have positive size".into());
+                                }
+                                // One quad in the normalized pdf.js order:
+                                // top-left, top-right, bottom-left, bottom-right.
+                                quads.push([
+                                    rect[0], rect[3], rect[2], rect[3], rect[0], rect[1], rect[2],
+                                    rect[1],
+                                ]);
+                            }
+                            "--color" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--color requires r,g,b".into());
+                                }
+                                let c = parse_numbers(&raw[i], 3)?;
+                                color = Some([c[0], c[1], c[2]]);
+                            }
+                            _ => break,
+                        }
+                    }
+                    if quads.is_empty() {
+                        return Err(
+                            "add-annotation requires --rect x1,y1,x2,y2 or --quadpoints ...".into(),
+                        );
+                    }
+                    if !matches!(
+                        kind.as_str(),
+                        "highlight" | "underline" | "squiggly" | "strikeout"
+                    ) {
+                        return Err(
+                            "--kind must be highlight, underline, squiggly or strikeout".into()
+                        );
+                    }
+                    command = Command::AddAnnotation {
+                        page: p - 1,
+                        kind,
+                        quads,
+                        color,
+                    };
+                }
+                "delete-annotation" => {
+                    i += 1;
+                    if i >= raw.len() {
+                        return Err("delete-annotation requires a page number".into());
+                    }
+                    let p: usize = raw[i].parse().map_err(|_| "invalid page number")?;
+                    if p == 0 {
+                        return Err("page numbers are 1-based".into());
+                    }
+                    let mut object: Option<u32> = None;
+                    while i + 1 < raw.len() {
+                        match raw[i + 1].as_str() {
+                            "--object" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--object requires an object number".into());
+                                }
+                                object = Some(raw[i].parse().map_err(|_| "invalid object number")?);
+                            }
+                            _ => break,
+                        }
+                    }
+                    let Some(object) = object else {
+                        return Err("delete-annotation requires --object <N>".into());
+                    };
+                    command = Command::DeleteAnnotation {
+                        page: p - 1,
+                        object,
+                    };
+                }
+                "edit-annotation" => {
+                    i += 1;
+                    if i >= raw.len() {
+                        return Err("edit-annotation requires a page number".into());
+                    }
+                    let p: usize = raw[i].parse().map_err(|_| "invalid page number")?;
+                    if p == 0 {
+                        return Err("page numbers are 1-based".into());
+                    }
+                    let mut object: Option<u32> = None;
+                    let mut color: Option<[f64; 3]> = None;
+                    let mut contents: Option<String> = None;
+                    while i + 1 < raw.len() {
+                        match raw[i + 1].as_str() {
+                            "--object" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--object requires an object number".into());
+                                }
+                                object = Some(raw[i].parse().map_err(|_| "invalid object number")?);
+                            }
+                            "--color" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--color requires r,g,b".into());
+                                }
+                                let c = parse_numbers(&raw[i], 3)?;
+                                color = Some([c[0], c[1], c[2]]);
+                            }
+                            "--contents" => {
+                                i += 2;
+                                if i >= raw.len() {
+                                    return Err("--contents requires a value".into());
+                                }
+                                contents = Some(raw[i].clone());
+                            }
+                            _ => break,
+                        }
+                    }
+                    let Some(object) = object else {
+                        return Err("edit-annotation requires --object <N>".into());
+                    };
+                    command = Command::EditAnnotation {
+                        page: p - 1,
+                        object,
+                        color,
+                        contents,
+                    };
+                }
                 "object" => {
                     i += 1;
                     if i >= raw.len() {
@@ -359,6 +575,13 @@ impl Args {
             "  delete-page <P>                   Delete a page",
             "  move-page <P> --to <P>            Move a page (final position, 1-based)",
             "  replace-text <P> --find <T> --replace <R>  Replace text (v1: Tj)",
+            "  add-annotation <P> --kind <K> --rect x1,y1,x2,y2 [--color r,g,b]",
+            "                                     Add markup annotation (K = highlight",
+            "                                     | underline | squiggly | strikeout);",
+            "                                     --quadpoints q repeats for multi-quad",
+            "  delete-annotation <P> --object <N>  Delete annotation by object number",
+            "  edit-annotation <P> --object <N> [--color r,g,b] [--contents T]",
+            "                                     Edit annotation color/contents",
             "  save --output <path>               Save edits to file",
             "",
             "Edit commands accept --output to save in one step:",

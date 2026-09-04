@@ -1,6 +1,7 @@
 //! Command implementations.
 
 pub mod annotations;
+pub mod annotations_edit;
 pub mod edit;
 pub mod fonts;
 pub mod images;
@@ -94,9 +95,26 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
         SetInfo { entries } => edit::run_set_info(ctx, entries.clone()),
         DeletePage { page } => edit::run_delete_page(ctx, *page),
         MovePage { page, to } => edit::run_move_page(ctx, *page, *to),
-        ReplaceText { page, find, replace } => {
-            edit::run_replace_text(ctx, *page, find, replace)
+        ReplaceText {
+            page,
+            find,
+            replace,
+        } => edit::run_replace_text(ctx, *page, find, replace),
+        AddAnnotation {
+            page,
+            kind,
+            quads,
+            color,
+        } => annotations_edit::run_add_annotation(ctx, *page, kind, quads, *color),
+        DeleteAnnotation { page, object } => {
+            annotations_edit::run_delete_annotation(ctx, *page, *object)
         }
+        EditAnnotation {
+            page,
+            object,
+            color,
+            contents,
+        } => annotations_edit::run_edit_annotation(ctx, *page, *object, *color, contents.clone()),
         Save => edit::run_save(ctx),
     };
 
@@ -123,6 +141,9 @@ pub fn run(ctx: &mut Ctx, command: &Command) {
         DeletePage { .. } => "delete-page",
         MovePage { .. } => "move-page",
         ReplaceText { .. } => "replace-text",
+        AddAnnotation { .. } => "add-annotation",
+        DeleteAnnotation { .. } => "delete-annotation",
+        EditAnnotation { .. } => "edit-annotation",
         Save => "save",
     };
 

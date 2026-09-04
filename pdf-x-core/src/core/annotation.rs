@@ -5,8 +5,9 @@
 //! Based on PDF.js src/core/annotation.js.
 
 use crate::core::error::PDFResult;
+use crate::core::outline::parse_destination_type;
 use crate::core::page::PageResolver;
-use crate::core::parser::PDFObject;
+use crate::core::parser::{PDFObject, Ref};
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
@@ -400,18 +401,26 @@ pub struct PopupAnnotation {
     pub parent_ref: Option<(u32, u32)>,
 }
 
-/// Parses annotations from a page's Annots array.
+/// Parses annotations from a page's Annots array, keeping each entry's
+/// indirect object reference.
+///
+/// The reference is the annotation's **object identity** — it is what edit
+/// commands (delete/edit annotation) address. Inline dictionaries (rare,
+/// spec-legal) carry no reference and are reported as `None`.
+///
+/// Reference: pdf.js `AnnotationFactory.create` (annotation.js) keys every
+/// parsed annotation by its `Ref` the same way (`annotation.ref`).
 ///
 /// # Arguments
 /// * `annots_obj` - The Annots object (array or reference to array)
 /// * `resolver` - The page resolver for resolving references
 ///
 /// # Returns
-/// A vector of parsed annotations
-pub fn parse_annotations<R: PageResolver>(
+/// A vector of `(reference, annotation)` pairs in Annots-array order
+pub fn parse_annotations_with_refs<R: PageResolver>(
     annots_obj: &PDFObject,
     resolver: &mut R,
-) -> PDFResult<Vec<Annotation>> {
+) -> PDFResult<Vec<(Option<Ref>, Annotation)>> {
     let annots_array = match annots_obj {
         PDFObject::Array(arr) => arr.clone(),
         PDFObject::Ref(ref_obj) => {
@@ -427,8 +436,8 @@ pub fn parse_annotations<R: PageResolver>(
     let mut annotations = Vec::new();
     let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
 
-    for annot_ref in annots_array.iter() {
-        let annot_dict = match &**annot_ref {
+    for annot_entry in annots_array.iter() {
+        let annot_dict = match &**annot_entry {
             PDFObject::Ref(ref_obj) => {
                 let ref_key = (ref_obj.num, ref_obj.generation);
 
@@ -455,13 +464,32 @@ pub fn parse_annotations<R: PageResolver>(
         }
 
         if let Ok(annot) = parse_annotation_dict(&fx_dict, resolver) {
-            annotations.push(annot);
+            let annot_ref = match &**annot_entry {
+                PDFObject::Ref(r) => Some(*r),
+                _ => None,
+            };
+            annotations.push((annot_ref, annot));
         } else {
             // Silently skip invalid annotations
         }
     }
 
     Ok(annotations)
+}
+
+/// Parses annotations from a page's Annots array (without object references).
+///
+/// Thin wrapper over [`parse_annotations_with_refs`] that drops the identity;
+/// prefer the `_with_refs` variant whenever an edit command may need to address
+/// the annotation later.
+pub fn parse_annotations<R: PageResolver>(
+    annots_obj: &PDFObject,
+    resolver: &mut R,
+) -> PDFResult<Vec<Annotation>> {
+    Ok(parse_annotations_with_refs(annots_obj, resolver)?
+        .into_iter()
+        .map(|(_, annot)| annot)
+        .collect())
 }
 
 /// Parses a single annotation dictionary.
@@ -771,25 +799,52 @@ fn parse_link_action<R: PageResolver>(
 }
 
 /// Parses a GoTo destination.
+///
+/// Reference: pdf.js `annotation.js` keeps explicit destination arrays as-is;
+/// the page index is resolved through the document (`Catalog#getPageIndex`,
+/// `catalog.js:1590`). Here the resolver carries the page tree
+/// ([`PageResolver::resolve_page_index`], implemented delta-aware by
+/// `DocStore`), so element 0 resolves directly. String/name destinations stay
+/// [`LinkAction::GoToNamed`] — resolving them needs the catalog's name tree.
 fn parse_goto_destination<R: PageResolver>(
     dest_obj: &PDFObject,
     resolver: &mut R,
 ) -> PDFResult<LinkAction> {
     match dest_obj {
         PDFObject::Array(arr) => {
-            if arr.is_empty() {
+            // Explicit destination: `[page /XYZ left top zoom | /Fit | ...]`
+            // (spec §12.3.2.2). Element 0 is an indirect page reference — or
+            // (PDF 2.0 §12.3.2.3) a 0-based integer page number.
+            if arr.len() < 2 {
                 return Ok(LinkAction::Unknown);
             }
 
-            // First element is the page reference
-            let page_ref = &arr[0];
+            let page_index = match &*arr[0] {
+                PDFObject::Ref(r) => {
+                    // Force-resolve the page object so missing data surfaces as
+                    // an error (progressive Need) rather than silently missing
+                    // from the page-index cache.
+                    resolver.resolve_if_ref(&arr[0])?;
+                    resolver.resolve_page_index(r.num, r.generation)
+                }
+                PDFObject::Number(n) if *n >= 0.0 => Some(*n as usize),
+                _ => None,
+            };
+            let Some(page_index) = page_index else {
+                // No page-tree view (bare `XRef` resolver) or malformed entry:
+                // degrade to Unknown rather than emit a placeholder target.
+                // A *dangling* page ref errors above and skips the annotation.
+                return Ok(LinkAction::Unknown);
+            };
 
-            // Resolve page reference to page index
-            // For now, we'll use a placeholder since we don't have the document context here
-            // In the full implementation, we'd need to pass the document to resolve this
-            return Ok(LinkAction::GoToNamed {
-                name: format!("{:?}", page_ref), // Placeholder
-            });
+            // Element 1: the destination type name (/XYZ, /FitH, ...).
+            let type_obj = resolver.resolve_if_ref(&arr[1])?;
+            let type_name = match &*type_obj {
+                PDFObject::Name(name) => name.as_str(),
+                _ => return Ok(LinkAction::Unknown),
+            };
+            let dest = parse_destination_type(type_name, &arr[2..])?;
+            Ok(LinkAction::GoTo { page_index, dest })
         }
         PDFObject::String(bytes) | PDFObject::HexString(bytes) => {
             let name = String::from_utf8_lossy(bytes).to_string();
@@ -831,5 +886,104 @@ mod tests {
     fn test_form_field_type() {
         assert_eq!(FormFieldType::Button, FormFieldType::Button);
         assert_eq!(FormFieldType::Text, FormFieldType::Text);
+    }
+
+    // ==========================================================================
+    // Document-level parsing: identity API + GoTo destination resolution
+    // ==========================================================================
+
+    /// Two-page PDF with three Link annotations on page 1:
+    /// 5 = explicit `/Dest` array targeting page 2, 6 = string (named) dest,
+    /// 7 = explicit dest pointing at a nonexistent object. Object map:
+    /// 1=Catalog, 2=Pages, 3-4=Pages, 5-7=Annots.
+    fn two_page_link_pdf() -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R 6 0 R 7 0 R] >>"
+                .to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+            "<< /Type /Annot /Subtype /Link /Rect [72 700 300 720] \
+             /Dest [4 0 R /XYZ null 750 null] >>"
+                .to_string(),
+            "<< /Type /Annot /Subtype /Link /Rect [72 660 300 680] /Dest (target) >>".to_string(),
+            "<< /Type /Annot /Subtype /Link /Rect [72 620 300 640] \
+             /Dest [99 0 R /Fit] >>"
+                .to_string(),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
+        }
+        let xref_pos = out.len();
+        let size = objects.len() + 1;
+        out.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in &offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn explicit_dest_resolves_to_goto_with_page_index() {
+        let mut doc = crate::core::PDFDocument::open(two_page_link_pdf()).unwrap();
+        let annots = doc.annotations_with_refs(0).unwrap();
+
+        // The dangling-ref annotation (object 9) is skipped, not placeholdered.
+        assert_eq!(annots.len(), 2, "got {annots:?}");
+
+        let (annot_ref, annot) = &annots[0];
+        // Identity: the /Annots entry is indirect → its object ref rides along.
+        assert_eq!(annot_ref.map(|r| (r.num, r.generation)), Some((5, 0)));
+        let crate::core::annotation::AnnotationData::Link(link) = &annot.data else {
+            panic!("expected Link annotation, got {annot:?}");
+        };
+        let crate::core::annotation::LinkAction::GoTo {
+            page_index,
+            dest: crate::core::outline::DestinationType::XYZ { top, .. },
+        } = &link.action
+        else {
+            panic!("expected GoTo action, got {:?}", link.action);
+        };
+        assert_eq!(*page_index, 1, "explicit dest [4 0 R …] → page index 1");
+        assert_eq!(*top, Some(750.0));
+    }
+
+    #[test]
+    fn string_dest_stays_goto_named() {
+        let mut doc = crate::core::PDFDocument::open(two_page_link_pdf()).unwrap();
+        let annots = doc.annotations_with_refs(0).unwrap();
+
+        let (annot_ref, annot) = &annots[1];
+        assert_eq!(annot_ref.map(|r| (r.num, r.generation)), Some((6, 0)));
+        let crate::core::annotation::AnnotationData::Link(link) = &annot.data else {
+            panic!("expected Link annotation, got {annot:?}");
+        };
+        let crate::core::annotation::LinkAction::GoToNamed { name } = &link.action else {
+            panic!("expected GoToNamed, got {:?}", link.action);
+        };
+        assert_eq!(name, "target");
+    }
+
+    #[test]
+    fn with_refs_preserves_annots_order_and_identity() {
+        let mut doc = crate::core::PDFDocument::open(two_page_link_pdf()).unwrap();
+        let page = doc.get_page(0).unwrap();
+        let annots = page
+            .extract_annotations_with_refs(doc.doc_store_mut())
+            .unwrap();
+
+        let refs: Vec<(u32, u32)> = annots
+            .iter()
+            .filter_map(|(r, _)| r.map(|r| (r.num, r.generation)))
+            .collect();
+        assert_eq!(refs, vec![(5, 0), (6, 0)]);
     }
 }

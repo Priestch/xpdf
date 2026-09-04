@@ -12,6 +12,8 @@ use super::error::{PDFError, PDFResult};
 use super::parser::{PDFObject, Ref};
 use super::resource_budget::ResourceBudget;
 use super::xref::XRef;
+use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// The `delta → base` object-resolution authority.
@@ -26,6 +28,17 @@ pub struct DocStore {
     delta: DeltaLayer,
     /// Limits applied while decoding and resolving untrusted input.
     resource_budget: ResourceBudget,
+    /// Root `/Pages` object reference, seeded by `PDFDocument::from_xref` once the
+    /// catalog is known. Lets link/GoTo destinations resolve page references to
+    /// indices without a `PDFDocument` handle (see [`DocStore::resolve_page_index`]).
+    root_pages_ref: Option<Ref>,
+    /// `(page ref → 0-based index)` map over the page tree, built lazily by
+    /// [`DocStore::resolve_page_index`] and invalidated when the delta revision
+    /// changes (commands may move/delete pages).
+    page_index_cache: FxHashMap<(u32, u32), usize>,
+    /// The `delta.revision()` value [`Self::page_index_cache`] was built at
+    /// (`None` = not built yet).
+    page_index_cache_revision: Option<u64>,
 }
 
 impl DocStore {
@@ -35,7 +48,17 @@ impl DocStore {
             xref,
             delta,
             resource_budget: ResourceBudget::default(),
+            root_pages_ref: None,
+            page_index_cache: FxHashMap::default(),
+            page_index_cache_revision: None,
         }
+    }
+
+    /// Seed the root `/Pages` reference (called once by the document loader).
+    pub(crate) fn set_root_pages_ref(&mut self, root_pages_ref: Ref) {
+        self.root_pages_ref = Some(root_pages_ref);
+        self.page_index_cache.clear();
+        self.page_index_cache_revision = None;
     }
 
     /// Current limits for decoding and page resolution.
@@ -72,6 +95,99 @@ impl DocStore {
         match obj {
             PDFObject::Ref(r) => self.resolve_ref(r.num, r.generation),
             other => Ok(Arc::new(other.clone())),
+        }
+    }
+
+    /// Resolve a page object reference to its 0-based page index.
+    ///
+    /// Walks the page tree from the seeded root `/Pages` (delta-aware — commands
+    /// that move/delete pages bump the revision and invalidate the cache),
+    /// assigning indices in document order. Reference: pdf.js `Catalog#getAllPageDicts`
+    /// (`catalog.js:1461`) — the same explicit-stack DFS with a cycle guard — with
+    /// lookups served from `pageIndexCache` like `Catalog#getPageIndex`
+    /// (`catalog.js:1590`).
+    ///
+    /// Returns `None` when no root has been seeded (resolvers without a page-tree
+    /// view) or the reference is not a page in the tree.
+    pub fn resolve_page_index(&mut self, num: u32, generation: u32) -> Option<usize> {
+        let root_pages_ref = self.root_pages_ref?;
+        let revision = self.delta.revision();
+        if self.page_index_cache_revision != Some(revision) {
+            self.page_index_cache.clear();
+            self.fill_page_index_cache(root_pages_ref);
+            self.page_index_cache_revision = Some(revision);
+        }
+        self.page_index_cache.get(&(num, generation)).copied()
+    }
+
+    /// Build the `(page ref → index)` map over the whole page tree.
+    ///
+    /// Mirrors `build_page_ref_cache` (document.rs) but lives here so the
+    /// [`super::page::PageResolver`] method works over `&mut DocStore` alone.
+    /// Errors are swallowed: a corrupt tree degrades to "page not found"
+    /// (`None` from the caller), never a hard failure.
+    fn fill_page_index_cache(&mut self, root_pages_ref: Ref) {
+        let mut nodes_to_visit: Vec<PDFObject> = vec![PDFObject::Ref(root_pages_ref)];
+        let mut visited_refs: HashSet<(u32, u32)> = HashSet::new();
+        let mut current_page_index = 0usize;
+
+        while let Some(current_node) = nodes_to_visit.pop() {
+            let (node_obj, obj_ref) = match &current_node {
+                PDFObject::Ref(ref_obj) => {
+                    let ref_key = (ref_obj.num, ref_obj.generation);
+                    // Prevent circular references.
+                    if !visited_refs.insert(ref_key) {
+                        continue;
+                    }
+                    match self.resolve_ref(ref_obj.num, ref_obj.generation) {
+                        Ok(obj) => (obj, Some(ref_key)),
+                        Err(_) => continue,
+                    }
+                }
+                _ => (Arc::new(current_node), None),
+            };
+
+            let dict = match &*node_obj {
+                PDFObject::Dictionary(d) => d,
+                _ => continue,
+            };
+
+            // Discriminate leaves the same way `build_page_ref_cache` does.
+            let is_page = match dict.get("Type") {
+                Some(PDFObject::Name(name)) => name == "Page",
+                _ => !dict.contains_key("Kids"),
+            };
+            if is_page {
+                if let Some(ref_key) = obj_ref {
+                    self.page_index_cache.insert(ref_key, current_page_index);
+                }
+                current_page_index += 1;
+                continue;
+            }
+
+            // Intermediate Pages node — collect its Kids (direct or indirect).
+            let kids_array = match dict.get("Kids") {
+                Some(PDFObject::Array(arr)) => Some(arr.clone()),
+                Some(PDFObject::Ref(ref_obj)) => {
+                    let fetched = self.resolve_ref(ref_obj.num, ref_obj.generation);
+                    match fetched {
+                        Ok(obj) => match &*obj {
+                            PDFObject::Array(arr) => Some(arr.clone()),
+                            _ => None,
+                        },
+                        Err(_) => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some(kids_array) = kids_array else {
+                continue;
+            };
+
+            // Push in reverse so the DFS pops kids in document order.
+            for kid in kids_array.iter().rev() {
+                nodes_to_visit.push((**kid).clone());
+            }
         }
     }
 

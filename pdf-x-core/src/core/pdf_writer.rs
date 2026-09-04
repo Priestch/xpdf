@@ -17,7 +17,7 @@
 use super::delta::{DeltaLayer, ObjectId};
 use super::error::{PDFError, PDFResult};
 use super::parser::PDFObject;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 
 /// One cross-reference row to emit for a single object number in this update.
@@ -131,16 +131,19 @@ impl PDFWriter {
 
         let mut current_offset = original_size as u64 + 1;
 
-        // Collect all objects to write (modified + new)
-        let objects_to_write: Vec<_> = delta
-            .iter_modified()
-            .map(|(id, obj)| (*id, obj))
-            .chain(
-                delta
-                    .iter_new_objects()
-                    .map(|obj| ((obj.obj_num, obj.generation), obj)),
-            )
-            .collect();
+        // Collect all objects to write (modified + new). An object both added
+        // and later modified appears in both pools; the `modified` (newer)
+        // state must win and each object number may be written only once per
+        // update — a duplicate body would leave one of the two xref rows
+        // pointing at a stale copy.
+        let mut objects_to_write: Vec<_> =
+            delta.iter_modified().map(|(id, obj)| (*id, obj)).collect();
+        let mut written: HashSet<(u32, u32)> = objects_to_write.iter().map(|(id, _)| *id).collect();
+        for obj in delta.iter_new_objects() {
+            if written.insert((obj.obj_num, obj.generation)) {
+                objects_to_write.push(((obj.obj_num, obj.generation), obj));
+            }
+        }
 
         // Write each object
         for (obj_id, delta_obj) in &objects_to_write {
@@ -304,7 +307,10 @@ impl PDFWriter {
                 buffer.write_all(data).map_err(|e| {
                     PDFError::Generic(format!("Failed to write stream data: {}", e))
                 })?;
-                buffer.write_all(b"\nendstream").map_err(|e| {
+                // EOL before endstream is not part of /Length (spec §7.3.8.1);
+                // EOL after endstream is required — without it qpdf treats
+                // every stream as having a corrupt length ("endstreamendobj").
+                buffer.write_all(b"\nendstream\n").map_err(|e| {
                     PDFError::Generic(format!("Failed to write stream suffix: {}", e))
                 })?;
             }
@@ -735,6 +741,33 @@ mod tests {
         let row8 = lines.next().expect("row for object 8");
         assert!(row7.ends_with(" n "), "row 7 must be in-use: {row7}");
         assert!(row8.ends_with(" n "), "row 8 must be in-use: {row8}");
+    }
+
+    #[test]
+    fn object_added_then_modified_written_once() {
+        // An object both added and later modified lives in two pools (new +
+        // modified). The update must contain one body — the modified state —
+        // and one xref row for it.
+        let mut delta = DeltaLayer::new(10);
+        let added = delta.add_object(PDFObject::String(b"stale".to_vec()));
+        delta.modify_object(added, PDFObject::String(b"fresh".to_vec()));
+
+        let update = PDFWriter::write_incremental_update(&delta, 5000, 10, 4500).unwrap();
+        let update_str = String::from_utf8_lossy(&update);
+
+        assert_eq!(
+            update_str.matches(&format!("{} 0 obj", added.num)).count(),
+            1,
+            "object must be written exactly once: {update_str}"
+        );
+        assert!(
+            update_str.contains("fresh"),
+            "the modified state must win: {update_str}"
+        );
+        assert!(
+            !update_str.contains("stale"),
+            "the pre-modification body must not be written: {update_str}"
+        );
     }
 
     #[test]
