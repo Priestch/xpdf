@@ -450,8 +450,10 @@ impl PDFDocument {
     /// Delete a page from the document.
     ///
     /// Removes the page from its parent's `/Kids` array and decrements `/Count`
-    /// on every ancestor up to the root `/Pages` node. The page object itself
-    /// is NOT deleted from the file (harmless orphan; simplifies undo).
+    /// on every ancestor up to the root `/Pages` node. The page dict object is
+    /// additionally marked deleted in the delta, so an incremental save
+    /// persists it as a free xref entry (spec §7.5.6) and readers of the saved
+    /// file can no longer resolve it.
     ///
     /// Dangling outline/GoTo destinations are tolerated by viewers (v1 limitation).
     pub fn delete_page(&mut self, page_index: usize) -> PDFResult<()> {

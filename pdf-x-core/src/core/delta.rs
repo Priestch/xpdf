@@ -348,6 +348,27 @@ impl DeltaLayer {
         }
     }
 
+    /// Undo a deletion: clear the deleted mark so the base object resolves again.
+    ///
+    /// Unlike [`DeltaLayer::modify_object`] this does not re-add the object to
+    /// `modified` — the base copy is intact, and re-serializing it on save
+    /// would only duplicate bytes.
+    ///
+    /// # Example
+    /// ```
+    /// use pdf_x_core::core::{DeltaLayer, Ref};
+    ///
+    /// let mut delta = DeltaLayer::new(100);
+    /// delta.delete_object(Ref::new(5, 0));
+    /// delta.undelete_object(Ref::new(5, 0));
+    /// assert!(!delta.is_deleted(&Ref::new(5, 0)));
+    /// ```
+    pub fn undelete_object(&mut self, obj_ref: Ref) {
+        if self.deleted.remove(&(obj_ref.num, obj_ref.generation)) {
+            self.bump_revision();
+        }
+    }
+
     /// Check if an object is deleted.
     ///
     /// # Arguments
@@ -803,8 +824,11 @@ impl Command for SetInfoCommand {
 /// Reversible command that deletes a page from the page tree.
 ///
 /// Removes the page's reference from its parent's `/Kids` array and decrements
-/// `/Count` on every ancestor up to the root `/Pages` node. The page object
-/// itself is NOT deleted from the file (harmless orphan; simplifies undo).
+/// `/Count` on every ancestor up to the root `/Pages` node. The page dict
+/// object is additionally marked deleted in the delta, so an incremental save
+/// persists it as a free xref entry (spec §7.5.6) instead of leaving a
+/// reachable orphan. Undo restores the `/Kids` entry and clears the deletion
+/// mark (the base bytes were never touched).
 ///
 /// Reference: pdf.js does not support page deletion at all. Dangling
 /// outline/GoTo destinations are tolerated by viewers (v1 limitation).
@@ -832,6 +856,8 @@ impl DeletePageCommand {
     /// Create a new page-deletion command.
     ///
     /// All objects are pre-fetched so the command needs no `fetch_base` callback.
+    /// Undo restores page resolution via [`DeltaLayer::undelete_object`] — the
+    /// base bytes of the page dict are never touched.
     pub fn new(
         page_ref: Ref,
         parent_ref: Ref,
@@ -931,6 +957,10 @@ impl Command for DeletePageCommand {
             delta.modify_object(*ancestor_ref, PDFObject::Dictionary(new_dict));
         }
 
+        // 3. Mark the page dict itself deleted so an incremental save persists
+        // it as a free xref entry (spec §7.5.6) instead of a reachable orphan.
+        delta.delete_object(self.page_ref);
+
         Ok(())
     }
 
@@ -1008,6 +1038,10 @@ impl Command for DeletePageCommand {
             );
             delta.modify_object(*ancestor_ref, PDFObject::Dictionary(dict));
         }
+
+        // 3. Clear the page dict's deletion mark — the base bytes are intact,
+        // so the object resolves again without re-serializing anything.
+        delta.undelete_object(self.page_ref);
 
         Ok(())
     }
@@ -1305,6 +1339,86 @@ mod tests {
 
         assert!(delta.is_deleted(&obj_ref));
         assert_eq!(delta.change_count(), 1);
+    }
+
+    #[test]
+    fn undelete_object_restores_base_resolution() {
+        let mut delta = DeltaLayer::new(100);
+        let obj_ref = Ref::new(5, 0);
+        delta.modify_object(obj_ref, PDFObject::Number(42.0));
+        delta.delete_object(obj_ref);
+        assert!(delta.is_deleted(&obj_ref));
+        let revision_after_delete = delta.revision();
+
+        delta.undelete_object(obj_ref);
+
+        assert!(!delta.is_deleted(&obj_ref));
+        assert!(
+            delta.iter_deleted().next().is_none(),
+            "deletion must be gone from the serializable state"
+        );
+        // Undeleting must NOT re-add the object to `modified`: the base copy
+        // is intact and re-serializing it on save would duplicate bytes.
+        assert!(
+            delta.get(&obj_ref).is_none(),
+            "undelete must not resurrect the object as a modification"
+        );
+        // Note: delete_object already dropped the earlier modification from
+        // `modified` (deletion supersedes modification), so the delta is now
+        // fully empty — undelete must not fabricate a modification either.
+        assert_eq!(delta.change_count(), 0, "delta must be fully empty");
+        assert!(
+            delta.revision() > revision_after_delete,
+            "undelete is an effective mutation and must bump the revision"
+        );
+
+        // Undeleting a live (never-deleted) object is a no-op.
+        let before = delta.revision();
+        delta.undelete_object(Ref::new(6, 0));
+        assert_eq!(delta.revision(), before);
+    }
+
+    #[test]
+    fn delete_page_command_marks_page_deleted_and_undo_restores() {
+        // Parent /Pages with two kids; delete the second.
+        let mut parent = std::collections::HashMap::new();
+        parent.insert("Type".to_string(), PDFObject::Name("Pages".to_string()));
+        parent.insert("Count".to_string(), PDFObject::Number(2.0));
+        parent.insert(
+            "Kids".to_string(),
+            PDFObject::Array(
+                vec![
+                    Box::new(PDFObject::Ref(Ref::new(4, 0))),
+                    Box::new(PDFObject::Ref(Ref::new(8, 0))),
+                ]
+                .into(),
+            ),
+        );
+
+        let mut delta = DeltaLayer::new(100);
+        let mut cmd = DeletePageCommand::new(
+            Ref::new(8, 0),
+            Ref::new(2, 0),
+            1,
+            Vec::new(),
+            PDFObject::Dictionary(parent.clone()),
+            Vec::new(),
+        );
+
+        cmd.execute(&mut delta, None).expect("delete must execute");
+
+        // The page ref left /Kids AND is marked deleted for persistence.
+        assert!(delta.is_deleted(&Ref::new(8, 0)));
+        let deleted: Vec<_> = delta.iter_deleted().copied().collect();
+        assert_eq!(deleted, vec![(8, 0)]);
+
+        cmd.undo(&mut delta).expect("undo must restore");
+
+        assert!(
+            !delta.is_deleted(&Ref::new(8, 0)),
+            "undo must clear the deletion mark"
+        );
+        assert!(delta.iter_deleted().next().is_none());
     }
 
     #[test]

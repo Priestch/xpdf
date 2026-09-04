@@ -14,11 +14,21 @@
 //! %%EOF
 //! ```
 
-use super::delta::DeltaLayer;
+use super::delta::{DeltaLayer, ObjectId};
 use super::error::{PDFError, PDFResult};
 use super::parser::PDFObject;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::Write;
+
+/// One cross-reference row to emit for a single object number in this update.
+///
+/// `InUse` marks an object written into this update (offset of its `N G obj`
+/// header); `Free` marks an object deleted from the document (a member of the
+/// free list chained from the object-0 head — spec §7.5.4).
+enum XRefOutEntry {
+    InUse { offset: u64, generation: u32 },
+    Free { next_free: u32, generation: u32 },
+}
 
 /// PDF writer for incremental updates.
 ///
@@ -72,7 +82,9 @@ impl PDFWriter {
 
     /// Write an incremental update while inheriting document trailer entries.
     ///
-    /// `delta` provides both object changes and trailer overrides.
+    /// `delta` provides object changes (modified/new objects, plus deleted
+    /// objects serialized as free xref entries — spec §7.5.6) and trailer
+    /// overrides.
     pub fn write_incremental_update_with_trailer(
         delta: &DeltaLayer,
         original_size: usize,
@@ -82,8 +94,41 @@ impl PDFWriter {
     ) -> PDFResult<Vec<u8>> {
         let mut buffer = vec![b'\n'];
 
-        // Track object offsets for the new xref table
-        let mut object_offsets: HashMap<(u32, u32), u64> = HashMap::new();
+        // Cross-reference entries for this update, keyed by object number. A
+        // BTreeMap keeps rows sorted (subsections must be contiguous ascending
+        // runs) and makes each row lookup O(log n).
+        let mut entries: BTreeMap<u32, XRefOutEntry> = BTreeMap::new();
+
+        // Free-list head: object 0, "next free" pointing at the first freed
+        // object (spec §7.5.4). Written unconditionally — classic producers
+        // always emit the head row.
+        let mut freed: Vec<ObjectId> = delta
+            .iter_deleted()
+            .map(|(num, generation)| (*num, *generation))
+            .filter(|(num, _)| *num != 0) // object 0 IS the head, never freed
+            .collect();
+        freed.sort_unstable();
+        entries.insert(
+            0,
+            XRefOutEntry::Free {
+                next_free: freed.first().map_or(0, |(num, _)| *num),
+                generation: 65535,
+            },
+        );
+        // Chain the freed objects: each points at the next, the last back to
+        // the head. Freeing bumps the generation so readers never resolve the
+        // freed generation again (pdf.js writer.js:313-321).
+        for (i, &(num, freed_gen)) in freed.iter().enumerate() {
+            let next_free = freed.get(i + 1).map_or(0, |&(next, _)| next);
+            entries.insert(
+                num,
+                XRefOutEntry::Free {
+                    next_free,
+                    generation: (freed_gen + 1).min(u16::MAX as u32),
+                },
+            );
+        }
+
         let mut current_offset = original_size as u64 + 1;
 
         // Collect all objects to write (modified + new)
@@ -99,7 +144,13 @@ impl PDFWriter {
 
         // Write each object
         for (obj_id, delta_obj) in &objects_to_write {
-            object_offsets.insert(*obj_id, current_offset);
+            entries.insert(
+                obj_id.0,
+                XRefOutEntry::InUse {
+                    offset: current_offset,
+                    generation: obj_id.1,
+                },
+            );
 
             // Write object header: "N G obj"
             write!(buffer, "{} {} obj\n", obj_id.0, obj_id.1)
@@ -117,12 +168,7 @@ impl PDFWriter {
 
         // Write the new xref table
         let xref_start_offset = (original_size as u64) + (buffer.len() as u64);
-        Self::write_xref_table(
-            &mut buffer,
-            &object_offsets,
-            original_size,
-            prev_xref_offset,
-        )?;
+        Self::write_xref_table(&mut buffer, &entries)?;
 
         // Write the new trailer
         Self::write_trailer(
@@ -132,6 +178,7 @@ impl PDFWriter {
             prev_xref_offset,
             original_trailer,
             delta,
+            &entries,
         )?;
 
         // Write EOF marker
@@ -242,8 +289,14 @@ impl PDFWriter {
                 })?;
             }
             PDFObject::Stream { dict, data } => {
-                // Write stream dictionary
-                Self::write_object(buffer, &PDFObject::Dictionary(dict.clone()))?;
+                // /Length must equal the bytes actually written (spec §7.3.8.1).
+                // Delta streams normally carry correct lengths already, but
+                // normalize defensively so a stale value can never corrupt the
+                // update — readers cut the stream at /Length and would feed a
+                // decoder the wrong byte count.
+                let mut dict = dict.clone();
+                dict.insert("Length".to_string(), PDFObject::Number(data.len() as f64));
+                Self::write_object(buffer, &PDFObject::Dictionary(dict))?;
 
                 buffer.write_all(b"\nstream\n").map_err(|e| {
                     PDFError::Generic(format!("Failed to write stream prefix: {}", e))
@@ -334,32 +387,29 @@ impl PDFWriter {
 
     /// Write a cross-reference table.
     ///
-    /// This writes a hybrid xref table that can reference both objects in the
-    /// original PDF and new/modified objects in the incremental update.
+    /// This writes a hybrid xref table covering the objects in this update —
+    /// new/modified objects as in-use rows, deleted objects as free rows
+    /// (spec §7.5.4/§7.5.6).
     ///
-    /// Format per PDF 1.5+ specification (hybrid xref):
+    /// Format:
     /// ```text
     /// xref
     /// start_index count
     /// offset generation n  (for in-use objects)
-    /// 0000000000 65535 f   (for free objects)
+    /// next_free generation f  (for free objects; object 0 heads the list)
     /// ```
     fn write_xref_table<W: Write>(
         buffer: &mut W,
-        object_offsets: &HashMap<(u32, u32), u64>,
-        original_size: usize,
-        prev_xref_offset: usize,
+        entries: &BTreeMap<u32, XRefOutEntry>,
     ) -> PDFResult<()> {
         buffer
             .write_all(b"xref\n")
             .map_err(|e| PDFError::Generic(format!("Failed to write xref header: {}", e)))?;
 
-        // Collect all object numbers we need to reference
-        let mut obj_nums: Vec<u32> = object_offsets.keys().map(|(num, _)| *num).collect();
-        obj_nums.sort();
-
-        // Group consecutive objects into subsections
-        // PDF spec requires subsection headers: "start_index count"
+        // Group consecutive object numbers into subsections; the spec requires
+        // each subsection header to be "start_index count" followed by exactly
+        // `count` 20-byte rows.
+        let obj_nums: Vec<u32> = entries.keys().copied().collect();
         let mut index = 0;
         while index < obj_nums.len() {
             let start = index;
@@ -368,14 +418,21 @@ impl PDFWriter {
             }
             Self::write_xref_subsection(buffer, obj_nums[start], (index - start + 1) as u32)?;
             for obj_num in &obj_nums[start..=index] {
-                let ((_, generation), offset) = object_offsets
-                    .iter()
-                    .find(|((num, _), _)| num == obj_num)
-                    .ok_or_else(|| {
-                        PDFError::Generic(format!("Missing offset for object {}", obj_num))
-                    })?;
-                write!(buffer, "{:010} {:05} n \n", offset, generation)
-                    .map_err(|e| PDFError::Generic(format!("Failed to write xref entry: {}", e)))?;
+                match &entries[obj_num] {
+                    XRefOutEntry::InUse { offset, generation } => {
+                        write!(buffer, "{:010} {:05} n \n", offset, generation).map_err(|e| {
+                            PDFError::Generic(format!("Failed to write xref entry: {}", e))
+                        })?;
+                    }
+                    XRefOutEntry::Free {
+                        next_free,
+                        generation,
+                    } => {
+                        write!(buffer, "{:010} {:05} f \n", next_free, generation).map_err(
+                            |e| PDFError::Generic(format!("Failed to write xref entry: {}", e)),
+                        )?;
+                    }
+                }
             }
             index += 1;
         }
@@ -407,6 +464,7 @@ impl PDFWriter {
         prev_xref_offset: usize,
         original_trailer: Option<&PDFObject>,
         delta: &DeltaLayer,
+        entries: &BTreeMap<u32, XRefOutEntry>,
     ) -> PDFResult<()> {
         buffer
             .write_all(b"trailer\n")
@@ -415,8 +473,20 @@ impl PDFWriter {
             PDFError::Generic(format!("Failed to write trailer dict prefix: {}", e))
         })?;
 
-        // Size: total number of objects (original + new)
-        write!(buffer, "/Size {}", total_object_count)
+        // /Size must cover every object number that has ever existed (object
+        // numbers are never reused — spec §7.5.4), so take the max of the
+        // caller's count, the original trailer's /Size, and the highest entry
+        // in this table.
+        let mut size = total_object_count;
+        if let Some(PDFObject::Dictionary(dict)) = original_trailer {
+            if let Some(PDFObject::Number(n)) = dict.get("Size") {
+                size = size.max(*n as u32);
+            }
+        }
+        if let Some(&max_num) = entries.keys().next_back() {
+            size = size.max(max_num + 1);
+        }
+        write!(buffer, "/Size {}", size)
             .map_err(|e| PDFError::Generic(format!("Failed to write /Size: {}", e)))?;
 
         // Previous: offset of previous xref table
@@ -603,5 +673,114 @@ mod tests {
         assert!(update_str.contains("%%EOF"));
         // Verify /Size is in the trailer
         assert!(update_str.contains("/Size 100"));
+        // Free-list head is written even with no deletions (spec §7.5.4).
+        assert!(update_str.contains("0 1\n0000000000 65535 f \n"));
+    }
+
+    #[test]
+    fn object_zero_head_entry_written_with_no_deletions() {
+        let mut delta = DeltaLayer::new(100);
+        delta.modify_object(Ref::new(10, 0), PDFObject::String(b"page".to_vec()));
+
+        let update = PDFWriter::write_incremental_update(&delta, 5000, 100, 4500).unwrap();
+        let update_str = String::from_utf8_lossy(&update);
+
+        // Head subsection alone, then the in-use subsection for object 10.
+        let head = "0 1\n0000000000 65535 f \n";
+        let in_use_start = update_str
+            .find(head)
+            .expect("free-list head must be written");
+        assert!(
+            update_str[in_use_start + head.len()..].starts_with("10 1\n"),
+            "object 10 must start its own subsection after the head, got: {update_str}"
+        );
+    }
+
+    #[test]
+    fn deleted_objects_written_as_free_chain() {
+        // Two freed objects form a chain: head(0) → 3 → 7 → back to head.
+        let mut delta = DeltaLayer::new(100);
+        delta.delete_object(Ref::new(7, 0));
+        delta.delete_object(Ref::new(3, 0));
+
+        let update = PDFWriter::write_incremental_update(&delta, 5000, 100, 4500).unwrap();
+        let update_str = String::from_utf8_lossy(&update);
+
+        // Byte-exact subsections: head points at 3; 3 points at 7; 7 closes
+        // the chain. Freed generations bump to 1 (pdf.js writer.js:313-321).
+        assert!(update_str.contains("0 1\n0000000003 65535 f \n"));
+        assert!(update_str.contains("3 1\n0000000007 00001 f \n"));
+        assert!(update_str.contains("7 1\n0000000000 00001 f \n"));
+    }
+
+    #[test]
+    fn free_and_in_use_noncontiguous_subsections() {
+        // Deleting object 1 merges into the head's subsection (0..=1); the
+        // modified objects 7,8 form their own run.
+        let mut delta = DeltaLayer::new(100);
+        delta.delete_object(Ref::new(1, 0));
+        delta.modify_object(Ref::new(7, 0), PDFObject::String(b"a".to_vec()));
+        delta.modify_object(Ref::new(8, 0), PDFObject::String(b"b".to_vec()));
+
+        let update = PDFWriter::write_incremental_update(&delta, 5000, 100, 4500).unwrap();
+        let update_str = String::from_utf8_lossy(&update);
+
+        // Head + freed object 1 in one subsection; 7,8 as in-use in another.
+        assert!(update_str.contains("0 2\n0000000001 65535 f \n0000000000 00001 f \n"));
+        assert!(update_str.contains("7 2\n"));
+        // The in-use rows must be `n` rows.
+        let seven = update_str.find("7 2\n").expect("subsection 7 2 must exist");
+        let mut lines = update_str[seven + 4..].lines();
+        let row7 = lines.next().expect("row for object 7");
+        let row8 = lines.next().expect("row for object 8");
+        assert!(row7.ends_with(" n "), "row 7 must be in-use: {row7}");
+        assert!(row8.ends_with(" n "), "row 8 must be in-use: {row8}");
+    }
+
+    #[test]
+    fn stream_length_normalized_on_write() {
+        let mut dict = HashMap::new();
+        dict.insert("Length".to_string(), PDFObject::Number(999.0));
+        let stream = PDFObject::Stream {
+            dict,
+            data: b"abc".to_vec(),
+        };
+
+        let mut buffer = Vec::new();
+        PDFWriter::write_object(&mut buffer, &stream).unwrap();
+        let out = String::from_utf8(buffer).unwrap();
+
+        assert!(
+            out.contains("/Length 3"),
+            "stale /Length must be corrected: {out}"
+        );
+        assert!(
+            !out.contains("999"),
+            "stale /Length must not survive: {out}"
+        );
+    }
+
+    #[test]
+    fn size_is_max_of_caller_trailer_and_entries() {
+        // Original trailer claims /Size 250, caller passes 100, highest entry
+        // is 10 → /Size must be 250.
+        let mut delta = DeltaLayer::new(100);
+        delta.modify_object(Ref::new(10, 0), PDFObject::Null);
+
+        let mut trailer = HashMap::new();
+        trailer.insert("Size".to_string(), PDFObject::Number(250.0));
+        let update = PDFWriter::write_incremental_update_with_trailer(
+            &delta,
+            5000,
+            100,
+            4500,
+            Some(&PDFObject::Dictionary(trailer)),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&update).contains("/Size 250"));
+
+        // Caller's count wins when it is the largest.
+        let update = PDFWriter::write_incremental_update(&delta, 5000, 300, 4500).unwrap();
+        assert!(String::from_utf8_lossy(&update).contains("/Size 300"));
     }
 }

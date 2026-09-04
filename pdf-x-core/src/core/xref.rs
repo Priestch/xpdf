@@ -1321,10 +1321,19 @@ impl XRef {
             .ok_or(PDFError::ObjectNotInXRef { num: obj_num })?;
 
         match entry {
-            XRefEntry::Free { .. } => Err(PDFError::Generic(format!(
-                "Cannot fetch free object {}",
-                obj_num
-            ))),
+            // A free entry means the object no longer exists (spec §7.5.4). pdf.js treats
+            // this identically to a missing entry at the lookup seam — `getEntry` returns
+            // null for free entries (xref.js:802-807) and `fetch` passes that null straight
+            // through (xref.js:835-838) without raising. We surface the existing
+            // `ObjectDeleted` variant so base-side free entries are indistinguishable from
+            // delta-side deletions (DocStore::resolve_ref).
+            // Invariant: this error must NEVER trigger the lazy-recovery retry in `fetch`
+            // above — recovery rescans raw bytes and would resurrect freed objects. Only
+            // BadXRefOffset/ObjectNotInXRef may enter that path.
+            XRefEntry::Free { generation, .. } => Err(PDFError::ObjectDeleted {
+                num: obj_num,
+                generation: *generation,
+            }),
 
             XRefEntry::Uncompressed {
                 offset,
@@ -1831,6 +1840,83 @@ mod tests {
             .fetch(1, 0)
             .expect("object should re-fetch after cache drop");
         assert_eq!(refetched.as_ref(), &PDFObject::Number(42.0));
+    }
+
+    #[test]
+    fn fetch_on_free_entry_returns_object_deleted() {
+        // Free entries are indistinguishable from delta-side deletions for callers:
+        // both surface PDFError::ObjectDeleted (pdf.js xref.js:802-807/:835-838 passes
+        // free entries through as null).
+        let data = b"xref\n\
+            0 2\n\
+            0000000000 65535 f\n\
+            0000000000 00000 f\n\
+            trailer\n\
+            << /Size 2 >>\n";
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn DocumentSource>;
+        let mut xref = XRef::new(stream);
+        xref.parse(0).unwrap();
+
+        let err = xref
+            .fetch(1, 0)
+            .expect_err("a free entry must not resolve to an object");
+        assert!(
+            matches!(
+                err,
+                PDFError::ObjectDeleted {
+                    num: 1,
+                    generation: 0
+                }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn fetch_on_free_entry_does_not_trigger_recovery() {
+        // An incrementally-updated file keeps the freed object's old bytes on disk;
+        // the xref just marks the entry free. Recovery-by-scan would find those bytes
+        // and resurrect the deleted object, so a failed fetch on a free entry must
+        // never enter the lazy-recovery path (fetch only retries on
+        // BadXRefOffset/ObjectNotInXRef).
+        let data = b"1 0 obj\n42\nendobj\n\
+            2 0 obj\n(kept)\nendobj\n\
+            xref\n\
+            0 3\n\
+            0000000000 65535 f\n\
+            0000000000 65535 f\n\
+            0000000018 00000 n\n\
+            trailer\n\
+            << /Size 3 >>\n";
+        let stream = Box::new(Stream::from_bytes(data.to_vec())) as Box<dyn DocumentSource>;
+        let mut xref = XRef::new(stream);
+        let xref_pos = data
+            .windows(4)
+            .position(|w| w == b"xref")
+            .expect("xref not found");
+        xref.parse(xref_pos).unwrap();
+
+        let err = xref
+            .fetch(1, 0)
+            .expect_err("freed object must not resolve even though its bytes remain");
+        assert!(
+            matches!(err, PDFError::ObjectDeleted { num: 1, .. }),
+            "unexpected error: {err}"
+        );
+
+        // No resurrection: the entry is still free and recovery never ran.
+        assert!(
+            xref.get_entry(1).unwrap().is_free(),
+            "free entry was rewritten — recovery resurrected a deleted object"
+        );
+        assert!(
+            !xref.recovered,
+            "free-entry fetch must not trigger recovery"
+        );
+
+        // The xref itself is still fully functional.
+        let kept = xref.fetch(2, 0).expect("live object must still fetch");
+        assert_eq!(kept.as_ref(), &PDFObject::String(b"kept".to_vec()));
     }
 
     #[test]

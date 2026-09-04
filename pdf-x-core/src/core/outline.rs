@@ -328,8 +328,21 @@ pub fn parse_document_outline(doc: &mut PDFDocument) -> PDFResult<Option<Vec<Out
             }
         };
 
-        // Parse destination
-        let dest = parse_destination(&outline_dict, doc)?;
+        // Parse destination. A destination that cannot be resolved (e.g. its
+        // page was deleted from the page tree) degrades to no destination and
+        // the item stays in the outline — mirroring the per-item tolerance
+        // above. Only DataMissing propagates: it signals the outline dict has
+        // not loaded yet (progressive loading), not a broken destination.
+        let dest = match parse_destination(&outline_dict, doc) {
+            Ok(dest) => dest,
+            Err(PDFError::DataMissing { .. }) => {
+                return Err(PDFError::DataMissing {
+                    position: 0,
+                    length: 0,
+                });
+            }
+            Err(_) => None,
+        };
 
         // Parse color (optional, defaults to black)
         let color = parse_color(&outline_dict);
